@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}LHVMED | Conferência{% endblock %}
+
+{% block content %}
+<div class="container wrap py-4">
+
+  <div class="cardx topbar mb-3 appHeader">
+    <div class="brandRow">
+      <div class="brandLeft">
+        <p class="brand">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="brandMark" aria-label="MEDICALD">
+            <span class="brandWhite">LHVMED</span><span class="brandBlue"></span>
+          </span>
+          <span class="divider">•</span>
+          <span class="pageName">Conferência</span>
+        </p>
+        <p class="sub">Tela 2 • Bipar produtos, validar estoque e finalizar sem navegar.</p>
+      </div>
+
+      <div class="brandRowRight d-flex align-items-center gap-2 flex-wrap">
+        <a href="/" class="btn btn-outline-dark btnx btn-ghost">← Expedição</a>
+        <span class="pill" id="clockPill">⏱️ --:--</span>
+        <span class="pill pill-strong">📡 Scanner ON</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mb-3">
+    <div class="col-12 col-lg-4">
+      <div class="metric"><div><div class="k">Pedidos separados</div><div class="v">{{ stats.total_pedidos or 0 }}</div></div><div class="icon">📦</div></div>
+    </div>
+    <div class="col-12 col-lg-4">
+      <div class="metric"><div><div class="k">Itens a conferir</div><div class="v">{{ stats.total_itens or 0 }}</div></div><div class="icon">🧾</div></div>
+    </div>
+    <div class="col-12 col-lg-4">
+      <div class="metric"><div><div class="k">Progresso</div><div class="v">{{ stats.total_bipado or 0 }}/{{ stats.total_itens or 0 }}</div></div><div class="icon">✅</div></div>
+    </div>
+  </div>
+
+  <div class="row g-4">
+    <div class="col-lg-4">
+      <div class="cardx">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <div>
+            <h5 class="mb-1" style="font-weight:1000;">Scanner</h5>
+            <div class="hint">Bipa o SKU para marcar <strong>check verde</strong> no item. Não troca de tela.</div>
+          </div>
+          <span class="pill">Tela 2</span>
+        </div>
+
+        <input id="scannerInput" autocomplete="off" />
+
+        <div class="scan-box mb-3">
+          <div id="scanStatus" class="big-status">
+            <div class="title">Aguardando bip…</div>
+            <div class="sub">Bipe um SKU para registrar.</div>
+          </div>
+
+          <div class="d-flex gap-2 mt-3 flex-wrap">
+            <button id="focusBtn" class="btn btn-dark btnx">Ativar scanner</button>
+            <button id="clearBtn" class="btn btn-outline-dark btnx">Limpar</button>
+            <button id="refreshBtn" class="btn btn-outline-primary btnx">Atualizar</button>
+          </div>
+
+          <div class="hint mt-3">Dica: se parar de ler, clica em <strong>Ativar scanner</strong>.</div>
+        </div>
+
+        <hr style="border-color: var(--border);">
+
+        <div>
+          <h6 class="mb-2" style="font-weight:1000;">Pedido atual</h6>
+          <div class="hint mb-2" id="pedidoAtualTitle">—</div>
+          <div class="small" id="faltasText" style="color: var(--muted);">Faltas: —</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-lg-8">
+      <div class="cardx">
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+          <div>
+            <h5 class="mb-0" style="font-weight:1000;">Pedidos para Conferência</h5>
+            <div class="hint">Mostra só o que está <strong>SEPARADO</strong> e ainda não foi finalizado.</div>
+          </div>
+          <span class="pill">Total: {{ pedidos|length }}</span>
+        </div>
+
+        {% if pedidos %}
+          <div class="d-grid gap-3 mt-3">
+            {% for pedido in pedidos %}
+              <div class="order-card" data-ml-id="{{ pedido.ml_id }}">
+                <div class="order-head">
+                  <div>
+                    <div class="order-title">Pedido {{ pedido.ml_id }} <span class="chip">{{ pedido.envio_label }}</span></div>
+                    <div class="order-sub">{{ pedido.cliente_nome }} • {{ (pedido.itens|length) if pedido.itens else 0 }} itens</div>
+                  </div>
+                  <span class="pill ok">{{ pedido.total_bipado }}/{{ pedido.total_quantidade }}</span>
+                </div>
+
+                <div class="items">
+                  {% for item in (pedido.itens or []) %}
+                    {% set est = item.get('estoque_bling') %}
+                    {% set qtd = item.get('quantidade', 0) %}
+                    {% set qtd_bip = item.get('quantidade_bipada', 0) %}
+                    <div class="item-row" data-ml-id="{{ pedido.ml_id }}" data-sku="{{ item.get('sku','') }}">
+                      <div style="min-width: 220px;">
+                        <div class="item-mainline">
+                          <span class="item-check" aria-hidden="true">✓</span>
+                          <span class="item-name" style="font-weight:1000;">{{ item.get('nome','') }}</span>
+                        </div>
+                        <div class="mt-2"><span class="sku-pill">{{ item.get('sku','') }}</span></div>
+                      </div>
+
+                      <div style="min-width: 170px;">
+                        <div class="small" style="color:var(--muted);">Bipado</div>
+                        <div style="font-weight:1000;"><span class="qbip">{{ qtd_bip }}</span>/<span class="qtot">{{ qtd }}</span></div>
+                      </div>
+
+                      <div>
+                        <span class="badge-stock" data-stock-badge>
+                          {% if est is none %}
+                            ⏳ Estoque…
+                          {% else %}
+                            Em estoque: {{ est }}
+                          {% endif %}
+                        </span>
+                        <div class="small mt-1" style="color:var(--muted);" data-stock-sub>
+                          {% if est is none %}
+                            Conferindo no Bling
+                          {% else %}
+                            Atualizado
+                          {% endif %}
+                        </div>
+                      </div>
+                    </div>
+                  {% endfor %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="hint mt-3">Sem pedidos “SEPARADO” para conferir agora.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/scanner.js') }}"></script>
+{% endblock %}

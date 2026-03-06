@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% from "_macros.html" import order_card %}
+
+{% block title %}LHVMED | Expedição{% endblock %}
+
+{% block content %}
+<div class="container wrap py-4">
+
+  <!-- HEADER -->
+  <div class="cardx topbar mb-3 appHeader">
+    <div class="brandRow">
+      <div class="brandLeft">
+        <p class="brand">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="brandMark" aria-label="MEDICALD">
+            <span class="brandWhite">LHVMED</span><span class="brandBlue"></span>
+          </span>
+          <span class="divider">•</span>
+          <span class="pageName">Expedição</span>
+        </p>
+        <p class="sub">Lista premium e clara pra separar rápido (Nome · SKU · Quantidade)</p>
+      </div>
+
+      <div class="brandRowRight d-flex align-items-center gap-2 flex-wrap">
+        <a href="/scanner" class="btn btn-outline-dark btnx btn-ghost">Conferência</a>
+
+        <span class="pill pill-strong">Pedidos: {{ pedidos|length }}</span>
+        <span class="pill">Itens: {{ stats.total_itens or 0 }}</span>
+        <span class="pill">Bipados: {{ stats.total_bipado or 0 }}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCANNER -->
+  <div class="cardx p-3 mb-3 scanCard">
+    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap">
+      <div>
+        <div class="hTitle">Scanner</div>
+        <div class="sub">Bipa o SKU (filho). O pedido vai atualizando aqui — sem trocar de tela.</div>
+      </div>
+
+      <div class="d-flex gap-2 flex-wrap" style="min-width:260px;">
+        <button id="focusBtn" class="btn btn-dark btnx btn-primarySoft">Ativar scanner</button>
+        <button id="syncBtn" class="btn btn-brand btnx btn-brandPro">Sync Mercado Livre</button>
+        <span class="pill" id="syncPill" style="display:none;">⏳ Sync...</span>
+      </div>
+    </div>
+
+    <input id="scannerInput" autocomplete="off" />
+    <div class="sub mt-2" id="scanMsg">Aguardando bip…</div>
+    <div class="sub mt-1" id="syncMsg"></div>
+  </div>
+
+  <!-- ORDERS -->
+  <div class="cardx ordersCard">
+    <div class="sectionHead">
+      <div class="sectionTitle">
+        <div class="hTitle">Pedidos</div>
+        <div class="sub">Dentro de cada pedido: agrupa “produtos parecidos” e separa kits.</div>
+      </div>
+
+      <div class="filter-wrap">
+        <label class="sub" for="tipoFilter" style="font-weight:900;">Filtrar</label>
+        <select id="tipoFilter" class="form-select" style="width:240px;">
+          <option value="ALL">Todos</option>
+          <option value="FLEX">Somente FLEX</option>
+          <option value="COLETA">Somente COLETA</option>
+        </select>
+      </div>
+    </div>
+
+
+
+<div id="ordersContainer">
+
+  {% if pedidos %}
+    {% for pedido in pedidos %}
+      {{ order_card(pedido) }}
+    {% endfor %}
+  {% else %}
+    <div class="p-3 sub">Sem pedidos pendentes.</div>
+  {% endif %}
+
+</div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/index.js') }}"></script>
+{% endblock %}

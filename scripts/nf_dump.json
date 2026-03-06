@@ -1,0 +1,96 @@
+{
+  "data": {
+    "id": 25150583317,
+    "tipo": 0,
+    "situacao": 1,
+    "numero": "010142",
+    "dataEmissao": "2026-02-23 16:31:13",
+    "dataOperacao": "2026-02-23 00:00:00",
+    "chaveAcesso": "",
+    "contato": {
+      "id": 17975433944,
+      "nome": "Irene Eleuterio Da Silva (ireneeleutriodasilva)",
+      "numeroDocumento": "25608313844",
+      "ie": "",
+      "rg": "",
+      "telefone": "",
+      "email": "",
+      "endereco": {
+        "endereco": "",
+        "numero": "",
+        "complemento": "",
+        "bairro": "",
+        "cep": "",
+        "municipio": "",
+        "uf": ""
+      }
+    },
+    "naturezaOperacao": {
+      "id": 10488672411
+    },
+    "loja": {
+      "id": 0
+    },
+    "serie": 1,
+    "valorNota": 74.16,
+    "valorFrete": 0,
+    "xml": "",
+    "linkDanfe": "https://www.bling.com.br/doc.view.php?id=6fe363f06e938b0b9b6dcd614d0e1b4d3439870a286f290e88a2a63fbe3fc1c8&accessKey=MTc3MjA0ODAzMC5kMDJlNDY0M2I2YjM3MWY4YTgwZGJhZWYyNTgxNTVhZjM2NjA3NmU1ZGI5MDZhZGQ2M2M0NzVmZGY1ZGI1NjU1",
+    "linkPDF": "https://www.bling.com.br/doc.view.php?PDF=true&id=6fe363f06e938b0b9b6dcd614d0e1b4d3439870a286f290e88a2a63fbe3fc1c8&accessKey=MTc3MjA0ODAzMC5kMDJlNDY0M2I2YjM3MWY4YTgwZGJhZWYyNTgxNTVhZjM2NjA3NmU1ZGI5MDZhZGQ2M2M0NzVmZGY1ZGI1NjU1",
+    "optanteSimplesNacional": false,
+    "numeroPedidoLoja": "",
+    "vendedor": {
+      "id": 0
+    },
+    "transporte": {
+      "fretePorConta": 1,
+      "transportador": {
+        "nome": "",
+        "numeroDocumento": ""
+      },
+      "volumes": [],
+      "etiqueta": {
+        "nome": "",
+        "endereco": "",
+        "numero": "",
+        "complemento": "",
+        "municipio": "",
+        "uf": "",
+        "cep": "",
+        "bairro": ""
+      }
+    },
+    "itens": [
+      {
+        "codigo": "175661521514",
+        "descricao": "Gaze Estéril 13 Fios 50 Pacotes Com 10 Total 500 Unidades",
+        "unidade": "",
+        "quantidade": 2,
+        "valor": 37.08,
+        "valorTotal": 74.16,
+        "tipo": "P",
+        "pesoBruto": 0,
+        "pesoLiquido": 0,
+        "numeroPedidoCompra": "",
+        "classificacaoFiscal": "",
+        "cest": "",
+        "codigoServico": "",
+        "origem": 0,
+        "informacoesAdicionais": "",
+        "gtin": "7898488470384",
+        "cfop": "1101",
+        "impostos": {
+          "valorAproximadoTotalTributos": 0,
+          "icms": {
+            "st": 90,
+            "origem": 0,
+            "modalidade": 0,
+            "aliquota": 12,
+            "valor": 0
+          }
+        }
+      }
+    ],
+    "parcelas": []
+  }
+}

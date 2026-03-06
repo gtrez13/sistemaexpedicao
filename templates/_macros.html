@@ -1,0 +1,114 @@
+{% macro order_card(pedido, tipo_chip_class) %}
+  {# resumo estoque #}
+  {% set ns = namespace(ok=0, falta=0, unk=0) %}
+  {% for it in (pedido.itens or []) %}
+    {% set est = it.get('estoque_bling') %}
+    {% set qtd = it.get('quantidade') or 0 %}
+    {% if est is none %}
+      {% set ns.unk = ns.unk + 1 %}
+    {% elif (est|int) >= (qtd|int) %}
+      {% set ns.ok = ns.ok + 1 %}
+    {% else %}
+      {% set ns.falta = ns.falta + 1 %}
+    {% endif %}
+  {% endfor %}
+
+  <div class="order" data-envio="{{ pedido.envio_label }}" data-ml-id="{{ pedido.ml_id }}">
+    <div class="orderTop">
+      <div style="min-width:0;">
+        <p class="orderTitle">
+          Pedido {{ pedido.ml_id }}
+          <span class="chip {{ tipo_chip_class }}">{{ pedido.envio_label }}</span>
+        </p>
+        <p class="orderSub">
+          {{ pedido.cliente_nome or 'Cliente Mercado Livre' }} • {{ (pedido.itens|length) if pedido.itens else 0 }} itens
+        </p>
+      </div>
+
+      <div class="d-flex gap-2 flex-wrap align-items-center">
+        <span class="pill progress-pill" data-progress-pill="{{ pedido.ml_id }}">
+          Progresso: <span class="p-bip">{{ pedido.total_bipado or 0 }}</span>/<span class="p-tot">{{ pedido.total_quantidade or 0 }}</span>
+        </span>
+
+      </div>
+    </div>
+
+    <div class="items">
+      {% if pedido.itens %}
+        {% set kit_items = [] %}
+        {% set normal_items = [] %}
+        {% for it in pedido.itens %}
+          {% if it.get('parent_sku') %}
+            {% set _ = kit_items.append(it) %}
+          {% else %}
+            {% set _ = normal_items.append(it) %}
+          {% endif %}
+        {% endfor %}
+
+        <div class="normalZone" data-zone="normal">
+          {% if normal_items %}
+            {% for item in normal_items %}
+              <div class="itemRow normalItem {% if (item.get('quantidade_bipada',0)|int) >= (item.get('quantidade',0)|int) and (item.get('quantidade',0)|int) > 0 %}is-checked{% endif %}"
+                   data-item-name="{{ item.get('nome','')|e }}"
+                   data-item-sku="{{ item.get('sku','') }}"
+                   data-ml-id="{{ pedido.ml_id }}">
+                <div class="itemLeft">
+                  <p class="itemName">{{ item.get('nome','') }}</p>
+                  <div class="itemMeta">
+                    <span class="sku" title="{{ item.get('sku','') }}">{{ item.get('sku','') }}</span>
+                  </div>
+                </div>
+                <div class="itemRight">
+                  <p class="qty">Qtd: <span class="qtot">{{ item.get('quantidade',0) }}</span></p>
+                  <p class="bip">Bip: <span class="qbip">{{ item.get('quantidade_bipada',0) }}</span></p>
+                </div>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="sub">Sem itens normais.</div>
+          {% endif %}
+        </div>
+
+        {% if kit_items %}
+          <div style="height:10px;"></div>
+
+          {% set groups = {} %}
+          {% for it in kit_items %}
+            {% set key = it.get('parent_sku') %}
+            {% if key not in groups %}{% set _ = groups.update({key: []}) %}{% endif %}
+            {% set _ = groups[key].append(it) %}
+          {% endfor %}
+
+          {% for key in groups.keys()|list %}
+            {% set its = groups[key] %}
+            {% set kit_nome = (its[0].get('parent_nome') or ('KIT ' ~ key)) %}
+            <div class="kitBox">
+              <p class="kitTitle">📦 {{ kit_nome }}</p>
+              <p class="kitSub">SKU do kit: <strong>{{ key }}</strong> • (bipar SKUs abaixo)</p>
+            </div>
+
+            {% for item in its %}
+              <div class="itemRow {% if (item.get('quantidade_bipada',0)|int) >= (item.get('quantidade',0)|int) and (item.get('quantidade',0)|int) > 0 %}is-checked{% endif %}" data-item-sku="{{ item.get('sku','') }}" data-ml-id="{{ pedido.ml_id }}">
+                <div class="itemLeft">
+                  <p class="itemName">{{ item.get('nome','') }}</p>
+                  <div class="itemMeta">
+                    <span class="sku" title="{{ item.get('sku','') }}">{{ item.get('sku','') }}</span>
+                    <span class="fromkit" title="{{ item.get('parent_nome','') }}">
+                      vem de: {{ item.get('parent_nome') or ('KIT ' ~ item.get('parent_sku')) }}
+                    </span>
+                  </div>
+                </div>
+                <div class="itemRight">
+                  <p class="qty">Qtd: <span class="qtot">{{ item.get('quantidade',0) }}</span></p>
+                  <p class="bip">Bip: <span class="qbip">{{ item.get('quantidade_bipada',0) }}</span></p>
+                </div>
+              </div>
+            {% endfor %}
+          {% endfor %}
+        {% endif %}
+      {% else %}
+        <div class="sub">Sem itens.</div>
+      {% endif %}
+    </div>
+  </div>
+{% endmacro %}
