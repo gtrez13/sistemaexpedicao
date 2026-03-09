@@ -1,0 +1,17 @@
+# segredos
+.env
+bling_tokens.json
+
+# banco local
+db/wms.db
+
+# python
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+bling_login_once.py
+bling_state.json

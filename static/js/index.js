@@ -147,18 +147,30 @@ const scanMsg = document.getElementById('scanMsg');
 const focusBtn = document.getElementById('focusBtn');
 
 function focusScanner() {
-    try { scannerInput?.focus(); } catch {}
+    try {
+        scannerInput?.focus({ preventScroll: true });
+    } catch {}
 }
 
 window.addEventListener('load', () => {
     bindPedidoSelection();
 
-    // auto-seleciona o primeiro pedido VISÍVEL
     const firstVisible = Array.from(document.querySelectorAll('.order[data-ml-id]'))
         .find(o => o.offsetParent !== null);
+
     if (firstVisible) {
         setSelectedPedido(firstVisible.dataset.mlId);
     }
+
+    // 🔥 ATIVA SCANNER AUTOMATICAMENTE
+    setTimeout(focusScanner, 200);
+});
+document.addEventListener('click', (e) => {
+
+    // não rouba foco de botões, inputs etc
+    if (e.target.closest('button, input, select, textarea, a, label')) return;
+
+    focusScanner();
 });
 focusBtn?.addEventListener('click', focusScanner);
 
