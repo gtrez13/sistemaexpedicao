@@ -147,8 +147,8 @@ def _buscar_produto_bling(sku: str):
             return (None, None)
         nome = prod.get("nome") or prod.get("descricao")
         pid = prod.get("id")
-        # 2) imagem: tenta no resumo; senão abre o detalhe
-        foto = _extrair_foto(prod)
+        # 2) imagem: resumo traz imagemURL de graça; senão abre o detalhe
+        foto = (prod.get("imagemURL") or "").strip() or _extrair_foto(prod)
         if not foto and pid:
             det = _bling._get_json(f"/produtos/{pid}")
             foto = _extrair_foto((det or {}).get("data") or {})
@@ -162,11 +162,26 @@ def _extrair_foto(prod: dict) -> str | None:
     """Varre o produto do Bling atrás da 1ª URL de imagem (midia.imagens)."""
     if not isinstance(prod, dict):
         return None
+    # campo direto (aparece no resumo da lista)
+    direto = (prod.get("imagemURL") or "").strip()
+    if direto:
+        return direto
     midia = prod.get("midia") or {}
     imgs = (midia.get("imagens") or {}) if isinstance(midia, dict) else {}
     for grupo in ("externas", "internas"):
         for im in (imgs.get(grupo) or []):
-            link = im.get("link") or im.get("linkMiniatura")
+            if isinstance(im, str) and im.strip():
+                return im.strip()
+            if isinstance(im, dict):
+                link = im.get("link") or im.get("linkMiniatura")
+                if link:
+                    return link
+    # imagensURL: lista de strings (ou dicts) com as URLs
+    for im in (imgs.get("imagensURL") or []):
+        if isinstance(im, str) and im.strip():
+            return im.strip()
+        if isinstance(im, dict):
+            link = im.get("link") or im.get("url") or im.get("linkMiniatura")
             if link:
                 return link
     # fallback: qualquer campo que pareça URL de imagem
@@ -209,5 +224,4 @@ else:
 PYEOF
 
 echo ""
-echo "OK. Agora reinicie o backend e teste:"
-echo "  curl -s localhost:5000/api/mapa/localizacoes"
+echo "OK. Reinicie o backend (systemctl restart wms-russia / wms-europa) e teste."
