@@ -113,13 +113,23 @@ def lote_key(txt) -> str:
 
 
 # ───────────────────────── regra FEFO ─────────────────────────
+def _prefixos_ignorados():
+    """Lotes 'INI-…' são o lote inicial criado pela carga ANVISA, não o lote impresso na caixa:
+    ninguém consegue bipar essa etiqueta, então não entram na regra. Ajuste em FEFO_IGNORAR_PREFIXOS
+    (lista separada por vírgula; vazio = não ignora nada)."""
+    return tuple(p.strip().upper() for p in os.environ.get("FEFO_IGNORAR_PREFIXOS", "INI-").split(",") if p.strip())
+
+
 def lotes_efetivos(conn, key: str):
     """Lotes do SKU com saldo efetivo > 0, do mais antigo (validade) para o mais novo."""
     rows = conn.execute(
         "SELECT id_lote, lote, lote_key, validade, saldo, sync_em FROM fefo_lote WHERE sku_key=?",
         (key,)).fetchall()
     out = []
+    ignorar = _prefixos_ignorados()
     for r in rows:
+        if ignorar and (r["lote"] or "").upper().startswith(ignorar):
+            continue
         usados = conn.execute(
             "SELECT COALESCE(SUM(qtd),0) AS q FROM fefo_bip WHERE sku_key=? AND lote_key=? AND criado_em>=?",
             (key, r["lote_key"], r["sync_em"])).fetchone()["q"]
