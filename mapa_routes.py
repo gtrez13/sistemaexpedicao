@@ -19,11 +19,12 @@ Regras de segurança contra 429 / travamento (o WMS roda com 1 worker, 1 thread)
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 import requests
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 try:                                  # produção: escolhe Postgres/SQLite pelo DATABASE_URL
     from db import db_session
@@ -60,6 +61,33 @@ class _Indisponivel(Exception):
         super().__init__(motivo)
         self.retry_em = max(int(retry_em), 1)
         self.motivo = motivo
+
+
+# ───────────────────────── diagnóstico de lentidão ─────────────────────────
+# Registra no log (journalctl) toda requisição do WMS que passar de SLOW_S segundos.
+# Com 1 worker / 1 thread, a requisição lenta é justamente a que trava todo mundo.
+# Só grava método, caminho (sem query string), status e duração. Para desligar: SLOW_S = 0.
+SLOW_S = 1.5
+_slowlog = logging.getLogger("gunicorn.error")
+
+
+@mapa_routes.before_app_request
+def _slow_inicio():
+    g._slow_t0 = time.perf_counter()
+
+
+@mapa_routes.after_app_request
+def _slow_fim(resp):
+    try:
+        t0 = getattr(g, "_slow_t0", None)
+        if SLOW_S and t0 is not None:
+            dur = time.perf_counter() - t0
+            if dur >= SLOW_S:
+                _slowlog.warning("[SLOW] %.1fs %s %s -> %s",
+                                 dur, request.method, request.path, resp.status_code)
+    except Exception:
+        pass
+    return resp
 
 
 # ───────────────────────── banco ─────────────────────────
