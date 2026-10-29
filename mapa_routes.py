@@ -4,8 +4,8 @@ Mapa do Galpão — localização de SKU (backend, v2).
 Endpoints (registrar com url_prefix="/api"):
 
     GET    /api/mapa/localizacoes        lista o que já foi mapeado (só banco, nunca chama o Bling)
-    POST   /api/mapa/localizacao         grava {sku, porta_palet, posicao, nome, foto}
-    DELETE /api/mapa/localizacao/<sku>   remove o SKU do mapa
+    POST   /api/mapa/localizacao         adiciona {sku, porta_palet, posicao, nome, foto} (N:N)
+    DELETE /api/mapa/localizacao/<sku>   remove o SKU (?porta_palet=&posicao= => só daquela posição)
     GET    /api/mapa/produto/<sku>       nome + foto (cache -> mapa -> Bling, nessa ordem)
     GET    /api/mapa/status              estado do Bling para este módulo (sem segredos)
 
@@ -68,20 +68,21 @@ def _garantir_tabelas():
     if _tabelas_ok:
         return
     with db_session() as conn:
+        # N:N — vários SKUs por posição e o mesmo SKU em várias posições
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS localizacao_sku (
-                sku_key       TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS mapa_localizacao (
+                sku_key       TEXT NOT NULL,
                 sku           TEXT NOT NULL,
                 nome          TEXT,
                 foto          TEXT,
                 porta_palet   INTEGER NOT NULL,
                 posicao       INTEGER NOT NULL,
-                atualizado_em BIGINT
+                atualizado_em BIGINT,
+                PRIMARY KEY (sku_key, porta_palet, posicao)
             )
         """)
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_localizacao_posicao
-            ON localizacao_sku (porta_palet, posicao)
+            CREATE INDEX IF NOT EXISTS ix_mapa_loc_pos ON mapa_localizacao (porta_palet, posicao)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS mapa_produto_cache (
@@ -114,7 +115,8 @@ def listar_localizacoes():
     _garantir_tabelas()
     with db_session() as conn:
         rows = conn.execute(
-            "SELECT sku, nome, foto, porta_palet, posicao FROM localizacao_sku"
+            "SELECT sku, nome, foto, porta_palet, posicao FROM mapa_localizacao "
+            "ORDER BY porta_palet, posicao, sku"
         ).fetchall()
     return jsonify({"localizacoes": [
         {"sku": r["sku"], "nome": r["nome"], "foto": r["foto"],
@@ -125,6 +127,7 @@ def listar_localizacoes():
 
 @mapa_routes.post("/mapa/localizacao")
 def salvar_localizacao():
+    """Adiciona o SKU a uma posição (idempotente). Nome/foto valem para o SKU inteiro."""
     d = request.get_json(silent=True) or {}
     sku = _norm(d.get("sku"))
     nome = (d.get("nome") or "").strip()[:200]
@@ -141,38 +144,41 @@ def salvar_localizacao():
 
     _garantir_tabelas()
     key = _key(sku)
+    agora = int(time.time())
     with db_session() as conn:
-        ocup = conn.execute(
-            "SELECT sku, nome FROM localizacao_sku "
-            "WHERE porta_palet=? AND posicao=? AND sku_key<>?", (pp, pos, key)
-        ).fetchone()
-        if ocup:
-            return jsonify({
-                "error": f"Posição ocupada por {ocup['sku']}. Remova antes de trocar.",
-                "ocupante": {"sku": ocup["sku"], "nome": ocup["nome"]},
-            }), 409
         if not foto:      # reaproveita foto já conhecida — só banco, nunca Bling
+            p = conn.execute(
+                "SELECT foto FROM mapa_localizacao WHERE sku_key=? AND foto IS NOT NULL AND foto<>'' LIMIT 1",
+                (key,)).fetchone()
+            foto = p["foto"] if p else None
+        if not foto:
             c = conn.execute("SELECT foto FROM mapa_produto_cache WHERE sku_key=?", (key,)).fetchone()
             foto = (c["foto"] if c else None) or None
-        if not foto:
-            p = conn.execute("SELECT foto FROM localizacao_sku WHERE sku_key=?", (key,)).fetchone()
-            foto = (p["foto"] if p else None) or None
         conn.execute("""
-            INSERT INTO localizacao_sku (sku_key, sku, nome, foto, porta_palet, posicao, atualizado_em)
+            INSERT INTO mapa_localizacao (sku_key, sku, nome, foto, porta_palet, posicao, atualizado_em)
             VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT (sku_key) DO UPDATE SET
+            ON CONFLICT (sku_key, porta_palet, posicao) DO UPDATE SET
                 sku=EXCLUDED.sku, nome=EXCLUDED.nome, foto=EXCLUDED.foto,
-                porta_palet=EXCLUDED.porta_palet, posicao=EXCLUDED.posicao,
                 atualizado_em=EXCLUDED.atualizado_em
-        """, (key, sku, nome, foto, pp, pos, int(time.time())))
+        """, (key, sku, nome, foto, pp, pos, agora))
+        # nome/foto são do produto: mantém iguais nas outras posições do mesmo SKU
+        conn.execute("UPDATE mapa_localizacao SET nome=?, foto=? WHERE sku_key=?", (nome, foto, key))
     return jsonify({"success": True, "sku": sku, "porta_palet": pp, "posicao": pos})
 
 
 @mapa_routes.delete("/mapa/localizacao/<path:sku>")
 def remover_localizacao(sku):
+    """Com ?porta_palet=&posicao= remove só aquela posição; sem eles, remove o SKU de todas."""
     _garantir_tabelas()
+    key = _key(sku)
+    pp = request.args.get("porta_palet", type=int)
+    pos = request.args.get("posicao", type=int)
     with db_session() as conn:
-        conn.execute("DELETE FROM localizacao_sku WHERE sku_key=?", (_key(sku),))
+        if pp is not None and pos is not None:
+            conn.execute("DELETE FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?",
+                         (key, pp, pos))
+        else:
+            conn.execute("DELETE FROM mapa_localizacao WHERE sku_key=?", (key,))
     return jsonify({"success": True, "sku": sku})
 
 
@@ -190,7 +196,7 @@ def produto(sku):
             "SELECT nome, foto, achou, consultado_em FROM mapa_produto_cache WHERE sku_key=?", (key,)
         ).fetchone()
         loc = conn.execute(
-            "SELECT nome, foto FROM localizacao_sku WHERE sku_key=?", (key,)
+            "SELECT nome, foto FROM mapa_localizacao WHERE sku_key=? LIMIT 1", (key,)
         ).fetchone()
 
     if c and agora - int(c["consultado_em"]) < _ttl(c):
