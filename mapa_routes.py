@@ -25,6 +25,7 @@ import time
 
 import requests
 from flask import Blueprint, g, jsonify, request
+from flask_login import login_required   # mesma sessão do resto do WMS (/api/auth/me)
 
 try:                                  # produção: escolhe Postgres/SQLite pelo DATABASE_URL
     from db import db_session
@@ -139,6 +140,7 @@ def _foto_ok(url):
 
 # ───────────────────────── endpoints ─────────────────────────
 @mapa_routes.get("/mapa/localizacoes")
+@login_required
 def listar_localizacoes():
     _garantir_tabelas()
     with db_session() as conn:
@@ -154,6 +156,7 @@ def listar_localizacoes():
 
 
 @mapa_routes.post("/mapa/localizacao")
+@login_required
 def salvar_localizacao():
     """Adiciona o SKU a uma posição (idempotente). Nome/foto valem para o SKU inteiro."""
     d = request.get_json(silent=True) or {}
@@ -195,6 +198,7 @@ def salvar_localizacao():
 
 
 @mapa_routes.delete("/mapa/localizacao/<path:sku>")
+@login_required
 def remover_localizacao(sku):
     """Com ?porta_palet=&posicao= remove só aquela posição; sem eles, remove o SKU de todas."""
     _garantir_tabelas()
@@ -211,6 +215,7 @@ def remover_localizacao(sku):
 
 
 @mapa_routes.get("/mapa/produto/<path:sku>")
+@login_required
 def produto(sku):
     sku = _norm(sku)
     key = _key(sku)
@@ -251,6 +256,7 @@ def produto(sku):
 
 
 @mapa_routes.get("/mapa/status")
+@login_required
 def status():
     agora = time.time()
     exp = None

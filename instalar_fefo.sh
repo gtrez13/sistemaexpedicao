@@ -37,6 +37,7 @@ import re
 import time
 
 from flask import Blueprint, jsonify, request
+from flask_login import login_required   # mesma sessão do resto do WMS (/api/auth/me)
 
 try:
     from db import db_session
@@ -174,6 +175,7 @@ def casa_lote(raw: str, lotes):
 
 # ───────────────────────── endpoints ─────────────────────────
 @fefo_routes.get("/fefo/sku/<path:sku>")
+@login_required
 def fefo_sku(sku):
     garantir_tabelas()
     if not ativo(sku):
@@ -192,6 +194,7 @@ def fefo_sku(sku):
 
 
 @fefo_routes.post("/fefo/validar")
+@login_required
 def fefo_validar():
     d = request.get_json(silent=True) or {}
     sku = (d.get("sku") or "").strip()
@@ -240,6 +243,7 @@ def fefo_validar():
 
 
 @fefo_routes.post("/fefo/desfazer")
+@login_required
 def fefo_desfazer():
     """Estorna o último bip FEFO do SKU+lote (o bip normal falhou depois da liberação)."""
     d = request.get_json(silent=True) or {}
@@ -256,6 +260,7 @@ def fefo_desfazer():
 
 
 @fefo_routes.get("/fefo/status")
+@login_required
 def fefo_status():
     garantir_tabelas()
     with db_session() as conn:
