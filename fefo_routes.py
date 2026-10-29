@@ -10,11 +10,13 @@ devagar (lotes + saldo por lote). NENHUM bip chama o Bling.
 
 Endpoints (registrar com url_prefix="/api"):
     GET  /api/fefo/sku/<sku>   -> {exigir, proximo, lotes[]}      (só banco)
-    POST /api/fefo/validar     -> {sku, lote?, ml_id?, qtd?}      (só banco)
+    POST /api/fefo/validar     -> {sku, lote, ml_id?, qtd?}       (só banco)
+    POST /api/fefo/desfazer    -> {sku, lote}  estorna o último bip FEFO
     GET  /api/fefo/status      -> saúde da cópia local
 
 Segurança de rollout:
-  * Desligado por padrão: só exige lote se FEFO_ATIVO=1 no ambiente do serviço.
+  * Desligado por padrão: só exige lote se FEFO_ATIVO=1 no ambiente do serviço;
+    FEFO_SKUS=A,B limita a poucos SKUs (modo teste em produção).
   * SKU sem lote com saldo na cópia local => exigir:false (bipa como hoje).
   * O frontend, se o FEFO falhar/oscilar, segue bipando como hoje (fail-open).
 
@@ -38,8 +40,13 @@ fefo_routes = Blueprint("fefo_routes", __name__)
 _tabelas_ok = False
 
 
-def ativo() -> bool:
-    return os.environ.get("FEFO_ATIVO", "0").strip() in ("1", "true", "True", "sim")
+def ativo(sku=None) -> bool:
+    """FEFO_ATIVO=1 liga. FEFO_SKUS=A,B restringe a esses SKUs (use para testar em produção
+    sem afetar os demais). Sem FEFO_ATIVO nada é exigido."""
+    if os.environ.get("FEFO_ATIVO", "0").strip() not in ("1", "true", "True", "sim"):
+        return False
+    lista = {x.strip().lower() for x in os.environ.get("FEFO_SKUS", "").split(",") if x.strip()}
+    return not lista or sku_key(sku) in lista
 
 
 # ───────────────────────── banco ─────────────────────────
@@ -152,7 +159,7 @@ def casa_lote(raw: str, lotes):
 @fefo_routes.get("/fefo/sku/<path:sku>")
 def fefo_sku(sku):
     garantir_tabelas()
-    if not ativo():
+    if not ativo(sku):
         return jsonify({"exigir": False, "motivo": "desligado"})
     key = sku_key(sku)
     with db_session() as conn:
@@ -181,7 +188,7 @@ def fefo_validar():
         return jsonify({"error": "sku e lote são obrigatórios"}), 400
 
     garantir_tabelas()
-    if not ativo():
+    if not ativo(sku):
         return jsonify({"ok": True, "exigir": False})
     key = sku_key(sku)
     with db_session() as conn:
@@ -215,6 +222,22 @@ def fefo_validar():
                     "lote": escolhido["lote"], "validade": escolhido["validade"]})
 
 
+@fefo_routes.post("/fefo/desfazer")
+def fefo_desfazer():
+    """Estorna o último bip FEFO do SKU+lote (o bip normal falhou depois da liberação)."""
+    d = request.get_json(silent=True) or {}
+    sku = (d.get("sku") or "").strip()
+    lk = lote_key(d.get("lote"))
+    if not sku or not lk:
+        return jsonify({"error": "sku e lote são obrigatórios"}), 400
+    garantir_tabelas()
+    with db_session() as conn:
+        conn.execute(
+            "DELETE FROM fefo_bip WHERE id = (SELECT MAX(id) FROM fefo_bip WHERE sku_key=? AND lote_key=?)",
+            (sku_key(sku), lk))
+    return jsonify({"success": True})
+
+
 @fefo_routes.get("/fefo/status")
 def fefo_status():
     garantir_tabelas()
@@ -225,6 +248,7 @@ def fefo_status():
     ult = s["ult"]
     return jsonify({
         "fefo_ativo": ativo(),
+        "fefo_skus": os.environ.get("FEFO_SKUS", "") or None,
         "skus_sincronizados": s["n"], "skus_com_lote": c["n"], "lotes": l["n"],
         "ultima_sync_ha_s": (int(time.time()) - int(ult)) if ult else None,
     })
