@@ -4,6 +4,7 @@ Sincroniza lotes + saldo por lote do Bling para a cópia local do WMS (tabelas f
 
 Rode DENTRO da pasta do backend, com o venv do WMS:
     python fefo_sync.py --pendentes            # SKUs de pedidos ainda não concluídos
+    python fefo_sync.py --todos --max 300      # todos os SKUs do cadastro (repita até 0 SKU(s))
     python fefo_sync.py --skus MP001,V000023   # SKUs específicos
     python fefo_sync.py --arquivo skus.txt     # um SKU por linha
     python fefo_sync.py --pendentes --max 80   # limite por rodada (padrão 150)
@@ -100,6 +101,11 @@ class Bling:
         return self.dep
 
 
+def skus_todos(conn):
+    rows = conn.execute("SELECT DISTINCT sku FROM produtos WHERE sku IS NOT NULL AND sku <> ''").fetchall()
+    return [r["sku"] for r in rows if r["sku"]]
+
+
 def skus_pendentes(conn):
     rows = conn.execute("""
         SELECT DISTINCT pr.sku AS sku
@@ -170,6 +176,7 @@ def main():
     ap.add_argument("--skus")
     ap.add_argument("--arquivo")
     ap.add_argument("--pendentes", action="store_true")
+    ap.add_argument("--todos", action="store_true", help="todos os SKUs do cadastro do WMS (rode em lotes: --max)")
     ap.add_argument("--max", type=int, default=150)
     ap.add_argument("--horas", type=float, default=6)
     ap.add_argument("--forcar", action="store_true")
@@ -181,10 +188,10 @@ def main():
         skus += a.skus.split(",")
     if a.arquivo:
         skus += open(a.arquivo, encoding="utf-8").read().split()
-    if a.pendentes:
+    if a.pendentes or a.todos:
         try:
             with db_session() as conn:
-                skus += skus_pendentes(conn)
+                skus += skus_todos(conn) if a.todos else skus_pendentes(conn)
         except Exception as e:
             print(f"não consegui listar SKUs pendentes ({e}). Use --skus ou --arquivo.")
             return 2

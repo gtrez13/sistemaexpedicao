@@ -21,7 +21,8 @@ Segurança de rollout:
   * O frontend, se o FEFO falhar/oscilar, segue bipando como hoje (fail-open).
 
 Limite conhecido: o saldo do Bling só baixa do lote quando a NF sai com lote (próxima
-pendência). Até lá, o saldo efetivo = saldo sincronizado - bips FEFO feitos depois da sync.
+pendência). Até lá, saldo efetivo = saldo do Bling - TODOS os bips FEFO (acumulado, não zera na sync).
+Quando o passo de lote na NF existir, ele deve abater/zerar esse consumo local.
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ import re
 import time
 
 from flask import Blueprint, jsonify, request
-from flask_login import login_required   # mesma sessão do resto do WMS (/api/auth/me)
+from flask_login import current_user, login_required   # mesma sessão do resto do WMS (/api/auth/me)
 
 try:
     from db import db_session
@@ -91,6 +92,18 @@ def garantir_tabelas(conn=None):
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS ix_fefo_bip_sku ON fefo_bip (sku_key, lote_key)")
+        c.execute(f"""
+            CREATE TABLE IF NOT EXISTS fefo_excecao (
+                id        {pk},
+                sku_key   TEXT NOT NULL,
+                sku       TEXT NOT NULL,
+                lote_lido TEXT,
+                motivo    TEXT,
+                ml_id     TEXT,
+                usuario   TEXT,
+                criado_em BIGINT NOT NULL
+            )
+        """)
 
     if conn is not None:
         _run(conn)
@@ -103,6 +116,12 @@ def garantir_tabelas(conn=None):
 def _eh_postgres() -> bool:
     """Mesma regra do db/__init__.py: DATABASE_URL definido => Postgres."""
     return bool(os.environ.get("DATABASE_URL"))
+
+
+def pode_liberar() -> bool:
+    """Quem pode liberar o bip sem conferir o lote (fica registrado). FEFO_LIBERAR_ROLES, padrão admin,supervisor."""
+    roles = {r.strip().lower() for r in os.environ.get("FEFO_LIBERAR_ROLES", "admin,supervisor").split(",") if r.strip()}
+    return str(getattr(current_user, "role", "") or "").lower() in roles
 
 
 def sku_key(sku) -> str:
@@ -131,9 +150,12 @@ def lotes_efetivos(conn, key: str):
     for r in rows:
         if ignorar and (r["lote"] or "").upper().startswith(ignorar):
             continue
+        # Consumo ACUMULADO: o saldo do lote no Bling só baixa quando a NF sair com lote (passo futuro).
+        # Até lá o consumo FEFO fica registrado aqui e NÃO zera na sincronização — senão um lote já
+        # esgotado voltaria a aparecer com saldo a cada sync e travaria o operador.
         usados = conn.execute(
-            "SELECT COALESCE(SUM(qtd),0) AS q FROM fefo_bip WHERE sku_key=? AND lote_key=? AND criado_em>=?",
-            (key, r["lote_key"], r["sync_em"])).fetchone()["q"]
+            "SELECT COALESCE(SUM(qtd),0) AS q FROM fefo_bip WHERE sku_key=? AND lote_key=?",
+            (key, r["lote_key"])).fetchone()["q"]
         efetivo = float(r["saldo"]) - float(usados or 0)
         if efetivo > 0:
             out.append({"lote": r["lote"], "lote_key": r["lote_key"],
@@ -180,7 +202,7 @@ def fefo_sku(sku):
         return jsonify({"exigir": False, "motivo": "sem_lote"})
     pr = lotes[0]
     return jsonify({
-        "exigir": True,
+        "exigir": True, "pode_liberar": pode_liberar(),
         "proximo": {"lote": pr["lote"], "validade": pr["validade"], "saldo": pr["saldo"]},
         "lotes": [{"lote": l["lote"], "validade": l["validade"], "saldo": l["saldo"]} for l in lotes],
     })
@@ -219,12 +241,12 @@ def fefo_validar():
             motivo = "lote_sem_saldo" if conhecido else "lote_desconhecido"
             msg = ("Esse lote está sem saldo no sistema." if motivo == "lote_sem_saldo"
                    else "Lote não consta no sistema para este SKU. Confira a etiqueta.")
-            return jsonify({"ok": False, "motivo": motivo, "mensagem": msg,
+            return jsonify({"ok": False, "motivo": motivo, "mensagem": msg, "pode_liberar": pode_liberar(),
                             "deve_pegar": {"lote": pr["lote"], "validade": pr["validade"], "saldo": pr["saldo"]}})
         # aceita o mais antigo ou qualquer lote com a MESMA validade do mais antigo
         if escolhido["validade"] != pr["validade"]:
             return jsonify({
-                "ok": False, "motivo": "lote_mais_novo",
+                "ok": False, "motivo": "lote_mais_novo", "pode_liberar": pode_liberar(),
                 "mensagem": f"Há lote mais antigo em estoque: {pr['lote']} (val {pr['validade'] or 's/ validade'}). Pegue esse primeiro.",
                 "deve_pegar": {"lote": pr["lote"], "validade": pr["validade"], "saldo": pr["saldo"]},
             })
@@ -233,6 +255,38 @@ def fefo_validar():
             (key, escolhido["lote_key"], ml_id, qtd, int(time.time())))
     return jsonify({"ok": True, "exigir": True,
                     "lote": escolhido["lote"], "validade": escolhido["validade"]})
+
+
+@fefo_routes.post("/fefo/liberar")
+@login_required
+def fefo_liberar():
+    """Supervisor/admin libera o bip sem conferir o lote. Fica registrado (base do 'não achado em estoque')."""
+    if not pode_liberar():
+        return jsonify({"error": "Somente supervisor/admin pode liberar sem conferir o lote."}), 403
+    d = request.get_json(silent=True) or {}
+    sku = (d.get("sku") or "").strip()
+    if not sku:
+        return jsonify({"error": "sku é obrigatório"}), 400
+    garantir_tabelas()
+    quem = str(getattr(current_user, "username", None) or getattr(current_user, "id", "") or "")
+    with db_session() as conn:
+        conn.execute(
+            "INSERT INTO fefo_excecao (sku_key, sku, lote_lido, motivo, ml_id, usuario, criado_em) VALUES (?,?,?,?,?,?,?)",
+            (sku_key(sku), sku[:64], (d.get("lote_lido") or "")[:120], (d.get("motivo") or "")[:200],
+             (d.get("ml_id") or "")[:64] or None, quem[:80], int(time.time())))
+    return jsonify({"success": True})
+
+
+@fefo_routes.get("/fefo/excecoes")
+@login_required
+def fefo_excecoes():
+    if not pode_liberar():
+        return jsonify({"error": "Somente supervisor/admin."}), 403
+    garantir_tabelas()
+    with db_session() as conn:
+        rows = conn.execute(
+            "SELECT sku, lote_lido, motivo, ml_id, usuario, criado_em FROM fefo_excecao ORDER BY id DESC LIMIT 200").fetchall()
+    return jsonify({"excecoes": [dict(r) for r in rows]})
 
 
 @fefo_routes.post("/fefo/desfazer")
