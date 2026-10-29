@@ -315,6 +315,7 @@ from services.bling_service import BlingService
 
 BASE = "https://api.bling.com.br/Api/v3"
 PAUSA = 0.6
+LIMITE_PAGINA = 100
 TIMEOUT = (3, 10)
 
 
@@ -409,6 +410,10 @@ def sincronizar_sku(b: Bling, sku: str, id_bling):
     r = b.get("/produtos/lotes", {"idsProdutos[]": id_bling}) or {}
     lotes = r.get("data") or []
     if not lotes:
+        return id_bling, []
+    if len(lotes) >= LIMITE_PAGINA:
+        # uma página cheia pode estar CORTADA: lista incompleta levaria o FEFO a mandar pegar o lote errado
+        print(f"  !! {sku}: {len(lotes)} lotes (limite da página) — lista pode estar incompleta; FEFO ignora este SKU")
         return id_bling, []
     ids = [l["idLote"] for l in lotes if l.get("idLote") is not None]
     r = b.get(f"/produtos/{id_bling}/lotes/depositos/{b.deposito()}/saldo", {"idsLotes[]": ids}) or {}
