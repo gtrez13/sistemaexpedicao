@@ -294,6 +294,11 @@ try:
 except Exception:
     pass
 
+try:                       # mesmo ajuste de JWT (enable-jwt) que o WMS usa; o cabeçalho abaixo cobre se faltar
+    import bling_jwt  # noqa: F401
+except Exception:
+    pass
+
 from db import db_session
 from fefo_routes import garantir_tabelas, lote_key, sku_key
 from services.bling_service import BlingService
@@ -327,7 +332,8 @@ class Bling:
         self.ultima = time.time()
         try:
             r = requests.get(BASE + path, params=params, timeout=TIMEOUT,
-                             headers={"Authorization": f"Bearer {t['access_token']}", "Accept": "application/json"})
+                             headers={"Authorization": f"Bearer {t['access_token']}", "Accept": "application/json",
+                                     "enable-jwt": "1"})
         except requests.RequestException as e:
             raise Parar(f"rede: {e}")
         if r.status_code == 200:

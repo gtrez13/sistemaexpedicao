@@ -306,7 +306,8 @@ def _bling_get(path: str, params=None):
 
         try:
             r = requests.get(BLING_BASE + path, params=params, timeout=TIMEOUT,
-                             headers={"Authorization": f"Bearer {access}", "Accept": "application/json"})
+                             headers={"Authorization": f"Bearer {access}", "Accept": "application/json",
+                                     "enable-jwt": "1"})
         except requests.RequestException:
             _cooldown(COOLDOWN_FALHA, "rede")
             raise _Indisponivel(COOLDOWN_FALHA, "rede")
