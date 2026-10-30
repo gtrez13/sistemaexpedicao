@@ -16,10 +16,15 @@ Endpoints (url_prefix="/api"; todos exigem login):
     POST /api/nao-achado                 operador/qualquer logado: {sku, nome?, qtd?, ml_id?, estoque_bling?, locais?, obs?}
     GET  /api/nao-achado[?status=]       supervisor/admin: lista (aberto|vencido|explicado|aceito|cobrar|todos)
     POST /api/nao-achado/<id>/explicar   supervisor/admin: {texto} (mín. 10 caracteres)
-    POST /api/nao-achado/<id>/decidir    admin: {decisao: aceito|cobrar, parecer?}
+    POST /api/nao-achado/<id>/decidir    admin: {decisao: aceito|cobrar, parecer?, confirmar_sem_estoque?}
+    POST /api/nao-achado/<id>/reprocessar admin: refaz o que falhou (zerar no Bling / avisar o Velaplace)
     GET  /api/nao-achado/resumo          supervisor/admin: contadores (abertos, vencidos, a decidir)
 
-Só banco local: não chama o Bling.
+ÚLTIMA ETAPA (admin com confirmar_sem_estoque=true): o WMS zera o saldo do produto NO DEPÓSITO da
+LHVMed (BLING_DEPOSITO_ID) no Bling (lançamento de balanço = 0), confere o saldo depois e avisa o
+Velaplace (VELAPLACE_API_URL + VELAPLACE_TOKEN; sem isso o aviso fica "simulado").
+Só roda com NAO_ACHADO_ZERAR_BLING=1 no ambiente do serviço (senão fica "desligado" e nada é escrito no Bling).
+Falha nunca derruba a decisão: o resultado fica gravado e o admin pode "reprocessar".
 """
 from __future__ import annotations
 
@@ -92,6 +97,16 @@ def garantir_tabelas(conn=None):
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS ix_nao_achado_status ON nao_achado (status, reportado_em)")
+        extras = [("estoque_status", "TEXT"), ("estoque_anterior", "DOUBLE PRECISION"), ("estoque_msg", "TEXT"),
+                  ("estoque_zerado_em", "BIGINT"), ("velaplace_status", "TEXT"), ("velaplace_msg", "TEXT")]
+        if os.environ.get("DATABASE_URL"):
+            for col, tp in extras:
+                c.execute(f"ALTER TABLE nao_achado ADD COLUMN IF NOT EXISTS {col} {tp}")
+        else:
+            have = {r[1] for r in c.execute("PRAGMA table_info(nao_achado)").fetchall()}
+            for col, tp in extras:
+                if col not in have:
+                    c.execute(f"ALTER TABLE nao_achado ADD COLUMN {col} {tp}")
 
     if conn is not None:
         _run(conn)
@@ -99,6 +114,95 @@ def garantir_tabelas(conn=None):
         with db_session() as c:
             _run(c)
     _tabelas_ok = True
+
+
+# ───────────────────── zerar no Bling + avisar o Velaplace ─────────────────────
+def _zerar_ligado() -> bool:
+    return os.environ.get("NAO_ACHADO_ZERAR_BLING", "0").strip() in ("1", "true", "True", "sim")
+
+
+def _saldo_no_deposito(bs, produto_id, deposito):
+    """Saldo físico do produto SÓ no depósito informado (None se não deu para ler)."""
+    r = bs._get("/estoques/saldos", params=[("idsProdutos[]", str(int(produto_id)))])
+    if r.status_code != 200:
+        raise RuntimeError(f"Bling saldos HTTP {r.status_code}")
+    rows = (r.json() or {}).get("data") or []
+    for row in rows:
+        for d in (row.get("depositos") or []):
+            if str(d.get("id")) == str(deposito):
+                return float(d.get("saldoFisico") or 0)
+    return 0.0                      # depósito sem linha nos saldos = sem saldo ali
+
+
+def zerar_no_bling(sku: str, motivo: str):
+    """-> (status, saldo_anterior, mensagem). status: ok | ja_zerado | desligado | erro."""
+    if not _zerar_ligado():
+        return "desligado", None, "NAO_ACHADO_ZERAR_BLING não está ligado: nada foi escrito no Bling."
+    dep = os.environ.get("BLING_DEPOSITO_ID", "").strip()
+    if not dep:
+        return "erro", None, "BLING_DEPOSITO_ID não definido: não sei qual depósito zerar."
+    try:
+        from services.bling_service import BlingService
+        bs = BlingService()
+        r = bs._get("/produtos", params={"codigo": sku, "limite": 5})
+        if r.status_code != 200:
+            return "erro", None, f"Bling produtos HTTP {r.status_code}"
+        prods = [p for p in ((r.json() or {}).get("data") or []) if str(p.get("codigo", "")).lower() == sku.lower()]
+        if not prods:
+            return "erro", None, "Produto não encontrado no Bling pelo código (SKU)."
+        pid = int(prods[0]["id"])
+        antes = _saldo_no_deposito(bs, pid, dep)
+        if antes == 0:
+            return "ja_zerado", 0.0, "O saldo já era 0 no depósito da LHVMed."
+        corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "B", "quantidade": 0,
+                 "observacoes": ("WMS: não achado em estoque. " + (motivo or ""))[:250]}
+        w = bs._post("/estoques", json=corpo)
+        if w.status_code not in (200, 201):
+            return "erro", antes, f"Bling recusou o balanço: HTTP {w.status_code} {w.text[:200]}"
+        depois = _saldo_no_deposito(bs, pid, dep)
+        if depois != 0:
+            return "erro", antes, f"Balanço enviado, mas o saldo continua {depois:g} (conferir no Bling)."
+        return "ok", antes, f"Saldo {antes:g} -> 0 no depósito {dep}."
+    except Exception as e:   # nunca derruba a decisão do admin
+        return "erro", None, f"{type(e).__name__}: {e}"[:300]
+
+
+def avisar_velaplace(dados: dict):
+    """-> (status, mensagem). status: ok | simulado | erro. Contrato em INTEGRACAO_VELAPLACE_ESTOQUE_ZERADO.md."""
+    base = os.environ.get("VELAPLACE_API_URL", "").rstrip("/")
+    token = os.environ.get("VELAPLACE_TOKEN", "")
+    path = os.environ.get("VELAPLACE_ESTOQUE_PATH", "/api/estoque/zerado")
+    if not base or not token:
+        return "simulado", "Velaplace não configurado (VELAPLACE_API_URL/VELAPLACE_TOKEN): aviso apenas registrado."
+    try:
+        import requests
+        r = requests.post(base + path, json=dados, timeout=8,
+                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        if r.status_code in (200, 201, 202, 204):
+            return "ok", f"Velaplace respondeu {r.status_code}."
+        return "erro", f"Velaplace HTTP {r.status_code}: {r.text[:150]}"
+    except Exception as e:
+        return "erro", f"{type(e).__name__}: {e}"[:300]
+
+
+def _executar_final(conn, nid, r, parecer):
+    """Zera no Bling e avisa o Velaplace; grava o resultado na ocorrência."""
+    if r["estoque_status"] in ("ok", "ja_zerado"):       # reprocesso: só o aviso falhou, não zera de novo
+        est, antes, msg = r["estoque_status"], r["estoque_anterior"], r["estoque_msg"] or ""
+    else:
+        est, antes, msg = zerar_no_bling(r["sku"], r["explicacao"] or "")
+    agora = int(time.time())
+    vst = vmsg = None
+    if est in ("ok", "ja_zerado"):
+        vst, vmsg = avisar_velaplace({
+            "evento": "estoque_zerado", "sku": r["sku"], "produto": r["nome"], "quantidade_anterior": antes,
+            "motivo": r["explicacao"] or parecer or "Não achado em estoque (confirmado pelo admin)",
+            "ocorrencia_id": nid, "origem": "wms-lhvmed", "confirmado_por": _quem(), "confirmado_em": agora})
+    conn.execute(
+        "UPDATE nao_achado SET estoque_status=?, estoque_anterior=?, estoque_msg=?, estoque_zerado_em=?, "
+        "velaplace_status=?, velaplace_msg=? WHERE id=?",
+        (est, antes, msg[:300], (r["estoque_zerado_em"] or agora) if est in ("ok", "ja_zerado") else None, vst, (vmsg or "")[:300] or None, nid))
+    return {"estoque_status": est, "estoque_msg": msg, "velaplace_status": vst, "velaplace_msg": vmsg}
 
 
 def _fmt(r, agora=None):
@@ -213,16 +317,42 @@ def decidir(nid):
     dec = (d.get("decisao") or "").lower()
     if dec not in ("aceito", "cobrar"):
         return jsonify({"error": "decisao deve ser 'aceito' ou 'cobrar'"}), 400
+    confirmar = bool(d.get("confirmar_sem_estoque"))
     garantir_tabelas()
     with db_session() as conn:
-        r = conn.execute("SELECT status, prazo_em FROM nao_achado WHERE id=?", (nid,)).fetchone()
+        r = conn.execute("SELECT * FROM nao_achado WHERE id=?", (nid,)).fetchone()
         if not r:
             return jsonify({"error": "Ocorrência não encontrada."}), 404
-        if r["status"] == "aceito" or r["status"] == "cobrar":
+        if r["status"] in ("aceito", "cobrar"):
             return jsonify({"error": "Já decidida."}), 409
+        parecer = (d.get("parecer") or "")[:500]
         conn.execute("UPDATE nao_achado SET status=?, parecer=?, decidido_por=?, decidido_em=? WHERE id=?",
-                     (dec, (d.get("parecer") or "")[:500], _quem(), int(time.time()), nid))
-    return jsonify({"success": True})
+                     (dec, parecer, _quem(), int(time.time()), nid))
+        final = {}
+        if confirmar:
+            final = _executar_final(conn, nid, r, parecer)
+        else:
+            conn.execute("UPDATE nao_achado SET estoque_status='nao_solicitado' WHERE id=?", (nid,))
+    return jsonify({"success": True, **final})
+
+
+@naoachado_routes.post("/nao-achado/<int:nid>/reprocessar")
+@login_required
+def reprocessar(nid):
+    """Refaz a última etapa (zerar no Bling / avisar o Velaplace) quando falhou. Só admin."""
+    if not eh_admin():
+        return jsonify({"error": "Somente admin."}), 403
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM nao_achado WHERE id=?", (nid,)).fetchone()
+        if not r:
+            return jsonify({"error": "Ocorrência não encontrada."}), 404
+        if r["status"] not in ("aceito", "cobrar"):
+            return jsonify({"error": "Só depois da decisão do admin."}), 409
+        if r["estoque_status"] in ("ok", "ja_zerado") and r["velaplace_status"] in ("ok", "simulado"):
+            return jsonify({"error": "Nada a reprocessar."}), 409
+        final = _executar_final(conn, nid, r, r["parecer"] or "")
+    return jsonify({"success": True, **final})
 NAEOF
 python3 -m py_compile naoachado_routes.py && echo ">> naoachado_routes.py ok"
 
@@ -247,3 +377,4 @@ PYEOF
 echo ""
 echo "OK. Reinicie: sudo systemctl restart wms-russia.service ; depois teste: curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/api/nao-achado   (deve dar 401)"
 echo "Prazo padrao 48h; para mudar: NAO_ACHADO_HORAS no drop-in do servico."
+echo "Zerar no Bling e avisar o Velaplace ficam DESLIGADOS ate voce ligar (ver instrucoes): NAO_ACHADO_ZERAR_BLING=1, BLING_DEPOSITO_ID=10488672491, VELAPLACE_API_URL, VELAPLACE_TOKEN."
