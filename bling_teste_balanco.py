@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Testa, SEM mudar o estoque, se o Bling aceita o lançamento de balanço que o "não achado" usa.
+Testa, SEM risco, se o Bling aceita o lançamento de balanço que o "não achado" usa.
 
-Faz um balanço com a MESMA quantidade que o produto já tem no depósito (saldo X -> X) e confere o
-saldo depois. Mostra o HTTP de cada chamada (o que interessa: o POST /estoques deve dar 200/201).
+Por segurança, o --enviar SÓ funciona em produto que já está com saldo 0 no depósito (balanço 0 -> 0:
+não muda nada, mesmo que o formato esteja errado). Em produto com saldo, o script só LÊ e mostra o que
+enviaria. Mostra o HTTP de cada chamada (o que interessa: o POST /estoques deve dar 200/201).
 
 Rode na pasta do backend, com o venv:
     python bling_teste_balanco.py SKU            # só LÊ e mostra o que enviaria (não escreve)
-    python bling_teste_balanco.py SKU --enviar   # envia o balanço X -> X (estoque não muda)
+    python bling_teste_balanco.py SKU --enviar   # só aceita se o saldo já é 0: envia o balanço 0 -> 0
 
-Use um SKU qualquer que tenha saldo > 0 (ex.: um produto parado). Precisa de BLING_DEPOSITO_ID no .env/ambiente.
+Procure um SKU com saldo 0 no depósito. Precisa de BLING_DEPOSITO_ID no .env/ambiente (padrão: LHVMed).
 """
 import json
 import os
@@ -44,12 +45,19 @@ def main():
                 saldo = float(d.get("saldoFisico") or 0)
     print(f"saldo físico no depósito {dep}:", saldo)
     if saldo is None:
-        print("depósito sem saldo para este produto — escolha outro SKU"); return 1
+        saldo = 0.0
+        print("(o produto não tem linha de saldo nesse depósito: tratado como saldo 0)")
     corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "B", "quantidade": saldo,
-             "observacoes": "TESTE WMS: balanço com a mesma quantidade (sem alteração)"}
+             "observacoes": "TESTE WMS: balanço sem alteração de saldo"}
     print("corpo que seria enviado:", json.dumps(corpo, ensure_ascii=False))
     if not enviar:
-        print("\n(nada foi escrito) Para enviar de verdade: acrescente --enviar"); return 0
+        if saldo == 0:
+            print("\n(nada foi escrito) Este produto está com saldo 0: pode rodar de novo com --enviar (sem risco).")
+        else:
+            print("\n(nada foi escrito) Este produto TEM saldo: o --enviar não será aceito. Procure um SKU com saldo 0.")
+        return 0
+    if saldo != 0:
+        print("\nRECUSADO: o produto tem saldo %g e o teste só envia em produto com saldo 0." % saldo); return 1
     w = bs._post("/estoques", json=corpo)
     print("POST /estoques ->", w.status_code, w.text[:300])
     s2 = bs._get("/estoques/saldos", params=[("idsProdutos[]", str(pid))])
@@ -60,7 +68,7 @@ def main():
                 novo = float(d.get("saldoFisico") or 0)
     print("saldo depois:", novo, "(igual ao de antes: %s)" % (novo == saldo))
     ok = w.status_code in (200, 201) and novo == saldo
-    print("\nRESULTADO:", "OK — o Bling aceita o balanço, pode ligar o zerar." if ok else "FALHOU — me mande esta saída.")
+    print("\nRESULTADO:", "OK — o Bling aceita o balanço (formato validado), pode ligar o zerar." if ok else "FALHOU — me mande esta saída.")
     return 0 if ok else 1
 
 
