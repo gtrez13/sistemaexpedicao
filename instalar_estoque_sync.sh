@@ -189,10 +189,100 @@ if __name__ == "__main__":
 ESEOF
 chmod +x estoque_sync.py
 python3 -m py_compile estoque_sync.py && echo ">> estoque_sync.py instalado"
+cat > estoque_routes.py <<'EREOF'
+"""
+Atualiza o estoque do Bling SOB DEMANDA (ex.: logo depois do "Sincronizar ML").
+
+    POST /api/estoque/atualizar   dispara estoque_sync.py em segundo plano e responde NA HORA
+    GET  /api/estoque/status      {rodando: true|false}  (o front espera acabar e recarrega a lista)
+
+Não faz nenhuma chamada ao Bling dentro da requisição (o servidor web tem 1 worker): só dispara o script
+independente, o mesmo do cron, com o mesmo bloqueio (flock) — nunca rodam dois ao mesmo tempo.
+"""
+from __future__ import annotations
+
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+from flask import Blueprint, jsonify
+from flask_login import login_required
+
+estoque_routes = Blueprint("estoque_routes", __name__)
+
+LOCK = "/tmp/estoque_sync.lock"
+AQUI = os.path.dirname(os.path.abspath(__file__))
+MIN_ENTRE_DISPAROS_S = 20
+_ultimo = 0.0
+
+
+def _rodando() -> bool:
+    try:
+        fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o666)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+@estoque_routes.get("/estoque/status")
+@login_required
+def status():
+    return jsonify({"rodando": _rodando()})
+
+
+@estoque_routes.post("/estoque/atualizar")
+@login_required
+def atualizar():
+    global _ultimo
+    script = os.path.join(AQUI, "estoque_sync.py")
+    if not os.path.exists(script):
+        return jsonify({"iniciado": False, "motivo": "estoque_sync.py não instalado"})
+    if _rodando():
+        return jsonify({"iniciado": False, "rodando": True})
+    if time.time() - _ultimo < MIN_ENTRE_DISPAROS_S:
+        return jsonify({"iniciado": False, "recente": True})
+    _ultimo = time.time()
+    env = dict(os.environ)
+    env.setdefault("BLING_DEPOSITO_ID", "10488672491")
+    try:
+        log = open(os.path.expanduser("~/nexuswms/estoque_sync.log"), "a")
+    except OSError:
+        log = subprocess.DEVNULL
+    subprocess.Popen(["flock", "-n", LOCK, sys.executable, script], cwd=AQUI, env=env,
+                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    return jsonify({"iniciado": True})
+EREOF
+python3 -m py_compile estoque_routes.py && echo ">> estoque_routes.py instalado (atualiza o estoque ao Sincronizar ML)"
+python3 - <<'PYEOF'
+f="app.py"; s=open(f, encoding="utf-8").read()
+if "estoque_routes" in s:
+    print(">> app.py ja tinha o estoque_routes (ok)")
+else:
+    linha = '    from estoque_routes import estoque_routes as estoque_bp\n    app.register_blueprint(estoque_bp, url_prefix="/api")\n'
+    for a in ['    app.register_blueprint(naoachado_bp, url_prefix="/api")\n', '    app.register_blueprint(fefo_bp, url_prefix="/api")\n',
+              '    app.register_blueprint(mapa_bp, url_prefix="/api")\n', "    app.register_blueprint(api_routes)\n"]:
+        if a in s:
+            open(f + ".bak_estoque", "w", encoding="utf-8").write(s)
+            open(f, "w", encoding="utf-8").write(s.replace(a, a + linha, 1))
+            print(">> app.py patchado (backup em app.py.bak_estoque)"); break
+    else:
+        print("!! Nao achei onde registrar o estoque_routes. Adicione dentro de create_app():"); print(linha); raise SystemExit(1)
+PYEOF
+python3 -m py_compile app.py && echo ">> app.py compila"
 echo ">> teste sem gravar (mostra o que mudaria):"
 BLING_DEPOSITO_ID=$DEP venv/bin/python estoque_sync.py --dry 2>&1 | grep -v -i "warn" | tail -40
 echo ""
-echo "Se o teste acima parece certo, ligue o automatico:  bash instalar_estoque_sync.sh --cron"
+echo "Reinicie o servico para ativar o botao: sudo systemctl restart wms-russia.service"
+echo "Cron a cada 5 min (se ainda nao ligou):  bash instalar_estoque_sync.sh --cron"
 exit 0
 fi
 
