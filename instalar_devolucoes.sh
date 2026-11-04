@@ -537,6 +537,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             if checadas >= ORCAMENTO_POR_RODADA or parou_429:
                 continue
             checadas += 1
+            st_envio = None
             if pausa:
                 time.sleep(pausa)
             code, ret = ml_get(f"/post-purchase/v2/claims/{cid}/returns")
@@ -557,7 +558,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 ficam_ml += 1
                 if ex and ex["status"] == "esperada" and not ex["bipado"]:   # corrige a que entrou como "a caminho do galpão"
                     conn.execute("UPDATE devolucoes SET status='armazem_ml', atualizado_em=? WHERE id=?", (agora, ex["id"]))
-            if resultado in ("importada", "armazem_ml") and not ex:
+            if (resultado in ("importada", "armazem_ml") or resultado.startswith("erro_")) and not ex:
                 if pausa:
                     time.sleep(pausa)
                 _, ped = ml_get(f"/orders/{c.get('resource_id')}")
@@ -571,14 +572,15 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                         sku, d["produto"] = p["sku"], p["nome"]
                 row = {
                     "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre",
-                    "status": "esperada" if resultado == "importada" else "armazem_ml",
+                    "status": "armazem_ml" if resultado == "armazem_ml" else "esperada",
                     "data_recebimento": time.strftime("%Y-%m-%d"), "loja": loja, "cliente": d["cliente"],
                     "numero_venda": str(c.get("resource_id")), "sku": sku or None,
                     "sku_key": sku[:64].lower() if sku else None, "produto": d["produto"],
                     "qtd": float(d["qtd"] or 1), "valor": d["valor"], "teve_reclamacao": 1,
                     "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
                     "observacoes": f"Importada do Mercado Livre. Motivo ML: {motivo}. Envio de volta: {st_envio or '—'}."
-                                   + (" Vai para o ARMAZÉM DO ML (FULL): não passa pelo galpão." if resultado == "armazem_ml" else ""),
+                                   + (" Vai para o ARMAZÉM DO ML (FULL): não passa pelo galpão." if resultado == "armazem_ml" else "")
+                                   + (f" ATENÇÃO: o ML não liberou os detalhes desta devolução ({resultado.upper()}): destino NÃO confirmado, confira na chegada." if resultado.startswith("erro_") else ""),
                 }
                 cols = list(row)
                 conn.execute(f"INSERT INTO devolucoes ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
