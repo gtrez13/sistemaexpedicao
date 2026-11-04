@@ -28,17 +28,25 @@ def get(path, params=None):
         return r.status_code, {"_raw": r.text[:300]}
 
 print("conta ML:", uid)
-st, j = get("/post-purchase/v1/claims/search", {"limit": 10, "type": "returns"})
-if st != 200:
-    st, j = get("/post-purchase/v1/claims/search", {"limit": 10})
-dados = j.get("data") or []
-print("paging:", j.get("paging"), "| qtd:", len(dados))
-for c in dados[:5]:
-    print(json.dumps({k: c.get(k) for k in ("id", "type", "stage", "status", "reason_id", "resource", "resource_id", "date_created")}, ensure_ascii=False))
-if dados:
-    cid = dados[0].get("id")
-    print("\n--- detalhe da primeira ---")
+todas, off = [], 0
+while off < 200:
+    st, j = get("/post-purchase/v1/claims/search", {"limit": 50, "offset": off, "type": "returns"})
+    if st != 200: break
+    pg = j.get("data") or []
+    todas += pg
+    off += 50
+    if len(pg) < 50: break
+todas.sort(key=lambda c: c.get("date_created") or "", reverse=True)
+print("total lido:", len(todas), "| status:", {s_: sum(1 for c in todas if c.get("status") == s_) for s_ in {c.get("status") for c in todas}})
+print("--- 8 mais recentes ---")
+for c in todas[:8]:
+    print(json.dumps({k: c.get(k) for k in ("id", "stage", "status", "reason_id", "resource_id", "date_created")}, ensure_ascii=False))
+abertas = [c for c in todas if c.get("status") != "closed"]
+alvo = (abertas or todas)[:2]
+for c in alvo:
+    cid = c["id"]
+    print(f"\n--- detalhe claim {cid} ({c.get('status')}) ---")
     st, d = get(f"/post-purchase/v1/claims/{cid}")
-    print(json.dumps(d, ensure_ascii=False)[:1200])
+    print(json.dumps(d, ensure_ascii=False)[:900])
     st, r = get(f"/post-purchase/v2/claims/{cid}/returns")
-    print(json.dumps(r, ensure_ascii=False)[:1200])
+    print(json.dumps(r, ensure_ascii=False)[:1500])
