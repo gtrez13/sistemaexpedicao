@@ -112,6 +112,7 @@ def garantir_tabelas(conn=None):
                 produto          TEXT,
                 qtd              DOUBLE PRECISION NOT NULL DEFAULT 1,
                 valor            DOUBLE PRECISION,
+                custo_devolucao  DOUBLE PRECISION,
                 serie_lote       TEXT,
                 nf_saida         TEXT,
                 teve_reclamacao  INTEGER,
@@ -137,10 +138,13 @@ def garantir_tabelas(conn=None):
         """)
         if os.environ.get("DATABASE_URL"):
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_claim_id TEXT")
+            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_devolucao DOUBLE PRECISION")
         else:
             have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
             if "ml_claim_id" not in have:
                 c.execute("ALTER TABLE devolucoes ADD COLUMN ml_claim_id TEXT")
+            if "custo_devolucao" not in have:
+                c.execute("ALTER TABLE devolucoes ADD COLUMN custo_devolucao DOUBLE PRECISION")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -250,6 +254,8 @@ def _aplicar(d: dict, base: dict | None = None) -> dict:
             out["qtd"] = 1.0
     if "valor" in d:
         out["valor"] = _num(d["valor"])
+    if "custo_devolucao" in d:
+        out["custo_devolucao"] = _num(d["custo_devolucao"])
     if "bipado" in d:
         out["bipado"] = 1 if d["bipado"] else 0
     if "checklist" in d and isinstance(d["checklist"], dict):
@@ -316,12 +322,15 @@ def listar():
 def resumo():
     garantir_tabelas()
     with db_session() as conn:
-        tot = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v FROM devolucoes").fetchone()
+        tot = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v, COALESCE(SUM(custo_devolucao),0) AS c FROM devolucoes").fetchone()
+        volt = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v FROM devolucoes WHERE volta_estoque=1").fetchone()
         por = conn.execute("SELECT status, COUNT(*) AS n FROM devolucoes GROUP BY status").fetchall()
         sac = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE sac_status<>'enviado'").fetchone()["n"]
-        volta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE volta_estoque=1").fetchone()["n"]
-    return jsonify({"total": tot["n"], "valor": float(tot["v"] or 0), "por_status": {r["status"]: r["n"] for r in por},
-                    "sac_pendentes": sac, "voltam_estoque": volta})
+    return jsonify({"total": tot["n"], "valor": float(tot["v"] or 0),
+                    "valor_voltou": float(volt["v"] or 0),          # produtos que voltaram ao estoque (verde)
+                    "custo_devolucao": float(tot["c"] or 0),        # o que a empresa arcou para a devolução (vermelho)
+                    "por_status": {r["status"]: r["n"] for r in por},
+                    "sac_pendentes": sac, "voltam_estoque": volt["n"]})
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>")
@@ -427,7 +436,7 @@ def exportar():
     with db_session() as conn:
         rows = conn.execute("SELECT * FROM devolucoes ORDER BY criado_em DESC").fetchall()
     cols = ["id", "data_recebimento", "responsavel", "loja", "cliente", "numero_venda", "sku", "produto", "qtd",
-            "valor", "serie_lote", "nf_saida", "teve_reclamacao", "num_reclamacao", "motivo", "alegacao_defeito",
+            "valor", "custo_devolucao", "serie_lote", "nf_saida", "teve_reclamacao", "num_reclamacao", "motivo", "alegacao_defeito",
             "avaria", "desc_avaria", "chegada", "faltou_item", "qual_item", "volta_estoque", "destino", "status",
             "sac_status"]
     buf = io.StringIO()
@@ -572,9 +581,16 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
                 conn.execute("UPDATE devolucoes_ml_vistos SET resultado=?, atualizado_em=? WHERE claim_id=?", (resultado, agora, cid))
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
-    pendentes = max(0, len(abertas) - conhecidas - checadas)
-    return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas, "ficam_no_ml": ficam_ml,
-            "pendentes": pendentes, "limite_ml": parou_429}
+        ids = [str(c.get("id")) for c in abertas]
+        cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0}
+        for i in range(0, len(ids), 50):
+            lote = ids[i:i + 50]
+            for r in conn.execute(f"SELECT resultado, COUNT(*) AS n FROM devolucoes_ml_vistos WHERE claim_id IN ({','.join('?' * len(lote))}) GROUP BY resultado", tuple(lote)).fetchall():
+                cont[r["resultado"]] = cont.get(r["resultado"], 0) + r["n"]
+    pendentes = max(0, len(abertas) - sum(cont.values()))
+    return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas,
+            "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
+            "sem_devolucao": cont["sem_devolucao"], "pendentes": pendentes, "limite_ml": parou_429}
 
 
 @devolucoes_routes.post("/devolucoes/importar-ml")
