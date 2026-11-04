@@ -12,6 +12,7 @@ Endpoints (url_prefix="/api"; todos exigem login):
     GET   /api/devolucoes[?status=&q=]       lista
     GET   /api/devolucoes/<id>               detalhe
     PATCH /api/devolucoes/<id>               edita campos / checklist / status
+    POST  /api/devolucoes/importar-ml        traz do Mercado Livre as devoluções ABERTAS (status "A caminho")
     POST  /api/devolucoes/<id>/sac           supervisor/admin: envia ao SAC (SAC_API_URL; sem isso fica "simulado")
     GET   /api/devolucoes/resumo             contadores do painel
     GET   /api/devolucoes/export.csv         supervisor/admin: planilha (mesmas colunas do painel)
@@ -44,7 +45,7 @@ MOTIVOS = ["Arrependimento ou desistência", "Produto diferente do anunciado", "
 CHEGADAS = ["Correto e sem danos aparentes", "Embalagem danificada, produto intacto", "Produto danificado",
             "Produto usado ou com sinais de uso", "Produto diferente do enviado", "Outro"]
 DESTINOS = ["Estoque", "Assistência técnica", "Quarentena / análise", "Descarte", "Devolver ao fornecedor"]
-STATUS = [("recebida", "Recebida"), ("aguardando_nf", "Aguardando NF de devolução"),
+STATUS = [("esperada", "A caminho (ML)"), ("recebida", "Recebida"), ("aguardando_nf", "Aguardando NF de devolução"),
           ("assistencia", "Encaminhada à assistência"), ("liberada_estoque", "Liberada para estoque"),
           ("finalizada", "Finalizada")]
 CHECKLIST = [
@@ -127,6 +128,12 @@ def garantir_tabelas(conn=None):
                 sac_enviado_em   BIGINT
             )
         """)
+        if os.environ.get("DATABASE_URL"):
+            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_claim_id TEXT")
+        else:
+            have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
+            if "ml_claim_id" not in have:
+                c.execute("ALTER TABLE devolucoes ADD COLUMN ml_claim_id TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -204,14 +211,18 @@ def venda():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"error": "informe o número da venda"}), 400
+    garantir_tabelas()
     with db_session() as conn:
+        ex = conn.execute("SELECT id, status FROM devolucoes WHERE numero_venda=? ORDER BY id DESC LIMIT 1", (q,)).fetchone()
+        existente = {"id": ex["id"], "status": ex["status"]} if ex else None
         p = conn.execute("SELECT id, ml_id, cliente_nome FROM pedidos WHERE ml_id=? LIMIT 1", (q,)).fetchone()
         if not p:
-            return jsonify({"encontrado": False})
+            return jsonify({"encontrado": False, "devolucao_existente": existente})
         itens = conn.execute(
             "SELECT pr.sku AS sku, pr.nome AS nome, pp.quantidade AS qtd FROM pedido_produtos pp "
             "JOIN produtos pr ON pr.id = pp.produto_id WHERE pp.pedido_id=?", (p["id"],)).fetchall()
     return jsonify({"encontrado": True, "numero_venda": p["ml_id"], "cliente": p["cliente_nome"],
+                    "devolucao_existente": existente,
                     "itens": [{"sku": i["sku"], "nome": i["nome"], "qtd": i["qtd"]} for i in itens]})
 
 
@@ -420,3 +431,87 @@ def exportar():
         w.writerow([("sim" if f[c] is True else "não" if f[c] is False else ("" if f[c] is None else f[c])) for c in cols])
     return Response("﻿" + buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=devolucoes.csv"})
+
+
+# ───────────────────────────── importar do Mercado Livre ─────────────────────────────
+_ultima_importacao = 0.0
+
+
+def _ml_get(path, params=None):
+    """GET no ML com o token do WMS (o serviço renova sozinho). -> json ou None."""
+    from services.ml_service import MercadoLivreService
+    r = MercadoLivreService()._request("GET", path, params=params)
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
+def _dados_do_pedido(order: dict) -> dict:
+    itens = order.get("order_items") or []
+    it = (itens[0] if itens else {}) or {}
+    item = it.get("item") or {}
+    b = order.get("buyer") or {}
+    nome = " ".join(x for x in [b.get("first_name"), b.get("last_name")] if x) or b.get("nickname") or ""
+    return {
+        "cliente": nome[:200],
+        "sku": str(item.get("seller_sku") or item.get("seller_custom_field") or "")[:64] or None,
+        "produto": (item.get("title") or "")[:200],
+        "qtd": it.get("quantity") or 1,
+        "valor": it.get("unit_price"),
+    }
+
+
+def importar_do_ml(ml_get=_ml_get) -> dict:
+    """Cria (status 'esperada') uma devolução para cada reclamação ABERTA de devolução no ML que o WMS ainda não tem."""
+    garantir_tabelas()
+    j = ml_get("/post-purchase/v1/claims/search", {"type": "returns", "status": "opened", "limit": 50})
+    if j is None:
+        return {"ok": False, "erro": "O Mercado Livre não respondeu (token ou permissão). Nada foi importado."}
+    novos = vistos = 0
+    agora = int(time.time())
+    loja = os.environ.get("DEVOLUCAO_LOJA_ML", "LHV Med")
+    with db_session() as conn:
+        for c in (j.get("data") or []):
+            if c.get("status") != "opened" or c.get("resource") != "order":
+                continue
+            cid = str(c.get("id"))
+            vistos += 1
+            if conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone():
+                continue
+            ped = ml_get(f"/orders/{c.get('resource_id')}") or {}
+            d = _dados_do_pedido(ped)
+            sku = d["sku"] or ""
+            if sku:
+                p = conn.execute("SELECT sku, nome FROM produtos WHERE LOWER(sku)=LOWER(?) LIMIT 1", (sku,)).fetchone()
+                if p:
+                    sku, d["produto"] = p["sku"], p["nome"]
+            row = {
+                "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre", "status": "esperada",
+                "data_recebimento": time.strftime("%Y-%m-%d"), "loja": loja, "cliente": d["cliente"],
+                "numero_venda": str(c.get("resource_id")), "sku": sku or None, "sku_key": sku[:64].lower() if sku else None,
+                "produto": d["produto"], "qtd": float(d["qtd"] or 1), "valor": d["valor"],
+                "teve_reclamacao": 1, "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
+                "observacoes": f"Importada do Mercado Livre. Motivo ML: {c.get('reason_id') or '—'}",
+            }
+            cols = list(row)
+            conn.execute(f"INSERT INTO devolucoes ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                         tuple(row[k] for k in cols))
+            novos += 1
+    return {"ok": True, "abertas_no_ml": vistos, "novas": novos}
+
+
+@devolucoes_routes.post("/devolucoes/importar-ml")
+@login_required
+def importar_ml():
+    global _ultima_importacao
+    agora = time.time()
+    if agora - _ultima_importacao < 60:
+        return jsonify({"ok": True, "pulado": True, "motivo": "importado há menos de 1 min"})
+    _ultima_importacao = agora
+    try:
+        return jsonify(importar_do_ml())
+    except Exception as e:  # noqa: BLE001  nunca derruba a tela
+        return jsonify({"ok": False, "erro": f"falha ao importar: {e}"[:300]})
