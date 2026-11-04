@@ -52,7 +52,7 @@ MOTIVOS = ["Arrependimento ou desistência", "Produto diferente do anunciado", "
 CHEGADAS = ["Correto e sem danos aparentes", "Embalagem danificada, produto intacto", "Produto danificado",
             "Produto usado ou com sinais de uso", "Produto diferente do enviado", "Outro"]
 DESTINOS = ["Estoque", "Assistência técnica", "Quarentena / análise", "Descarte", "Devolver ao fornecedor"]
-STATUS = [("esperada", "A caminho (ML)"), ("recebida", "Recebida"), ("aguardando_nf", "Aguardando NF de devolução"),
+STATUS = [("esperada", "A caminho (ML)"), ("armazem_ml", "No armazém do ML (FULL)"), ("recebida", "Recebida"), ("aguardando_nf", "Aguardando NF de devolução"),
           ("assistencia", "Encaminhada à assistência"), ("liberada_estoque", "Liberada para estoque"),
           ("finalizada", "Finalizada")]
 CHECKLIST = [
@@ -451,7 +451,7 @@ def exportar():
 
 # ───────────────────────────── importar do Mercado Livre ─────────────────────────────
 _ultima_importacao = 0.0
-ORCAMENTO_POR_RODADA = 20          # reclamações checadas por rodada (o ML limita as consultas: 429)
+ORCAMENTO_POR_RODADA = 25          # reclamações checadas por rodada (o ML limita as consultas: 429)
 RECHECAR_SEM_DEVOLUCAO_S = 1800    # reclamação sem devolução ainda: olha de novo depois de 30 min
 _reasons_cache: dict = {}
 
@@ -502,7 +502,7 @@ def _motivo_texto(ml_get, reason_id):
     return _reasons_cache[reason_id]
 
 
-def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
+def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
     """Traz para o WMS (status 'esperada') as devoluções ABERTAS do ML que VOLTAM PARA O SELLER (galpão).
     Devolução de produto FULL vai para o armazém do ML e fica de fora. Consulta devagar e lembra o que já checou."""
     garantir_tabelas()
@@ -527,7 +527,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
         for c in abertas:
             cid = str(c.get("id"))
             v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
-            if v and (v["resultado"] in ("importada", "armazem_ml")
+            tem_linha = conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone() is not None
+            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
                       or (v["resultado"] == "sem_devolucao" and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S)):
                 conhecidas += 1
                 continue
@@ -550,9 +551,9 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
             ex = conn.execute("SELECT id, status, bipado FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone()
             if resultado == "armazem_ml":
                 ficam_ml += 1
-                if ex and ex["status"] == "esperada" and not ex["bipado"]:   # importada antes por engano
-                    conn.execute("DELETE FROM devolucoes WHERE id=?", (ex["id"],))
-            elif resultado == "importada" and not ex:
+                if ex and ex["status"] == "esperada" and not ex["bipado"]:   # corrige a que entrou como "a caminho do galpão"
+                    conn.execute("UPDATE devolucoes SET status='armazem_ml', atualizado_em=? WHERE id=?", (agora, ex["id"]))
+            if resultado in ("importada", "armazem_ml") and not ex:
                 if pausa:
                     time.sleep(pausa)
                 _, ped = ml_get(f"/orders/{c.get('resource_id')}")
@@ -565,13 +566,15 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
                     if p:
                         sku, d["produto"] = p["sku"], p["nome"]
                 row = {
-                    "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre", "status": "esperada",
+                    "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre",
+                    "status": "esperada" if resultado == "importada" else "armazem_ml",
                     "data_recebimento": time.strftime("%Y-%m-%d"), "loja": loja, "cliente": d["cliente"],
                     "numero_venda": str(c.get("resource_id")), "sku": sku or None,
                     "sku_key": sku[:64].lower() if sku else None, "produto": d["produto"],
                     "qtd": float(d["qtd"] or 1), "valor": d["valor"], "teve_reclamacao": 1,
                     "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
-                    "observacoes": f"Importada do Mercado Livre. Motivo ML: {motivo}. Envio de volta: {st_envio or '—'}.",
+                    "observacoes": f"Importada do Mercado Livre. Motivo ML: {motivo}. Envio de volta: {st_envio or '—'}."
+                                   + (" Vai para o ARMAZÉM DO ML (FULL): não passa pelo galpão." if resultado == "armazem_ml" else ""),
                 }
                 cols = list(row)
                 conn.execute(f"INSERT INTO devolucoes ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
