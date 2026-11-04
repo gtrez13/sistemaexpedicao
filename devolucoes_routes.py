@@ -13,6 +13,11 @@ Endpoints (url_prefix="/api"; todos exigem login):
     GET   /api/devolucoes/<id>               detalhe
     PATCH /api/devolucoes/<id>               edita campos / checklist / status
     POST  /api/devolucoes/importar-ml        traz do Mercado Livre as devoluções ABERTAS (status "A caminho")
+    POST  /api/devolucoes/<id>/fotos         envia foto (multipart, campo "foto") de como o produto chegou
+    GET   /api/devolucoes/<id>/fotos         lista as fotos
+    GET   /api/devolucoes/fotos/<fid>        a imagem (exige login)    DELETE idem: remove
+    POST  /api/devolucoes/<id>/resolver      supervisor/admin: {texto} resolve a pendência (problema na chegada / cobrança)
+    POST  /api/devolucoes/<id>/finalizar     fecha a devolução (exige tudo preenchido, bipado, foto e pendência resolvida)
     POST  /api/devolucoes/<id>/sac           supervisor/admin: envia ao SAC (SAC_API_URL; sem isso fica "simulado")
     GET   /api/devolucoes/resumo             contadores do painel
     GET   /api/devolucoes/export.csv         supervisor/admin: planilha (mesmas colunas do painel)
@@ -27,8 +32,9 @@ import io
 import json
 import os
 import time
+import uuid
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, jsonify, request, send_file
 from flask_login import current_user, login_required
 
 try:
@@ -45,7 +51,7 @@ MOTIVOS = ["Arrependimento ou desistência", "Produto diferente do anunciado", "
 CHEGADAS = ["Correto e sem danos aparentes", "Embalagem danificada, produto intacto", "Produto danificado",
             "Produto usado ou com sinais de uso", "Produto diferente do enviado", "Outro"]
 DESTINOS = ["Estoque", "Assistência técnica", "Quarentena / análise", "Descarte", "Devolver ao fornecedor"]
-STATUS = [("esperada", "A caminho (ML)"), ("armazem_ml", "No armazém do ML (FULL)"), ("recebida", "Recebida"), ("aguardando_nf", "Aguardando NF de devolução"),
+STATUS = [("esperada", "A caminho (ML)"), ("armazem_ml", "No armazém do ML (FULL)"), ("recebida", "Recebida"), ("pendente_resolver", "Pendente: resolver"), ("aguardando_nf", "Aguardando NF de devolução"),
           ("assistencia", "Encaminhada à assistência"), ("liberada_estoque", "Liberada para estoque"),
           ("finalizada", "Finalizada")]
 CHECKLIST = [
@@ -77,6 +83,8 @@ def eh_gestor() -> bool:
     return _role() in ("admin", "supervisor")
 
 
+EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", "BIGINT"), ("finalizada_em", "BIGINT"),
+             ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status"]
@@ -109,6 +117,12 @@ def garantir_tabelas(conn=None):
                 custo_ml         DOUBLE PRECISION,
                 custo_ml_em      BIGINT,
                 ml_envio         TEXT,
+                resolucao        TEXT,
+                resolvido_por    TEXT,
+                resolvido_em     BIGINT,
+                finalizada_em    BIGINT,
+                finalizada_por   TEXT,
+                dados_ml_em      BIGINT,
                 serie_lote       TEXT,
                 nf_saida         TEXT,
                 teve_reclamacao  INTEGER,
@@ -138,6 +152,8 @@ def garantir_tabelas(conn=None):
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml DOUBLE PRECISION")
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml_em BIGINT")
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_envio TEXT")
+            for col, tp in EXTRAS_V3:
+                c.execute(f"ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS {col} {tp}")
         else:
             have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
             if "ml_claim_id" not in have:
@@ -150,6 +166,19 @@ def garantir_tabelas(conn=None):
                 c.execute("ALTER TABLE devolucoes ADD COLUMN custo_ml_em BIGINT")
             if "ml_envio" not in have:
                 c.execute("ALTER TABLE devolucoes ADD COLUMN ml_envio TEXT")
+            for col, tp in EXTRAS_V3:
+                if col not in have:
+                    c.execute(f"ALTER TABLE devolucoes ADD COLUMN {col} {tp}")
+        c.execute(f"""
+            CREATE TABLE IF NOT EXISTS devolucao_fotos (
+                id            {pk},
+                devolucao_id  BIGINT NOT NULL,
+                arquivo       TEXT NOT NULL,
+                criado_em     BIGINT NOT NULL,
+                criado_por    TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS ix_devolucao_fotos ON devolucao_fotos (devolucao_id)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -189,7 +218,69 @@ def _fmt(r):
         if d.get(k) is not None:
             d[k] = bool(d[k])
     d["bipado"] = bool(d.get("bipado"))
+    d["tem_problema"] = tem_problema(r)
+    d["pendencia"] = d["tem_problema"] and not d.get("resolvido_em")
     return d
+
+
+def _fmt_com_fotos(conn, rows):
+    ids = [r["id"] for r in rows]
+    cont = {}
+    for i in range(0, len(ids), 200):
+        lote = ids[i:i + 200]
+        for x in conn.execute(f"SELECT devolucao_id, COUNT(*) AS n FROM devolucao_fotos WHERE devolucao_id IN ({','.join('?' * len(lote))}) GROUP BY devolucao_id", tuple(lote)).fetchall():
+            cont[x["devolucao_id"]] = x["n"]
+    out = []
+    for r in rows:
+        d = _fmt(r)
+        d["n_fotos"] = cont.get(r["id"], 0)
+        out.append(d)
+    return out
+
+
+# ───────────────────────────── regras: problema na chegada, pendência, fechamento ─────────────────────────────
+def tem_problema(d) -> bool:
+    """Chegou com problema: avaria, faltou item, ou 'de que maneira chegou' diferente de correto/sem danos."""
+    ch = (d["chegada"] if d["chegada"] is not None else "") or ""
+    return bool(d["avaria"]) or bool(d["faltou_item"]) or (ch != "" and ch != CHEGADAS[0])
+
+
+def _recalcular(conn, did):
+    """Problema na chegada sem resolução => 'pendente_resolver'. Resolvido (ou sem problema) => volta a 'recebida'."""
+    r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r or r["status"] not in ("recebida", "pendente_resolver"):
+        return
+    if tem_problema(r) and not r["resolvido_em"]:
+        if r["status"] != "pendente_resolver":
+            conn.execute("UPDATE devolucoes SET status='pendente_resolver' WHERE id=?", (did,))
+    elif r["status"] == "pendente_resolver":
+        conn.execute("UPDATE devolucoes SET status='recebida' WHERE id=?", (did,))
+
+
+def _n_fotos(conn, did) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM devolucao_fotos WHERE devolucao_id=?", (did,)).fetchone()["n"]
+
+
+def faltando_para_fechar(r, n_fotos) -> list:
+    f = []
+    for campo, nome in (("sku", "SKU"), ("loja", "loja"), ("cliente", "cliente"), ("numero_venda", "número da venda"),
+                        ("nf_saida", "NF de saída"), ("motivo", "motivo"), ("chegada", "como o produto chegou"),
+                        ("destino", "destino")):
+        if not (r[campo] or "").strip():
+            f.append(nome)
+    if r["valor"] is None:
+        f.append("valor")
+    for campo, nome in (("teve_reclamacao", "reclamação (sim/não)"), ("avaria", "avaria (sim/não)"),
+                        ("faltou_item", "faltou item (sim/não)"), ("volta_estoque", "pode voltar ao estoque")):
+        if r[campo] is None:
+            f.append(nome)
+    if not r["bipado"]:
+        f.append("bipar o produto")
+    if n_fotos < 1:
+        f.append("FOTO de como o produto chegou")
+    if tem_problema(r) and not r["resolvido_em"]:
+        f.append("resolver a pendência (problema na chegada)")
+    return f
 
 
 # ───────────────────────────── consultas de apoio ─────────────────────────────
@@ -299,6 +390,7 @@ def criar():
                      tuple(dados[c] for c in cols))
         nid = conn.execute("SELECT id FROM devolucoes WHERE criado_em=? AND responsavel=? ORDER BY id DESC LIMIT 1",
                            (agora, dados["responsavel"])).fetchone()["id"]
+        _recalcular(conn, nid)
     return jsonify({"success": True, "id": nid})
 
 
@@ -319,7 +411,8 @@ def listar():
     sql += " ORDER BY criado_em DESC LIMIT 300"
     with db_session() as conn:
         rows = conn.execute(sql, tuple(args)).fetchall()
-    return jsonify({"itens": [_fmt(r) for r in rows]})
+        itens = _fmt_com_fotos(conn, rows)
+    return jsonify({"itens": itens})
 
 
 @devolucoes_routes.get("/devolucoes/resumo")
@@ -331,11 +424,13 @@ def resumo():
         volt = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v FROM devolucoes WHERE volta_estoque=1").fetchone()
         por = conn.execute("SELECT status, COUNT(*) AS n FROM devolucoes GROUP BY status").fetchall()
         sac = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE sac_status<>'enviado'").fetchone()["n"]
+    por_status_map = {r["status"]: r["n"] for r in por}
     return jsonify({"total": tot["n"], "valor": float(tot["v"] or 0),
                     "valor_voltou": float(volt["v"] or 0),          # produtos que voltaram ao estoque (verde)
                     "custo_devolucao": float(tot["c"] or 0),        # o que a empresa arcou para a devolução (vermelho)
                     "por_status": {r["status"]: r["n"] for r in por},
-                    "sac_pendentes": sac, "voltam_estoque": volt["n"]})
+                    "sac_pendentes": sac, "voltam_estoque": volt["n"],
+                    "pendencias": dict(por_status_map).get("pendente_resolver", 0)})
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>")
@@ -344,9 +439,11 @@ def detalhe(did):
     garantir_tabelas()
     with db_session() as conn:
         r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
-    if not r:
-        return jsonify({"error": "Devolução não encontrada."}), 404
-    return jsonify(_fmt(r))
+        if not r:
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        d = _fmt_com_fotos(conn, [r])[0]
+        d["fotos"] = [x["id"] for x in conn.execute("SELECT id FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
+    return jsonify(d)
 
 
 @devolucoes_routes.patch("/devolucoes/<int:did>")
@@ -356,18 +453,151 @@ def editar(did):
     garantir_tabelas()
     novos = _aplicar(d)
     novos.pop("sku_key", None) if "sku" not in d else None
+    if novos.get("status") in ("finalizada", "pendente_resolver"):   # só pelos endpoints /finalizar e /resolver (ou automático)
+        novos.pop("status")
     if not novos:
         return jsonify({"error": "Nada para alterar."}), 400
     novos["atualizado_em"] = int(time.time())
     sets = ",".join(f"{c}=?" for c in novos)
     with db_session() as conn:
-        r = conn.execute("SELECT id, sac_status FROM devolucoes WHERE id=?", (did,)).fetchone()
+        r = conn.execute("SELECT id, sac_status, status FROM devolucoes WHERE id=?", (did,)).fetchone()
         if not r:
             return jsonify({"error": "Devolução não encontrada."}), 404
+        if r["status"] == "finalizada" and not eh_gestor():
+            return jsonify({"error": "Devolução finalizada: só supervisor/admin altera."}), 403
         # alterou depois de enviada ao SAC: volta a "pendente" para reenviar a versão certa
         if r["sac_status"] == "enviado":
             sets += ",sac_status='pendente'"
         conn.execute(f"UPDATE devolucoes SET {sets} WHERE id=?", tuple(novos.values()) + (did,))
+        _recalcular(conn, did)
+        st = conn.execute("SELECT status FROM devolucoes WHERE id=?", (did,)).fetchone()["status"]
+    return jsonify({"success": True, "status": st})
+
+
+# ───────────────────────────── fotos ─────────────────────────────
+MAX_FOTO = 8 * 1024 * 1024
+
+
+def _pasta_fotos():
+    d = os.environ.get("DEVOLUCOES_FOTOS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads_devolucoes")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _tipo_imagem(b: bytes):
+    if b[:3] == b"\xff\xd8\xff":
+        return "jpg", "image/jpeg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", "image/png"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None, None
+
+
+@devolucoes_routes.post("/devolucoes/<int:did>/fotos")
+@login_required
+def foto_enviar(did):
+    f = request.files.get("foto")
+    if not f:
+        return jsonify({"error": "Envie a foto (campo 'foto')."}), 400
+    dados = f.read(MAX_FOTO + 1)
+    if len(dados) > MAX_FOTO:
+        return jsonify({"error": "Foto grande demais (máx. 8 MB)."}), 413
+    ext, _ = _tipo_imagem(dados)
+    if not ext:
+        return jsonify({"error": "Arquivo não é uma imagem (JPG, PNG ou WEBP)."}), 400
+    garantir_tabelas()
+    with db_session() as conn:
+        if not conn.execute("SELECT 1 FROM devolucoes WHERE id=?", (did,)).fetchone():
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        nome = f"{did}_{uuid.uuid4().hex}.{ext}"
+        with open(os.path.join(_pasta_fotos(), nome), "wb") as out:
+            out.write(dados)
+        conn.execute("INSERT INTO devolucao_fotos (devolucao_id, arquivo, criado_em, criado_por) VALUES (?,?,?,?)",
+                     (did, nome, int(time.time()), _quem()))
+        fid = conn.execute("SELECT id FROM devolucao_fotos WHERE arquivo=?", (nome,)).fetchone()["id"]
+    return jsonify({"success": True, "id": fid})
+
+
+@devolucoes_routes.get("/devolucoes/<int:did>/fotos")
+@login_required
+def foto_listar(did):
+    garantir_tabelas()
+    with db_session() as conn:
+        rows = conn.execute("SELECT id, criado_por, criado_em FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()
+    return jsonify({"fotos": [{"id": r["id"], "por": r["criado_por"], "em": r["criado_em"]} for r in rows]})
+
+
+@devolucoes_routes.get("/devolucoes/fotos/<int:fid>")
+@login_required
+def foto_ver(fid):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT arquivo FROM devolucao_fotos WHERE id=?", (fid,)).fetchone()
+    if not r:
+        return jsonify({"error": "Foto não encontrada."}), 404
+    caminho = os.path.join(_pasta_fotos(), os.path.basename(r["arquivo"]))
+    if not os.path.exists(caminho):
+        return jsonify({"error": "Arquivo da foto não encontrado."}), 404
+    _, mime = _tipo_imagem(open(caminho, "rb").read(16))
+    return send_file(caminho, mimetype=mime or "application/octet-stream", max_age=86400)
+
+
+@devolucoes_routes.delete("/devolucoes/fotos/<int:fid>")
+@login_required
+def foto_apagar(fid):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT arquivo, criado_por, devolucao_id FROM devolucao_fotos WHERE id=?", (fid,)).fetchone()
+        if not r:
+            return jsonify({"error": "Foto não encontrada."}), 404
+        if not eh_gestor() and r["criado_por"] != _quem():
+            return jsonify({"error": "Só quem enviou ou o supervisor remove a foto."}), 403
+        conn.execute("DELETE FROM devolucao_fotos WHERE id=?", (fid,))
+    try:
+        os.remove(os.path.join(_pasta_fotos(), os.path.basename(r["arquivo"])))
+    except OSError:
+        pass
+    return jsonify({"success": True})
+
+
+# ───────────────────────────── resolver pendência / finalizar ─────────────────────────────
+@devolucoes_routes.post("/devolucoes/<int:did>/resolver")
+@login_required
+def resolver(did):
+    if not eh_gestor():
+        return jsonify({"error": "Somente supervisor/admin resolve a pendência."}), 403
+    texto = ((request.get_json(silent=True) or {}).get("texto") or "").strip()
+    if len(texto) < 10:
+        return jsonify({"error": "Explique como foi resolvido (mín. 10 caracteres)."}), 400
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT status FROM devolucoes WHERE id=?", (did,)).fetchone()
+        if not r:
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        conn.execute("UPDATE devolucoes SET resolucao=?, resolvido_por=?, resolvido_em=?, atualizado_em=? WHERE id=?",
+                     (texto[:1000], _quem(), int(time.time()), int(time.time()), did))
+        _recalcular(conn, did)
+        st = conn.execute("SELECT status FROM devolucoes WHERE id=?", (did,)).fetchone()["status"]
+    return jsonify({"success": True, "status": st})
+
+
+@devolucoes_routes.post("/devolucoes/<int:did>/finalizar")
+@login_required
+def finalizar(did):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+        if not r:
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        if r["status"] == "finalizada":
+            return jsonify({"success": True, "ja_finalizada": True})
+        falta = faltando_para_fechar(r, _n_fotos(conn, did))
+        if falta:
+            return jsonify({"error": "Ainda falta: " + ", ".join(falta) + ".", "falta": falta}), 409
+        agora = int(time.time())
+        conn.execute("UPDATE devolucoes SET status='finalizada', finalizada_em=?, finalizada_por=?, atualizado_em=? WHERE id=?",
+                     (agora, _quem(), agora, did))
     return jsonify({"success": True})
 
 
