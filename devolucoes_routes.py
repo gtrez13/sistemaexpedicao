@@ -435,18 +435,21 @@ def exportar():
 
 # ───────────────────────────── importar do Mercado Livre ─────────────────────────────
 _ultima_importacao = 0.0
+ORCAMENTO_POR_RODADA = 20          # reclamações checadas por rodada (o ML limita as consultas: 429)
+RECHECAR_SEM_DEVOLUCAO_S = 1800    # reclamação sem devolução ainda: olha de novo depois de 30 min
+_reasons_cache: dict = {}
 
 
 def _ml_get(path, params=None):
-    """GET no ML com o token do WMS (o serviço renova sozinho). -> json ou None."""
+    """GET no ML com o token do WMS (o serviço renova sozinho). -> (http_status, json|None)."""
     from services.ml_service import MercadoLivreService
     r = MercadoLivreService()._request("GET", path, params=params)
-    if r is None or r.status_code != 200:
-        return None
+    if r is None:
+        return 0, None
     try:
-        return r.json()
+        return r.status_code, r.json()
     except ValueError:
-        return None
+        return r.status_code, None
 
 
 def _dados_do_pedido(order: dict) -> dict:
@@ -464,43 +467,107 @@ def _dados_do_pedido(order: dict) -> dict:
     }
 
 
-def importar_do_ml(ml_get=_ml_get) -> dict:
-    """Cria (status 'esperada') uma devolução para cada reclamação ABERTA de devolução no ML que o WMS ainda não tem."""
+def _destino_da_devolucao(ret: dict):
+    """-> (tem_envio_de_volta, destino, status_envio). destino: 'warehouse' (armazém do ML) | 'seller' | outro."""
+    for sh in (ret.get("shipments") or []):
+        if (sh.get("type") or "return") == "return":
+            return True, ((sh.get("destination") or {}).get("name") or "").lower(), sh.get("status")
+    return False, "", None
+
+
+def _motivo_texto(ml_get, reason_id):
+    """Texto do motivo no ML (cacheado); se não conseguir, devolve só o código."""
+    if not reason_id:
+        return "—"
+    if reason_id not in _reasons_cache:
+        code, j = ml_get(f"/post-purchase/v1/claims/reasons/{reason_id}")
+        txt = ((j or {}).get("detail") or (j or {}).get("name")) if code == 200 else None
+        _reasons_cache[reason_id] = f"{txt} ({reason_id})" if txt else reason_id
+    return _reasons_cache[reason_id]
+
+
+def importar_do_ml(ml_get=_ml_get, pausa=0.4) -> dict:
+    """Traz para o WMS (status 'esperada') as devoluções ABERTAS do ML que VOLTAM PARA O SELLER (galpão).
+    Devolução de produto FULL vai para o armazém do ML e fica de fora. Consulta devagar e lembra o que já checou."""
     garantir_tabelas()
-    j = ml_get("/post-purchase/v1/claims/search", {"type": "returns", "status": "opened", "limit": 50})
-    if j is None:
-        return {"ok": False, "erro": "O Mercado Livre não respondeu (token ou permissão). Nada foi importado."}
-    novos = vistos = 0
+    abertas, off = [], 0
+    while off < 200:
+        code, j = ml_get("/post-purchase/v1/claims/search", {"status": "opened", "limit": 50, "offset": off})
+        if code != 200 or j is None:
+            if off == 0:
+                return {"ok": False, "erro": "O Mercado Livre não respondeu (token ou permissão). Nada foi importado."}
+            break
+        pg = j.get("data") or []
+        abertas += [c for c in pg if c.get("status") == "opened" and c.get("resource") == "order"]
+        off += 50
+        if len(pg) < 50:
+            break
     agora = int(time.time())
     loja = os.environ.get("DEVOLUCAO_LOJA_ML", "LHV Med")
+    novas = ficam_ml = conhecidas = checadas = 0
+    parou_429 = False
     with db_session() as conn:
-        for c in (j.get("data") or []):
-            if c.get("status") != "opened" or c.get("resource") != "order":
-                continue
+        conn.execute("CREATE TABLE IF NOT EXISTS devolucoes_ml_vistos (claim_id TEXT PRIMARY KEY, resultado TEXT, atualizado_em BIGINT)")
+        for c in abertas:
             cid = str(c.get("id"))
-            vistos += 1
-            if conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone():
+            v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
+            if v and (v["resultado"] in ("importada", "armazem_ml")
+                      or (v["resultado"] == "sem_devolucao" and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S)):
+                conhecidas += 1
                 continue
-            ped = ml_get(f"/orders/{c.get('resource_id')}") or {}
-            d = _dados_do_pedido(ped)
-            sku = d["sku"] or ""
-            if sku:
-                p = conn.execute("SELECT sku, nome FROM produtos WHERE LOWER(sku)=LOWER(?) LIMIT 1", (sku,)).fetchone()
-                if p:
-                    sku, d["produto"] = p["sku"], p["nome"]
-            row = {
-                "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre", "status": "esperada",
-                "data_recebimento": time.strftime("%Y-%m-%d"), "loja": loja, "cliente": d["cliente"],
-                "numero_venda": str(c.get("resource_id")), "sku": sku or None, "sku_key": sku[:64].lower() if sku else None,
-                "produto": d["produto"], "qtd": float(d["qtd"] or 1), "valor": d["valor"],
-                "teve_reclamacao": 1, "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
-                "observacoes": f"Importada do Mercado Livre. Motivo ML: {c.get('reason_id') or '—'}",
-            }
-            cols = list(row)
-            conn.execute(f"INSERT INTO devolucoes ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                         tuple(row[k] for k in cols))
-            novos += 1
-    return {"ok": True, "abertas_no_ml": vistos, "novas": novos}
+            if checadas >= ORCAMENTO_POR_RODADA or parou_429:
+                continue
+            checadas += 1
+            if pausa:
+                time.sleep(pausa)
+            code, ret = ml_get(f"/post-purchase/v2/claims/{cid}/returns")
+            if code == 429:
+                parou_429 = True
+                continue
+            if code == 404:
+                resultado = "sem_devolucao"
+            elif code == 200 and ret is not None:
+                tem, destino, st_envio = _destino_da_devolucao(ret)
+                resultado = "armazem_ml" if (tem and destino == "warehouse") else ("importada" if tem else "sem_devolucao")
+            else:
+                continue                          # erro passageiro: tenta de novo na próxima rodada
+            ex = conn.execute("SELECT id, status, bipado FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone()
+            if resultado == "armazem_ml":
+                ficam_ml += 1
+                if ex and ex["status"] == "esperada" and not ex["bipado"]:   # importada antes por engano
+                    conn.execute("DELETE FROM devolucoes WHERE id=?", (ex["id"],))
+            elif resultado == "importada" and not ex:
+                if pausa:
+                    time.sleep(pausa)
+                _, ped = ml_get(f"/orders/{c.get('resource_id')}")
+                _, cl = ml_get(f"/post-purchase/v1/claims/{cid}")
+                d = _dados_do_pedido(ped or {})
+                motivo = _motivo_texto(ml_get, (cl or {}).get("reason_id") or c.get("reason_id"))
+                sku = d["sku"] or ""
+                if sku:
+                    p = conn.execute("SELECT sku, nome FROM produtos WHERE LOWER(sku)=LOWER(?) LIMIT 1", (sku,)).fetchone()
+                    if p:
+                        sku, d["produto"] = p["sku"], p["nome"]
+                row = {
+                    "criado_em": agora, "atualizado_em": agora, "responsavel": "Mercado Livre", "status": "esperada",
+                    "data_recebimento": time.strftime("%Y-%m-%d"), "loja": loja, "cliente": d["cliente"],
+                    "numero_venda": str(c.get("resource_id")), "sku": sku or None,
+                    "sku_key": sku[:64].lower() if sku else None, "produto": d["produto"],
+                    "qtd": float(d["qtd"] or 1), "valor": d["valor"], "teve_reclamacao": 1,
+                    "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
+                    "observacoes": f"Importada do Mercado Livre. Motivo ML: {motivo}. Envio de volta: {st_envio or '—'}.",
+                }
+                cols = list(row)
+                conn.execute(f"INSERT INTO devolucoes ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                             tuple(row[k] for k in cols))
+                novas += 1
+            if v:
+                conn.execute("UPDATE devolucoes_ml_vistos SET resultado=?, atualizado_em=? WHERE claim_id=?", (resultado, agora, cid))
+            else:
+                conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
+    pendentes = max(0, len(abertas) - conhecidas - checadas)
+    return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas, "ficam_no_ml": ficam_ml,
+            "pendentes": pendentes, "limite_ml": parou_429}
 
 
 @devolucoes_routes.post("/devolucoes/importar-ml")
