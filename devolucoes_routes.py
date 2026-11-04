@@ -106,6 +106,8 @@ def garantir_tabelas(conn=None):
                 qtd              DOUBLE PRECISION NOT NULL DEFAULT 1,
                 valor            DOUBLE PRECISION,
                 custo_devolucao  DOUBLE PRECISION,
+                custo_ml         DOUBLE PRECISION,
+                custo_ml_em      BIGINT,
                 serie_lote       TEXT,
                 nf_saida         TEXT,
                 teve_reclamacao  INTEGER,
@@ -132,12 +134,18 @@ def garantir_tabelas(conn=None):
         if os.environ.get("DATABASE_URL"):
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_claim_id TEXT")
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_devolucao DOUBLE PRECISION")
+            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml DOUBLE PRECISION")
+            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml_em BIGINT")
         else:
             have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
             if "ml_claim_id" not in have:
                 c.execute("ALTER TABLE devolucoes ADD COLUMN ml_claim_id TEXT")
             if "custo_devolucao" not in have:
                 c.execute("ALTER TABLE devolucoes ADD COLUMN custo_devolucao DOUBLE PRECISION")
+            if "custo_ml" not in have:
+                c.execute("ALTER TABLE devolucoes ADD COLUMN custo_ml DOUBLE PRECISION")
+            if "custo_ml_em" not in have:
+                c.execute("ALTER TABLE devolucoes ADD COLUMN custo_ml_em BIGINT")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -315,7 +323,7 @@ def listar():
 def resumo():
     garantir_tabelas()
     with db_session() as conn:
-        tot = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v, COALESCE(SUM(custo_devolucao),0) AS c FROM devolucoes").fetchone()
+        tot = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v, COALESCE(SUM(COALESCE(custo_devolucao, custo_ml, 0)),0) AS c FROM devolucoes").fetchone()
         volt = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(valor*qtd),0) AS v FROM devolucoes WHERE volta_estoque=1").fetchone()
         por = conn.execute("SELECT status, COUNT(*) AS n FROM devolucoes GROUP BY status").fetchall()
         sac = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE sac_status<>'enviado'").fetchone()["n"]
@@ -495,6 +503,60 @@ def _motivo_texto(ml_get, reason_id):
     return _reasons_cache[reason_id]
 
 
+ORCAMENTO_CUSTOS = 15             # devoluções cujo frete de volta é consultado por rodada (2 chamadas cada)
+RECHECAR_CUSTO_S = 6 * 3600       # custo de devolução ainda aberta é atualizado a cada 6 h
+
+
+class _LimiteML(Exception):
+    pass
+
+
+def _custo_frete_volta(ml_get, claim_id):
+    """Frete de volta cobrado do VENDEDOR (receiver.cost do envio de devolução). -> (valor|None, leu_algum_envio)."""
+    code, ret = ml_get(f"/post-purchase/v2/claims/{claim_id}/returns")
+    if code == 429:
+        raise _LimiteML()
+    if code != 200 or not ret:
+        return None, False
+    seller = str(os.environ.get("ML_SELLER_ID", "")).strip()
+    total, leu = 0.0, False
+    for sh in (ret.get("shipments") or []):
+        if (sh.get("type") or "return") != "return" or not sh.get("shipment_id"):
+            continue
+        code2, cs = ml_get(f"/shipments/{sh['shipment_id']}/costs")
+        if code2 == 429:
+            raise _LimiteML()
+        if code2 != 200 or not cs:
+            continue
+        leu = True
+        rc = cs.get("receiver") or {}
+        if not seller or str(rc.get("user_id")) == seller:
+            try:
+                total += float(rc.get("cost") or 0)
+            except (TypeError, ValueError):
+                pass
+    return (total if leu else None), leu
+
+
+def atualizar_custos(conn, ml_get, agora, orcamento=ORCAMENTO_CUSTOS):
+    """Preenche devolucoes.custo_ml com o frete de volta do ML (não mexe no custo digitado à mão)."""
+    rows = conn.execute(
+        "SELECT id, ml_claim_id FROM devolucoes WHERE ml_claim_id IS NOT NULL AND "
+        "(custo_ml_em IS NULL OR (status IN ('esperada','armazem_ml') AND custo_ml_em < ?)) ORDER BY id LIMIT ?",
+        (agora - RECHECAR_CUSTO_S, orcamento)).fetchall()
+    feitos, limite = 0, False
+    for r in rows:
+        try:
+            valor, _ = _custo_frete_volta(ml_get, r["ml_claim_id"])
+        except _LimiteML:
+            limite = True
+            break
+        conn.execute("UPDATE devolucoes SET custo_ml=?, custo_ml_em=? WHERE id=?", (valor, agora, r["id"]))
+        feitos += 1
+    falta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE ml_claim_id IS NOT NULL AND custo_ml_em IS NULL").fetchone()["n"]
+    return feitos, falta, limite
+
+
 def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
     """Traz para o WMS (status 'esperada') as devoluções ABERTAS do ML que VOLTAM PARA O SELLER (galpão).
     Devolução de produto FULL vai para o armazém do ML e fica de fora. Consulta devagar e lembra o que já checou."""
@@ -583,6 +645,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 conn.execute("UPDATE devolucoes_ml_vistos SET resultado=?, atualizado_em=? WHERE claim_id=?", (resultado, agora, cid))
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
+        custos_feitos, custos_faltam, custos_429 = atualizar_custos(conn, ml_get, agora)
         ids = [str(c.get("id")) for c in abertas]
         cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0}
         for i in range(0, len(ids), 50):
@@ -594,7 +657,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
     return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas,
             "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
             "sem_devolucao": cont["sem_devolucao"], "com_erro": cont["erro"], "erros": erros,
-            "pendentes": pendentes, "limite_ml": parou_429}
+            "pendentes": pendentes, "limite_ml": parou_429 or custos_429,
+            "custos_atualizados": custos_feitos, "custos_pendentes": custos_faltam}
 
 
 @devolucoes_routes.post("/devolucoes/importar-ml")

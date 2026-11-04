@@ -58,15 +58,17 @@ def importar(ml_get=None, espera_429=75, max_rodadas=60, log=print):
             return r
         log(f"rodada {n}: {r['abertas_no_ml']} reclamacoes abertas | voltam pro galpao {r['voltam_pro_galpao']} | "
             f"armazem do ML (FULL) {r['ficam_no_ml']} | sem envio de volta {r['sem_devolucao']} | "
-            f"com erro no ML {r.get('com_erro', 0)} | novas agora {r['novas']} | faltam checar {r['pendentes']}")
+            f"com erro no ML {r.get('com_erro', 0)} | novas agora {r['novas']} | faltam checar {r['pendentes']} | "
+            f"frete de volta: {r.get('custos_atualizados', 0)} lidos agora, faltam {r.get('custos_pendentes', 0)}")
         for e in r.get("erros", []):
             log(f"   NAO CONSEGUI LER: reclamacao {e['claim_id']} (pedido {e['pedido']}): HTTP {e['http']} {e['msg']}")
-        if r["pendentes"] == 0:
+        falta = r["pendentes"] + r.get("custos_pendentes", 0)
+        if falta == 0:
             break
-        if not r.get("limite_ml") and r["pendentes"] == anterior:
+        if not r.get("limite_ml") and falta == anterior:
             log("   sem progresso: paro aqui (o restante o ML nao deixa ler agora).")
             break
-        anterior = r["pendentes"]
+        anterior = falta
         if r.get("limite_ml"):
             log(f"   ML pediu calma (429): espero {espera_429}s e continuo...")
             time.sleep(espera_429)
