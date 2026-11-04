@@ -115,6 +115,7 @@ def garantir_tabelas(conn=None):
                 custo_devolucao  DOUBLE PRECISION,
                 custo_ml         DOUBLE PRECISION,
                 custo_ml_em      BIGINT,
+                ml_envio         TEXT,
                 serie_lote       TEXT,
                 nf_saida         TEXT,
                 teve_reclamacao  INTEGER,
@@ -143,6 +144,7 @@ def garantir_tabelas(conn=None):
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_devolucao DOUBLE PRECISION")
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml DOUBLE PRECISION")
             c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml_em BIGINT")
+            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_envio TEXT")
         else:
             have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
             if "ml_claim_id" not in have:
@@ -153,6 +155,8 @@ def garantir_tabelas(conn=None):
                 c.execute("ALTER TABLE devolucoes ADD COLUMN custo_ml DOUBLE PRECISION")
             if "custo_ml_em" not in have:
                 c.execute("ALTER TABLE devolucoes ADD COLUMN custo_ml_em BIGINT")
+            if "ml_envio" not in have:
+                c.execute("ALTER TABLE devolucoes ADD COLUMN ml_envio TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -511,7 +515,7 @@ def _motivo_texto(ml_get, reason_id):
 
 
 ORCAMENTO_CUSTOS = 15             # devoluções cujo frete de volta é consultado por rodada (2 chamadas cada)
-RECHECAR_CUSTO_S = 6 * 3600       # custo de devolução ainda aberta é atualizado a cada 6 h
+RECHECAR_CUSTO_S = 2 * 3600       # custo e status do envio de devolução ainda aberta: atualiza a cada 2 h
 
 
 class _LimiteML(Exception):
@@ -519,16 +523,19 @@ class _LimiteML(Exception):
 
 
 def _custo_frete_volta(ml_get, claim_id):
-    """Frete de volta cobrado do VENDEDOR (receiver.cost do envio de devolução). -> (valor|None, leu_algum_envio)."""
+    """Frete de volta cobrado do VENDEDOR (receiver.cost) + status do envio de volta. -> (valor|None, leu_algum_envio, status_envio)."""
     code, ret = ml_get(f"/post-purchase/v2/claims/{claim_id}/returns")
     if code == 429:
         raise _LimiteML()
     if code != 200 or not ret:
-        return None, False
+        return None, False, None
     seller = str(os.environ.get("ML_SELLER_ID", "")).strip()
-    total, leu = 0.0, False
+    total, leu, st_envio = 0.0, False, None
     for sh in (ret.get("shipments") or []):
-        if (sh.get("type") or "return") != "return" or not sh.get("shipment_id"):
+        if (sh.get("type") or "return") != "return":
+            continue
+        st_envio = st_envio or sh.get("status")
+        if not sh.get("shipment_id"):
             continue
         code2, cs = ml_get(f"/shipments/{sh['shipment_id']}/costs")
         if code2 == 429:
@@ -542,26 +549,52 @@ def _custo_frete_volta(ml_get, claim_id):
                 total += float(rc.get("cost") or 0)
             except (TypeError, ValueError):
                 pass
-    return (total if leu else None), leu
+    return (total if leu else None), leu, st_envio
 
 
 def atualizar_custos(conn, ml_get, agora, orcamento=ORCAMENTO_CUSTOS):
     """Preenche devolucoes.custo_ml com o frete de volta do ML (não mexe no custo digitado à mão)."""
     rows = conn.execute(
         "SELECT id, ml_claim_id FROM devolucoes WHERE ml_claim_id IS NOT NULL AND "
-        "(custo_ml_em IS NULL OR (status IN ('esperada','armazem_ml') AND custo_ml_em < ?)) ORDER BY id LIMIT ?",
-        (agora - RECHECAR_CUSTO_S, orcamento)).fetchall()
+        "(custo_ml_em IS NULL OR (ml_envio IS NULL AND custo_ml_em < ?) "
+        "OR (status IN ('esperada','armazem_ml') AND custo_ml_em < ?)) ORDER BY custo_ml_em, id LIMIT ?",
+        (agora - 600, agora - RECHECAR_CUSTO_S, orcamento)).fetchall()
     feitos, limite = 0, False
     for r in rows:
         try:
-            valor, _ = _custo_frete_volta(ml_get, r["ml_claim_id"])
+            valor, _, st_envio = _custo_frete_volta(ml_get, r["ml_claim_id"])
         except _LimiteML:
             limite = True
             break
-        conn.execute("UPDATE devolucoes SET custo_ml=?, custo_ml_em=? WHERE id=?", (valor, agora, r["id"]))
+        conn.execute("UPDATE devolucoes SET custo_ml=?, custo_ml_em=?, ml_envio=COALESCE(?, ml_envio) WHERE id=?",
+                     (valor, agora, st_envio, r["id"]))
         feitos += 1
     falta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE ml_claim_id IS NOT NULL AND custo_ml_em IS NULL").fetchone()["n"]
     return feitos, falta, limite
+
+
+DIAS_FECHADAS = 45
+EM_TRANSITO = ("pending", "ready_to_ship", "shipped")
+_fechadas_cache = {"em": 0.0, "lista": []}
+
+
+def _fechadas_recentes(ml_get, agora):
+    """Reclamações FECHADAS dos últimos DIAS_FECHADAS dias (a caixa pode ainda estar voltando). Cache de 30 min."""
+    if agora - _fechadas_cache["em"] < 1800:
+        return _fechadas_cache["lista"]
+    corte = time.strftime("%Y-%m-%d", time.localtime(agora - DIAS_FECHADAS * 86400))
+    out, off = [], 0
+    while off < 1000:
+        code, j = ml_get("/post-purchase/v1/claims/search", {"status": "closed", "limit": 50, "offset": off})
+        if code != 200 or j is None:
+            break
+        pg = j.get("data") or []
+        out += [c for c in pg if c.get("resource") == "order" and str(c.get("date_created") or "")[:10] >= corte]
+        off += 50
+        if len(pg) < 50:
+            break
+    _fechadas_cache.update(em=agora, lista=out)
+    return out
 
 
 def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
@@ -581,6 +614,10 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
         if len(pg) < 50:
             break
     agora = int(time.time())
+    n_abertas = len(abertas)
+    fechadas = _fechadas_recentes(ml_get, agora)
+    ids_abertas = {str(c.get("id")) for c in abertas}
+    abertas = abertas + [dict(c, _fechada=True) for c in fechadas if str(c.get("id")) not in ids_abertas]
     loja = os.environ.get("DEVOLUCAO_LOJA_ML", "LHV Med")
     novas = ficam_ml = conhecidas = checadas = 0
     parou_429 = False
@@ -591,7 +628,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             cid = str(c.get("id"))
             v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
             tem_linha = conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone() is not None
-            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
+            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha) or v["resultado"] == "fechada_ok"
                       or (v["resultado"] in ("sem_devolucao",) or str(v["resultado"]).startswith("erro_"))
                       and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S):
                 conhecidas += 1
@@ -611,6 +648,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             elif code == 200 and ret is not None:
                 tem, destino, st_envio = _destino_da_devolucao(ret)
                 resultado = "armazem_ml" if (tem and destino == "warehouse") else ("importada" if tem else "sem_devolucao")
+                if c.get("_fechada") and resultado != "sem_devolucao" and st_envio not in EM_TRANSITO:
+                    resultado = "fechada_ok"        # reclamação fechada e a caixa já chegou/encerrou: nada a esperar
             else:
                 resultado = f"erro_{code}"        # ex.: 403 sem acesso à reclamação; guarda e recheca em 30 min
                 erros.append({"claim_id": cid, "pedido": c.get("resource_id"), "http": code,
@@ -640,6 +679,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                     "sku_key": sku[:64].lower() if sku else None, "produto": d["produto"],
                     "qtd": float(d["qtd"] or 1), "valor": d["valor"], "teve_reclamacao": 1,
                     "num_reclamacao": cid, "ml_claim_id": cid, "bipado": 0, "checklist": "{}",
+                    "ml_envio": st_envio,
                     "observacoes": f"Importada do Mercado Livre. Motivo ML: {motivo}. Envio de volta: {st_envio or '—'}."
                                    + (" Vai para o ARMAZÉM DO ML (FULL): não passa pelo galpão." if resultado == "armazem_ml" else "")
                                    + (f" ATENÇÃO: o ML não liberou os detalhes desta devolução ({resultado.upper()}): destino NÃO confirmado, confira na chegada." if resultado.startswith("erro_") else ""),
@@ -653,15 +693,15 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
         custos_feitos, custos_faltam, custos_429 = atualizar_custos(conn, ml_get, agora)
-        ids = [str(c.get("id")) for c in abertas]
-        cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0}
+        ids = [str(c.get("id")) for c in abertas]    # abertas + fechadas recentes
+        cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0, "fechada_ok": 0}
         for i in range(0, len(ids), 50):
             lote = ids[i:i + 50]
             for r in conn.execute(f"SELECT resultado, COUNT(*) AS n FROM devolucoes_ml_vistos WHERE claim_id IN ({','.join('?' * len(lote))}) GROUP BY resultado", tuple(lote)).fetchall():
                 k = "erro" if str(r["resultado"]).startswith("erro_") else r["resultado"]
                 cont[k] = cont.get(k, 0) + r["n"]
     pendentes = max(0, len(abertas) - sum(cont.values()))
-    return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas,
+    return {"ok": True, "abertas_no_ml": n_abertas, "fechadas_em_transito": len(fechadas), "novas": novas,
             "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
             "sem_devolucao": cont["sem_devolucao"], "com_erro": cont["erro"], "erros": erros,
             "pendentes": pendentes, "limite_ml": parou_429 or custos_429,
