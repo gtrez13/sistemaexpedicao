@@ -522,6 +522,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
     loja = os.environ.get("DEVOLUCAO_LOJA_ML", "LHV Med")
     novas = ficam_ml = conhecidas = checadas = 0
     parou_429 = False
+    erros: list = []
     with db_session() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS devolucoes_ml_vistos (claim_id TEXT PRIMARY KEY, resultado TEXT, atualizado_em BIGINT)")
         for c in abertas:
@@ -529,7 +530,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
             tem_linha = conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone() is not None
             if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
-                      or (v["resultado"] == "sem_devolucao" and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S)):
+                      or (v["resultado"] in ("sem_devolucao",) or str(v["resultado"]).startswith("erro_"))
+                      and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S):
                 conhecidas += 1
                 continue
             if checadas >= ORCAMENTO_POR_RODADA or parou_429:
@@ -547,7 +549,9 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 tem, destino, st_envio = _destino_da_devolucao(ret)
                 resultado = "armazem_ml" if (tem and destino == "warehouse") else ("importada" if tem else "sem_devolucao")
             else:
-                continue                          # erro passageiro: tenta de novo na próxima rodada
+                resultado = f"erro_{code}"        # ex.: 403 sem acesso à reclamação; guarda e recheca em 30 min
+                erros.append({"claim_id": cid, "pedido": c.get("resource_id"), "http": code,
+                              "msg": str(((ret or {}).get("message") or (ret or {}).get("error") or ""))[:120]})
             ex = conn.execute("SELECT id, status, bipado FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone()
             if resultado == "armazem_ml":
                 ficam_ml += 1
@@ -585,15 +589,17 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
         ids = [str(c.get("id")) for c in abertas]
-        cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0}
+        cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0}
         for i in range(0, len(ids), 50):
             lote = ids[i:i + 50]
             for r in conn.execute(f"SELECT resultado, COUNT(*) AS n FROM devolucoes_ml_vistos WHERE claim_id IN ({','.join('?' * len(lote))}) GROUP BY resultado", tuple(lote)).fetchall():
-                cont[r["resultado"]] = cont.get(r["resultado"], 0) + r["n"]
+                k = "erro" if str(r["resultado"]).startswith("erro_") else r["resultado"]
+                cont[k] = cont.get(k, 0) + r["n"]
     pendentes = max(0, len(abertas) - sum(cont.values()))
     return {"ok": True, "abertas_no_ml": len(abertas), "novas": novas,
             "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
-            "sem_devolucao": cont["sem_devolucao"], "pendentes": pendentes, "limite_ml": parou_429}
+            "sem_devolucao": cont["sem_devolucao"], "com_erro": cont["erro"], "erros": erros,
+            "pendentes": pendentes, "limite_ml": parou_429}
 
 
 @devolucoes_routes.post("/devolucoes/importar-ml")
