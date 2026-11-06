@@ -28,6 +28,8 @@ except Exception:
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 812, 1218            # 100 x 150 mm a 203 dpi
+ZPL_ML = None
+INV_ML = None
 ML_H = int(H * 0.67)        # parte de cima: etiqueta do ML
 EMITENTE = os.getenv("EMPRESA_NOME", "LHVMED Imp. e Com. de Equip. Médicos Ltda")
 EMITENTE_CNPJ = os.getenv("EMPRESA_CNPJ", "")
@@ -59,6 +61,8 @@ def ml_label_png(ml_order_id: str) -> Image.Image:
         zpl = zpl.decode("utf-8", "ignore")
     open(f"/tmp/etq_{ml_order_id}_ml.zpl", "w").write(zpl)
     print(f"   zpl do ML: {len(zpl)} chars, começa com {zpl[:40]!r}", flush=True)
+    global ZPL_ML
+    ZPL_ML = zpl
     melhor = None
     for dpmm in ("8dpmm", "12dpmm"):
         r = requests.post(f"http://api.labelary.com/v1/printers/{dpmm}/labels/4x6/0/", data=zpl.encode("utf-8"),
@@ -103,6 +107,8 @@ def nfe_do_pedido(ml_order_id: str) -> dict:
         r = ml._request("GET", f"/users/{ml.user_id}/invoices/orders/{ml_order_id}")
         if r.status_code == 200:
             j = r.json()
+            global INV_ML
+            INV_ML = j
             print(f"   ML invoice: { {k: j[k] for k in j if k not in ('invoice_xml','xml')} }", flush=True)
             at = j.get("attributes") or {}
             rec = j.get("recipient") or {}
@@ -162,12 +168,149 @@ def code128(texto: str, altura: int, largura_max: int) -> Image.Image:
     return img.resize((int(img.width * k), int(img.height * k)))
 
 
-def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
+import re
+
+
+def ler_zpl(zpl: str) -> dict:
+    """Tira do ZPL do ML o que importa: dado do QR, número do código de barras e todos os textos (na ordem)."""
+    out = {"qr": None, "barcode": None, "textos": []}
+    campos = re.findall(r"\^FO[^^]*((?:\^[A-Z0-9][^^]*)*?)\^FD(.*?)\^FS", zpl, flags=re.S)
+    for cmds, dado in campos:
+        dado = dado.strip()
+        if "^BQ" in cmds:
+            out["qr"] = re.sub(r"^[A-Z]{1,2},", "", dado)          # tira o "QA," / "MA," do ^FD
+        elif re.search(r"\^B[CEU8A3]", cmds):
+            if not out["barcode"]:
+                out["barcode"] = re.sub(r"^>[;:]", "", dado)
+        elif dado and not dado.startswith("^"):
+            out["textos"].append(dado)
+    return out
+
+
+def classificar(textos: list[str]) -> dict:
+    c = {"despachar": None, "data": None, "nf": None, "rota": [], "cadeia": None, "hora": None, "letra": None, "outros": []}
+    for t in textos:
+        tt = t.strip()
+        if tt.lower().startswith("despachar"):
+            c["despachar"] = tt
+        elif re.fullmatch(r"(SEG|TER|QUA|QUI|SEX|SAB|SÁB|DOM)\s+\d\d/\d\d/\d{4}", tt, flags=re.I):
+            c["data"] = tt
+        elif tt.upper().startswith("NF:") or tt.upper().startswith("NF "):
+            c["nf"] = tt
+        elif ">" in tt and len(tt) < 40:
+            c["cadeia"] = tt
+        elif re.fullmatch(r"\d\d:\d\d", tt):
+            c["hora"] = tt
+        elif re.fullmatch(r"[A-Z]{2,4}\d{0,2}", tt) and len(c["rota"]) < 2:
+            c["rota"].append(tt)
+        elif re.fullmatch(r"[A-Z]", tt):
+            c["letra"] = tt
+        else:
+            c["outros"].append(tt)
+    return c
+
+
+def qr_img(dado: str, tam: int) -> Image.Image:
+    import qrcode
+    q = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=1)
+    q.add_data(dado); q.make(fit=True)
+    im = q.make_image(fill_color="black", back_color="white").convert("L")
+    return im.resize((tam, tam), Image.NEAREST)
+
+
+def montar_bonito(zpl: str, inv: dict, nfe: dict, ml_order_id: str) -> Image.Image | None:
+    """Layout próprio (igual ao mockup): QR + destinatário + CEP grande + rota + barcode, e DANFE embaixo."""
+    z = ler_zpl(zpl)
+    if not z["qr"] or not z["barcode"]:
+        print(f"   zpl sem QR/barcode reconhecíveis ({z}) — usando a etiqueta do ML como imagem", flush=True)
+        return None
+    c = classificar(z["textos"])
+    print(f"   campos do ML: {c}", flush=True)
+    rec = inv.get("recipient") or {}
+    ad = rec.get("address") or {}
+    ship = inv.get("shipment") or {}
+    tipo = {"self_service": "FLEX", "xd_drop_off": "AGÊNCIA", "drop_off": "CORREIOS", "cross_docking": "COLETA", "fulfillment": "FULL"}.get(ship.get("logistic_type"), (ship.get("logistic_type") or "").upper())
+
     canvas = Image.new("L", (W, H), 255)
-    # ML em cima, reduzido proporcionalmente
-    k = min((W - 16) / ml_png.width, (ML_H - 12) / ml_png.height)
-    ml2 = ml_png.resize((int(ml_png.width * k), int(ml_png.height * k)))
-    canvas.paste(ml2, ((W - ml2.width) // 2, 0))
+    d = ImageDraw.Draw(canvas)
+    M = 28
+    y = 26
+    # cabeçalho
+    d.text((M, y), "mercado", font=fonte(24, True), fill=0); d.text((M, y + 26), "envios", font=fonte(24, True), fill=0)
+    if tipo:
+        tw = d.textlength(tipo, font=fonte(26, True))
+        bx = (W - tw) // 2 - 16
+        d.rounded_rectangle([bx, y, bx + tw + 32, y + 50], radius=8, outline=0, width=3)
+        d.text((W // 2, y + 25), tipo, font=fonte(26, True), fill=0, anchor="mm")
+    if c["despachar"]:
+        txt = c["despachar"].replace("Despachar: ", "Despachar\n")
+        d.multiline_text((W - M, y), txt, font=fonte(18, True), fill=0, anchor="ra", align="right")
+    y += 76
+    # QR + destinatário
+    QR = 300
+    canvas.paste(qr_img(z["qr"], QR), (M, y))
+    x2 = M + QR + 22
+    nome = str(rec.get("name") or "").split(" (")[0]
+    f_n = fonte(27, True)
+    linhas = []
+    palavras, atual = nome.split(), ""
+    for p_ in palavras:
+        if d.textlength((atual + " " + p_).strip(), font=f_n) > W - x2 - M: linhas.append(atual); atual = p_
+        else: atual = (atual + " " + p_).strip()
+    linhas.append(atual)
+    yy = y
+    for l in linhas[:2]:
+        d.text((x2, yy), l, font=f_n, fill=0); yy += 32
+    yy += 4
+    f_e = fonte(20)
+    end = [f"{ad.get('street_name','')}, {ad.get('street_number','')}".strip(", "), (ad.get("complement") or "").strip(), f"{ad.get('neighborhood','')} · {ad.get('city','')} · {ad.get('state','')}"]
+    for l in [e_ for e_ in end if e_]:
+        d.text((x2, yy), l[:44], font=f_e, fill=0); yy += 25
+    cep = str(ad.get("zip_code") or "")
+    cep = f"{cep[:5]}-{cep[5:]}" if len(cep) == 8 else cep
+    yy += 6
+    d.text((x2, yy), f"CEP {cep}", font=fonte(40, True), fill=0); yy += 50
+    d.text((x2, yy), "Remetente: LHVMED · Osasco/SP", font=fonte(18), fill=0)
+    y += QR + 16
+    # rota (o que o ML usa pra separar): SPR2 grande, cadeia, data/NF, letra
+    d.line([(M, y), (W - M, y)], fill=0, width=2); y += 10
+    rota_grande = c["rota"][-1] if c["rota"] else ""
+    if rota_grande:
+        d.text((M, y - 4), rota_grande, font=fonte(84, True), fill=0)
+        if c["hora"]: d.text((M + d.textlength(rota_grande, font=fonte(84, True)) + 18, y + 36), c["hora"], font=fonte(26, True), fill=0)
+    if c["letra"]:
+        d.rectangle([W - M - 70, y + 8, W - M, y + 68], fill=0)
+        d.text((W - M - 35, y + 38), c["letra"], font=fonte(36, True), fill=255, anchor="mm")
+    y += 92
+    if c["cadeia"]: d.text((M, y), c["cadeia"], font=fonte(22, True), fill=0); y += 28
+    info = "   ".join(x for x in [c["data"], c["nf"]] if x)
+    if info: d.text((M, y), info, font=fonte(22, True), fill=0); y += 30
+    for o in c["outros"][:2]:
+        d.text((M, y), o[:70], font=fonte(16), fill=0); y += 20
+    # barcode do envio
+    y += 6
+    bc = code128(z["barcode"], 120, W - 2 * M)
+    canvas.paste(bc, ((W - bc.width) // 2, y)); y += bc.height + 2
+    d.text((W // 2, y), z["barcode"], font=fonte(24, True), fill=0, anchor="ma"); y += 30
+    d.text((M, y), f"Venda {ml_order_id}", font=fonte(18), fill=0)
+    d.text((W - M, y), f"Envio {ship.get('id','')}", font=fonte(18), fill=0, anchor="ra")
+    y += 30
+    global ML_H
+    ML_H = y
+    return canvas
+
+
+def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
+    global ML_H
+    canvas = None
+    if ZPL_ML and INV_ML:
+        canvas = montar_bonito(ZPL_ML, INV_ML, nfe, ml_order_id)
+    if canvas is None:
+        ML_H = int(H * 0.67)
+        canvas = Image.new("L", (W, H), 255)
+        k = min((W - 16) / ml_png.width, (ML_H - 12) / ml_png.height)
+        ml2 = ml_png.resize((int(ml_png.width * k), int(ml_png.height * k)))
+        canvas.paste(ml2, ((W - ml2.width) // 2, 0))
     d = ImageDraw.Draw(canvas)
     y = ML_H + 4
     for x in range(20, W - 20, 16):
