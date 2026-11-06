@@ -47,11 +47,35 @@ def ml_label_png(ml_order_id: str) -> Image.Image:
     if not sid:
         raise SystemExit("pedido sem shipping id no ML")
     zpl = ml.baixar_etiqueta_zpl(str(sid))
+    raw = zpl.encode("latin-1", "ignore") if isinstance(zpl, str) else zpl
+    if raw[:2] == b"PK":                      # o ML manda um ZIP com "Etiqueta de envio.txt" dentro
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            nome = next((n for n in z.namelist() if n.lower().endswith((".txt", ".zpl"))), z.namelist()[0])
+            zpl = z.read(nome).decode("utf-8", "ignore")
+    elif isinstance(zpl, bytes):
+        zpl = zpl.decode("utf-8", "ignore")
     open(f"/tmp/etq_{ml_order_id}_ml.zpl", "w").write(zpl)
-    r = requests.post("http://api.labelary.com/v1/printers/8dpmm/labels/4x6/0/", data=zpl.encode("utf-8"),
-                      headers={"Accept": "image/png"}, timeout=30)
-    r.raise_for_status()
-    return Image.open(io.BytesIO(r.content)).convert("L")
+    print(f"   zpl do ML: {len(zpl)} chars, começa com {zpl[:40]!r}", flush=True)
+    melhor = None
+    for dpmm in ("8dpmm", "12dpmm"):
+        r = requests.post(f"http://api.labelary.com/v1/printers/{dpmm}/labels/4x6/0/", data=zpl.encode("utf-8"),
+                          headers={"Accept": "image/png"}, timeout=30)
+        if r.status_code != 200:
+            print(f"   labelary {dpmm}: HTTP {r.status_code} {r.text[:120]}", flush=True)
+            continue
+        im = Image.open(io.BytesIO(r.content)).convert("L")
+        tinta = sum(1 for px in im.getdata() if px < 128)
+        print(f"   labelary {dpmm}: {im.size}, tinta {tinta}", flush=True)
+        if melhor is None or tinta > melhor[0]:
+            melhor = (tinta, im)
+    if not melhor:
+        raise SystemExit("Labelary não renderizou o ZPL do ML")
+    im = melhor[1]
+    bbox = im.point(lambda p: 0 if p < 128 else 255).getbbox()   # recorta a parte impressa
+    if bbox:
+        im = im.crop((max(0, bbox[0] - 10), max(0, bbox[1] - 10), min(im.width, bbox[2] + 10), min(im.height, bbox[3] + 10)))
+    return im
 
 
 def nfe_do_pedido(ml_order_id: str) -> dict:
