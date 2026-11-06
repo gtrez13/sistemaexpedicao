@@ -74,10 +74,22 @@ def ml_label_png(ml_order_id: str) -> Image.Image:
     if not melhor:
         raise SystemExit("Labelary não renderizou o ZPL do ML")
     im = melhor[1]
-    bbox = im.point(lambda p: 0 if p < 128 else 255).getbbox()   # recorta a parte impressa
-    if bbox:
-        im = im.crop((max(0, bbox[0] - 10), max(0, bbox[1] - 10), min(im.width, bbox[2] + 10), min(im.height, bbox[3] + 10)))
-    return im
+    return recortar_conteudo(im)
+
+
+def recortar_conteudo(im: Image.Image, minimo: int = 6) -> Image.Image:
+    """Recorta só onde tem impressão de verdade (ignora pixels soltos), pra etiqueta do ML encher a metade de cima."""
+    bw = im.point(lambda p: 255 if p < 128 else 0, "L")       # tinta = 255
+    px = bw.load()
+    w, h = bw.size
+    linhas = [sum(1 for x in range(w) if px[x, y]) for y in range(h)]
+    cols = [sum(1 for y in range(h) if px[x, y]) for x in range(w)]
+    ys = [y for y, n in enumerate(linhas) if n >= minimo]
+    xs = [x for x, n in enumerate(cols) if n >= minimo]
+    if not ys or not xs:
+        return im
+    m = 14
+    return im.crop((max(0, xs[0] - m), max(0, ys[0] - m), min(w, xs[-1] + m), min(h, ys[-1] + m)))
 
 
 def nfe_do_pedido(ml_order_id: str) -> dict:
@@ -195,10 +207,12 @@ def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
     f_c = fonte(18)
     def cabe(txt, maxw):
         txt = str(txt or "")
-        while txt and d.textlength(txt, font=f_c) > maxw:
-            txt = txt[:-2]
-        return txt
-    en = emit.get("nome") or EMITENTE
+        if d.textlength(txt, font=f_c) <= maxw:
+            return txt
+        while txt and d.textlength(txt + "…", font=f_c) > maxw:
+            txt = txt[:-1]
+        return txt + "…"
+    en = EMITENTE   # nome curto (o do ML vem gigante); CNPJ vem do ML
     ec = emit.get("cnpj") or EMITENTE_CNPJ
     d.text((24, y), cabe(en, col - 12), font=f_c, fill=0); d.text((24, y + 22), f"CNPJ {fmt_doc(ec)}" if ec else "", font=f_c, fill=0)
     d.text((24 + col, y), cabe(cont.get("nome", ""), col - 12), font=f_c, fill=0); d.text((24 + col, y + 22), fmt_doc(cont.get("numeroDocumento", "")), font=f_c, fill=0)
@@ -207,7 +221,7 @@ def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
     y += 8
     d.text((24, y + 4), f"Pedido ML {ml_order_id}", font=fonte(19), fill=0)
     d.text((W - 24, y), f"TOTAL R$ {total}", font=fonte(30, True), fill=0, anchor="ra")
-    d.text((24, H - 26), "Consulte pela chave de acesso em www.nfe.fazenda.gov.br", font=fonte(16), fill=0)
+    d.text((24, y + 44), "Consulte pela chave de acesso em www.nfe.fazenda.gov.br", font=fonte(16), fill=0)
     return canvas
 
 
