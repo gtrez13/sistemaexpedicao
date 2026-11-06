@@ -398,7 +398,14 @@ def main():
     img = montar(ml_png, nfe, oid)
     img.save(f"/tmp/etq_{oid}.png")
     open(f"/tmp/etq_{oid}.zpl", "w").write(para_zpl(img))
-    print(f">> prévia: /tmp/etq_{oid}.png   zpl: /tmp/etq_{oid}.zpl", flush=True)
+    # A4 em tamanho real (100 x 150 mm) pra testar numa impressora comum: imprimir em escala 100%
+    a4 = Image.new("L", (1654, 2339), 255)
+    a4.paste(img, ((a4.width - img.width) // 2, 120))
+    dd = ImageDraw.Draw(a4)
+    dd.rectangle([(a4.width - img.width) // 2 - 1, 119, (a4.width + img.width) // 2, 120 + img.height], outline=160)
+    dd.text((a4.width // 2, 120 + img.height + 40), "Etiqueta 100 x 150 mm em tamanho real — imprimir em escala 100%", font=fonte(26), fill=120, anchor="ma")
+    a4.save(f"/tmp/etq_{oid}_A4.pdf", resolution=203)
+    print(f">> prévia: /tmp/etq_{oid}.png   zpl: /tmp/etq_{oid}.zpl   A4 pra teste: /tmp/etq_{oid}_A4.pdf", flush=True)
 
 
 if __name__ == "__main__":
