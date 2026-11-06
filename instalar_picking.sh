@@ -92,9 +92,42 @@ def _linha(conn, sku, ml_id, status):
     return conn.execute(sql, tuple(args)).fetchone()
 
 
+def _linhas(conn, sku, ml_id, status):
+    """Todas as linhas de pedido_produtos que ainda faltam para esse SKU (componente ou kit), FIFO."""
+    sql = """
+        SELECT pp.id AS pp_id, pp.pedido_id, p.ml_id, p.cliente_nome, p.origem, pr.sku, pr.nome,
+               pp.quantidade, pp.quantidade_bipada, pp.parent_sku, pp.parent_nome
+          FROM pedido_produtos pp
+          JOIN produtos pr ON pr.id = pp.produto_id
+          JOIN pedidos  p  ON p.id  = pp.pedido_id
+         WHERE (UPPER(pr.sku) = UPPER(?) OR UPPER(COALESCE(pp.parent_sku,'')) = UPPER(?))
+           AND p.status = ?
+           AND pp.quantidade_bipada < pp.quantidade
+    """
+    args = [sku, sku, status]
+    if ml_id:
+        sql += " AND p.ml_id = ?"
+        args.append(ml_id)
+    sql += " ORDER BY p.criado_em ASC, p.id ASC, pp.id ASC"
+    return conn.execute(sql, tuple(args)).fetchall()
+
+
+def _totais_produto(conn, sku, status="PENDENTE"):
+    r = conn.execute("""
+        SELECT COALESCE(SUM(pp.quantidade),0) AS total, COALESCE(SUM(pp.quantidade_bipada),0) AS bipado,
+               COUNT(DISTINCT p.id) AS pedidos
+          FROM pedido_produtos pp JOIN produtos pr ON pr.id = pp.produto_id JOIN pedidos p ON p.id = pp.pedido_id
+         WHERE (UPPER(pr.sku) = UPPER(?) OR UPPER(COALESCE(pp.parent_sku,'')) = UPPER(?)) AND p.status = ?
+    """, (sku, sku, status)).fetchone()
+    total, bip = int(r["total"] or 0), int(r["bipado"] or 0)
+    return {"total": total, "bipado": bip, "falta": max(0, total - bip), "pedidos": int(r["pedidos"] or 0)}
+
+
 @picking_routes.post("/separacao/bipar")
 @login_required
 def separacao_bipar():
+    """Separação POR PRODUTO: distribui as N unidades nos pedidos mais antigos (FIFO), um atrás do outro.
+    O pedido vira SEPARADO sozinho quando todos os itens dele ficam completos — sem o operador precisar pensar nisso."""
     d = request.get_json(silent=True) or {}
     sku = str(d.get("sku") or "").strip()
     ml_id = str(d.get("ml_id") or "").strip() or None
@@ -108,33 +141,44 @@ def separacao_bipar():
         return jsonify({"success": False, "error": "Quantidade inválida (1 a 5000)"}), 400
 
     with db_session() as conn:
-        row = _linha(conn, sku, ml_id, "PENDENTE")
-        if not row:
-            if ml_id:
-                p = conn.execute("SELECT id, cliente_nome FROM pedidos WHERE ml_id=? AND status='PENDENTE'", (ml_id,)).fetchone()
-                if p:
-                    itens = _itens_do_pedido(conn, p["id"])
-                    return jsonify({"success": False, "error": f"{sku} não é do pedido #{ml_id} (ou já está completo nele)",
-                                    "detalhe": p["cliente_nome"], "pedido": _resumo_pedido(itens)}), 404
-            return jsonify({"success": False, "error": f"{sku} não está em nenhum pedido pendente"}), 404
+        linhas = _linhas(conn, sku, ml_id, "PENDENTE")
+        if not linhas:
+            return jsonify({"success": False, "error": f"{sku} não está em nenhum pedido pendente (ou já está completo)"}), 404
 
-        falta = int(row["quantidade"]) - int(row["quantidade_bipada"])
-        dar = min(qtd, falta)                     # NUNCA passa do que o pedido precisa
-        conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? WHERE id = ?", (dar, row["pp_id"]))
+        restante, distribuido, fechados, tocados = qtd, [], [], []
+        nome, sku_real = linhas[0]["nome"], linhas[0]["sku"]
+        for row in linhas:
+            if restante <= 0:
+                break
+            falta = int(row["quantidade"]) - int(row["quantidade_bipada"])
+            dar = min(restante, falta)
+            conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? WHERE id = ?", (dar, row["pp_id"]))
+            restante -= dar
+            distribuido.append({"ml_id": row["ml_id"], "cliente": row["cliente_nome"], "quantidade": dar})
+            if row["pedido_id"] not in tocados:
+                tocados.append(row["pedido_id"])
+        for pid in tocados:
+            itens = _itens_do_pedido(conn, pid)
+            if itens and all(i["falta"] == 0 for i in itens):
+                conn.execute("UPDATE pedidos SET status='SEPARADO', atualizado_em=CURRENT_TIMESTAMP WHERE id=?", (pid,))
+                conn.execute("UPDATE pedido_produtos SET quantidade_separada = quantidade_bipada, quantidade_bipada = 0 WHERE pedido_id = ?", (pid,))
+                fechados.append(conn.execute("SELECT ml_id FROM pedidos WHERE id=?", (pid,)).fetchone()["ml_id"])
+        produto = _totais_produto(conn, sku_real)
+        # pedido do último bip (compatibilidade com a tela)
+        ult = distribuido[-1]
+        pid_ult = next(r["pedido_id"] for r in linhas if r["ml_id"] == ult["ml_id"])
+        itens_ult = _itens_do_pedido(conn, pid_ult)
 
-        itens = _itens_do_pedido(conn, row["pedido_id"])
-        fechado = all(i["falta"] == 0 for i in itens)
-        if fechado:
-            conn.execute("UPDATE pedidos SET status='SEPARADO', atualizado_em=CURRENT_TIMESTAMP WHERE id=?", (row["pedido_id"],))
-            conn.execute("UPDATE pedido_produtos SET quantidade_separada = quantidade_bipada, quantidade_bipada = 0 WHERE pedido_id = ?",
-                         (row["pedido_id"],))
-        item = next((i for i in itens if i["sku"] == row["sku"] and (i["parent_sku"] or "") == (row["parent_sku"] or "")), None)
-
-    _log("bipar", row["ml_id"], row["sku"], row["nome"], dar, {"parent_sku": row["parent_sku"], "parent_nome": row["parent_nome"], "lote": dar > 1})
+    dado = qtd - restante
+    for x in distribuido:
+        _log("bipar", x["ml_id"], sku_real, nome, x["quantidade"], {"lote": dado > 1})
     return jsonify({
-        "success": True, "ml_id": row["ml_id"], "cliente": row["cliente_nome"], "origem": row["origem"] or "ML",
-        "bipado_agora": dar, "sobrou": qtd - dar,
-        "item": item, "pedido": _resumo_pedido(itens), "pedido_fechado": fechado,
+        "success": True, "sku": sku_real, "nome": nome, "bipado_agora": dado, "sobrou": restante,
+        "produto": produto,                      # total / bipado / falta do PRODUTO em todos os pedidos pendentes
+        "distribuido": distribuido, "pedidos_fechados": fechados,
+        # compat
+        "ml_id": ult["ml_id"], "cliente": ult["cliente"], "pedido_fechado": ult["ml_id"] in fechados,
+        "item": next((i for i in itens_ult if i["sku"] == sku_real), None), "pedido": _resumo_pedido(itens_ult),
     })
 
 
