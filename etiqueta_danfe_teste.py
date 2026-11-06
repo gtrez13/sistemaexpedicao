@@ -233,6 +233,8 @@ def montar_bonito(zpl: str, inv: dict, nfe: dict, ml_order_id: str) -> Image.Ima
         return None
     c = classificar(z["textos"])
     print(f"   campos do ML: {c}", flush=True)
+    print(f"   CONTEÚDO DO QR (igual ao da etiqueta original): {z['qr']}", flush=True)
+    print(f"   BARCODE DO ENVIO: {z['barcode']}", flush=True)
     rec = inv.get("recipient") or {}
     ad = rec.get("address") or {}
     ship = inv.get("shipment") or {}
