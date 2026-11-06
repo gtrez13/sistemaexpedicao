@@ -92,7 +92,19 @@ def nfe_do_pedido(ml_order_id: str) -> dict:
         if r.status_code == 200:
             j = r.json()
             print(f"   ML invoice: { {k: j[k] for k in j if k not in ('invoice_xml','xml')} }", flush=True)
-            info = {"numero": str(j.get("invoice_number") or ""), "serie": str(j.get("invoice_series") or ""), "chaveAcesso": j.get("invoice_key") or j.get("key") or ""}
+            at = j.get("attributes") or {}
+            rec = j.get("recipient") or {}
+            iss = j.get("issuer") or {}
+            rid = rec.get("identifications") or {}
+            info = {"numero": str(j.get("invoice_number") or ""), "serie": str(j.get("invoice_series") or ""),
+                    "chaveAcesso": at.get("invoice_key") or j.get("invoice_key") or "",
+                    "dataEmissao": str(j.get("issued_date") or at.get("authorization_date") or "")[:10],
+                    "valorNota": j.get("amount"),
+                    "contato": {"nome": str(rec.get("name") or "").split(" (")[0], "numeroDocumento": rid.get("cpf") or rid.get("cnpj") or ""},
+                    "emitente": {"nome": iss.get("name") or EMITENTE, "cnpj": ((iss.get("identifications") or {}).get("cnpj") or EMITENTE_CNPJ)},
+                    "fonte": "ml"}
+            if info["chaveAcesso"] and info["numero"] and str(j.get("status")) == "authorized":
+                return info                       # o ML já tem tudo (é a NF que ele mesmo imprime na etiqueta)
             xml = j.get("invoice_xml") or j.get("xml")
             if xml:
                 try:
@@ -152,6 +164,11 @@ def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
     chave = str(nfe.get("chaveAcesso") or "").replace(" ", "")
     cont = nfe.get("contato") or {}
     emit = nfe.get("emitente") or {}
+    def fmt_doc(v):
+        v = "".join(ch for ch in str(v or "") if ch.isdigit())
+        if len(v) == 11: return f"{v[:3]}.{v[3:6]}.{v[6:9]}-{v[9:]}"
+        if len(v) == 14: return f"{v[:2]}.{v[2:5]}.{v[5:8]}/{v[8:12]}-{v[12:]}"
+        return str(v or "")
     total = nfe.get("valorNota") or nfe.get("valorTotal") or ""
     try:
         total = f"{float(str(total).replace(',', '.')):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -183,8 +200,8 @@ def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
         return txt
     en = emit.get("nome") or EMITENTE
     ec = emit.get("cnpj") or EMITENTE_CNPJ
-    d.text((24, y), cabe(en, col - 12), font=f_c, fill=0); d.text((24, y + 22), f"CNPJ {ec}" if ec else "", font=f_c, fill=0)
-    d.text((24 + col, y), cabe(cont.get("nome", ""), col - 12), font=f_c, fill=0); d.text((24 + col, y + 22), str(cont.get("numeroDocumento", "")), font=f_c, fill=0)
+    d.text((24, y), cabe(en, col - 12), font=f_c, fill=0); d.text((24, y + 22), f"CNPJ {fmt_doc(ec)}" if ec else "", font=f_c, fill=0)
+    d.text((24 + col, y), cabe(cont.get("nome", ""), col - 12), font=f_c, fill=0); d.text((24 + col, y + 22), fmt_doc(cont.get("numeroDocumento", "")), font=f_c, fill=0)
     y += 52
     d.line([(24, y), (W - 24, y)], fill=0, width=2)
     y += 8
@@ -210,9 +227,9 @@ def main():
     oid = sys.argv[1].strip()
     print(">> etiqueta do ML…", flush=True)
     ml_png = ml_label_png(oid)
-    print(">> NF-e no Bling…", flush=True)
+    print(">> NF-e (ML primeiro, Bling só se precisar)…", flush=True)
     nfe = nfe_do_pedido(oid)
-    print(f"   NF {nfe.get('numero')} série {nfe.get('serie')} chave {nfe.get('chaveAcesso')}", flush=True)
+    print(f"   NF {nfe.get('numero')} série {nfe.get('serie')} chave {nfe.get('chaveAcesso')} fonte={nfe.get('fonte')}", flush=True)
     img = montar(ml_png, nfe, oid)
     img.save(f"/tmp/etq_{oid}.png")
     open(f"/tmp/etq_{oid}.zpl", "w").write(para_zpl(img))
