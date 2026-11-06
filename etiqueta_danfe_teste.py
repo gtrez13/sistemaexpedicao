@@ -177,6 +177,11 @@ def ler_zpl(zpl: str) -> dict:
     campos = re.findall(r"\^FO[^^]*((?:\^[A-Z0-9][^^]*)*?)\^FD(.*?)\^FS", zpl, flags=re.S)
     for cmds, dado in campos:
         dado = dado.strip()
+        if "_" in dado:   # ^FH: _C3_A9 = bytes UTF-8 em hexa
+            try:
+                dado = re.sub(r"(?:_[0-9A-Fa-f]{2})+", lambda m: bytes.fromhex(m.group(0).replace("_", "")).decode("utf-8", "ignore"), dado)
+            except Exception:
+                pass
         if "^BQ" in cmds:
             out["qr"] = re.sub(r"^[A-Z]{1,2},", "", dado)          # tira o "QA," / "MA," do ^FD
         elif re.search(r"\^B[CEU8A3]", cmds):
@@ -199,6 +204,8 @@ def classificar(textos: list[str]) -> dict:
             c["nf"] = tt
         elif ">" in tt and len(tt) < 40:
             c["cadeia"] = tt
+        elif c["cadeia"] and c["cadeia"].rstrip().endswith(">") and re.fullmatch(r"\d{1,3}", tt):
+            c["cadeia"] = c["cadeia"].rstrip() + " " + tt      # o "26" vem num campo separado
         elif re.fullmatch(r"\d\d:\d\d", tt):
             c["hora"] = tt
         elif re.fullmatch(r"[A-Z]{2,4}\d{0,2}", tt) and len(c["rota"]) < 2:
@@ -285,7 +292,8 @@ def montar_bonito(zpl: str, inv: dict, nfe: dict, ml_order_id: str) -> Image.Ima
     if c["cadeia"]: d.text((M, y), c["cadeia"], font=fonte(22, True), fill=0); y += 28
     info = "   ".join(x for x in [c["data"], c["nf"]] if x)
     if info: d.text((M, y), info, font=fonte(22, True), fill=0); y += 30
-    for o in c["outros"][:2]:
+    rem = [o for o in c["outros"] if "#" in o][:1]       # linha do vendedor no ML
+    for o in rem:
         d.text((M, y), o[:70], font=fonte(16), fill=0); y += 20
     # barcode do envio
     y += 6
