@@ -51,6 +51,8 @@ def ml_label_png(ml_order_id: str) -> Image.Image:
     # bytes crus (o helper do serviço decodifica como texto e estraga o ZIP)
     resp = ml._request("GET", "/shipment_labels", params={"shipment_ids": str(sid), "response_type": "zpl2"})
     raw = resp.content
+    if raw[:1] == b"{":
+        raise SystemExit(f"ML não devolveu etiqueta (HTTP {resp.status_code}): {raw[:400].decode('utf-8','ignore')}")
     zpl = raw
     if raw[:2] == b"PK":                      # o ML manda um ZIP com "Etiqueta de envio.txt" dentro
         import zipfile
