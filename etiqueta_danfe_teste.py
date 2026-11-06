@@ -163,7 +163,7 @@ def code128(texto: str, altura: int, largura_max: int) -> Image.Image:
     import barcode
     from barcode.writer import ImageWriter
     bc = barcode.get("code128", texto, writer=ImageWriter())
-    img = bc.render({"module_height": 8.0, "module_width": 0.2, "quiet_zone": 1, "write_text": False, "dpi": 203}).convert("L")
+    img = bc.render({"module_height": 12.0, "module_width": 0.33, "quiet_zone": 2, "write_text": False, "dpi": 203}).convert("L")
     k = min(largura_max / img.width, altura / img.height)
     return img.resize((int(img.width * k), int(img.height * k)))
 
@@ -297,7 +297,7 @@ def montar_bonito(zpl: str, inv: dict, nfe: dict, ml_order_id: str) -> Image.Ima
         d.text((M, y), o[:70], font=fonte(16), fill=0); y += 20
     # barcode do envio
     y += 6
-    bc = code128(z["barcode"], 120, W - 2 * M)
+    bc = code128(z["barcode"], 100, W - 2 * M)
     canvas.paste(bc, ((W - bc.width) // 2, y)); y += bc.height + 2
     d.text((W // 2, y), z["barcode"], font=fonte(24, True), fill=0, anchor="ma"); y += 30
     d.text((M, y), f"Venda {ml_order_id}", font=fonte(18), fill=0)
@@ -345,7 +345,8 @@ def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
     d.text((W - 24, y + 4), f"NF-e {nfe.get('numero', '')}  ·  Série {nfe.get('serie', '')}  ·  {dt}", font=fonte(20, True), fill=0, anchor="ra")
     y += 36
     if chave:
-        bc = code128(chave, 96, W - 48)
+        d.text((24, y), "CHAVE DE ACESSO", font=fonte(13, True), fill=0); y += 15
+        bc = code128(chave, 120, W - 40)
         canvas.paste(bc, ((W - bc.width) // 2, y))
         y += bc.height + 4
         d.text((W // 2, y), " ".join(chave[i:i + 4] for i in range(0, len(chave), 4)), font=fonte(20), fill=0, anchor="ma")
