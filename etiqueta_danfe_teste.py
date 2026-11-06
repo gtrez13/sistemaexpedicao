@@ -28,7 +28,7 @@ except Exception:
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 812, 1218            # 100 x 150 mm a 203 dpi
-ML_H = int(H * 0.62)        # parte de cima: etiqueta do ML
+ML_H = int(H * 0.67)        # parte de cima: etiqueta do ML
 EMITENTE = os.getenv("EMPRESA_NOME", "LHVMED Imp. e Com. de Equip. Médicos Ltda")
 EMITENTE_CNPJ = os.getenv("EMPRESA_CNPJ", "")
 
@@ -81,13 +81,52 @@ def ml_label_png(ml_order_id: str) -> Image.Image:
 
 
 def nfe_do_pedido(ml_order_id: str) -> dict:
+    """NF-e do pedido. Fonte 1: o que o ML já tem do pedido (número/série e, se houver, o XML).
+    Fonte 2: Bling — mas só aceita se o número bater com o do ML (o resolvedor por 'score' já pegou NF errada)."""
+    import xml.etree.ElementTree as ET
+    from services.ml_service import MercadoLivreService
+    ml = MercadoLivreService()
+    info = {}
+    try:
+        r = ml._request("GET", f"/users/{ml.user_id}/invoices/orders/{ml_order_id}")
+        if r.status_code == 200:
+            j = r.json()
+            print(f"   ML invoice: { {k: j[k] for k in j if k not in ('invoice_xml','xml')} }", flush=True)
+            info = {"numero": str(j.get("invoice_number") or ""), "serie": str(j.get("invoice_series") or ""), "chaveAcesso": j.get("invoice_key") or j.get("key") or ""}
+            xml = j.get("invoice_xml") or j.get("xml")
+            if xml:
+                try:
+                    ns = {"n": "http://www.portalfiscal.inf.br/nfe"}
+                    root = ET.fromstring(xml if isinstance(xml, str) else xml.decode("utf-8", "ignore"))
+                    inf = root.find(".//n:infNFe", ns)
+                    g = lambda path: (inf.findtext(path, default="", namespaces=ns) if inf is not None else "")
+                    info.update({
+                        "chaveAcesso": (inf.get("Id") or "")[3:] if inf is not None else info.get("chaveAcesso"),
+                        "numero": g("n:ide/n:nNF") or info["numero"], "serie": g("n:ide/n:serie") or info["serie"],
+                        "dataEmissao": g("n:ide/n:dhEmi")[:10], "valorNota": g("n:total/n:ICMSTot/n:vNF"),
+                        "contato": {"nome": g("n:dest/n:xNome"), "numeroDocumento": g("n:dest/n:CPF") or g("n:dest/n:CNPJ")},
+                        "emitente": {"nome": g("n:emit/n:xNome"), "cnpj": g("n:emit/n:CNPJ")},
+                        "fonte": "ml_xml",
+                    })
+                    return info
+                except Exception as e:
+                    print(f"   xml do ML não parseou: {e}", flush=True)
+        else:
+            print(f"   ML invoice: HTTP {r.status_code} {r.text[:150]}", flush=True)
+    except Exception as e:
+        print(f"   ML invoice: erro {e}", flush=True)
+
     from services.bling_service import BlingService
     b = BlingService()
     pv_id, nfe_id = b.resolver_pv_e_nfe_por_ml_order_id(ml_order_id)
     if not nfe_id:
         raise SystemExit("pedido ainda sem NF-e no Bling")
     d = b.obter_nfe_detalhe(nfe_id)
-    return d.get("data") or d
+    d = d.get("data") or d
+    if info.get("numero") and str(d.get("numero")) != info["numero"]:
+        raise SystemExit(f"NF do Bling ({d.get('numero')}) NÃO bate com a NF que está no ML ({info['numero']}) — não imprimo")
+    d["fonte"] = "bling"
+    return d
 
 
 def code128(texto: str, altura: int, largura_max: int) -> Image.Image:
@@ -102,38 +141,56 @@ def code128(texto: str, altura: int, largura_max: int) -> Image.Image:
 def montar(ml_png: Image.Image, nfe: dict, ml_order_id: str) -> Image.Image:
     canvas = Image.new("L", (W, H), 255)
     # ML em cima, reduzido proporcionalmente
-    k = min(W / ml_png.width, ML_H / ml_png.height)
+    k = min((W - 16) / ml_png.width, (ML_H - 12) / ml_png.height)
     ml2 = ml_png.resize((int(ml_png.width * k), int(ml_png.height * k)))
     canvas.paste(ml2, ((W - ml2.width) // 2, 0))
     d = ImageDraw.Draw(canvas)
-    y = ML_H + 6
+    y = ML_H + 4
     for x in range(20, W - 20, 16):
         d.line([(x, y), (x + 8, y)], fill=0, width=3)
-    y += 14
-    f_t, f_s, f_m, f_b = fonte(30, True), fonte(22), fonte(24), fonte(28, True)
+    y += 12
     chave = str(nfe.get("chaveAcesso") or "").replace(" ", "")
-    d.text((24, y), "DANFE SIMPLIFICADO — NF-e", font=f_t, fill=0)
-    d.text((24, y + 36), f"Nº {nfe.get('numero', '')}  Série {nfe.get('serie', '')}  Emissão {str(nfe.get('dataEmissao', ''))[:10]}", font=f_s, fill=0)
-    y += 68
-    d.text((24, y), " ".join(chave[i:i + 4] for i in range(0, len(chave), 4)), font=fonte(21), fill=0)
-    y += 30
-    if chave:
-        bc = code128(chave, 110, W - 48)
-        canvas.paste(bc, ((W - bc.width) // 2, y))
-        y += bc.height + 10
     cont = nfe.get("contato") or {}
-    d.text((24, y), "EMITENTE", font=fonte(16, True), fill=0)
-    d.text((24, y + 18), (EMITENTE + (f" · CNPJ {EMITENTE_CNPJ}" if EMITENTE_CNPJ else ""))[:60], font=f_s, fill=0)
-    y += 50
-    d.text((24, y), "DESTINATÁRIO", font=fonte(16, True), fill=0)
-    d.text((24, y + 18), f"{cont.get('nome', '')} · {cont.get('numeroDocumento', '')}"[:60], font=f_s, fill=0)
-    y += 50
+    emit = nfe.get("emitente") or {}
+    total = nfe.get("valorNota") or nfe.get("valorTotal") or ""
+    try:
+        total = f"{float(str(total).replace(',', '.')):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except ValueError:
+        pass
+    dt = str(nfe.get("dataEmissao", ""))[:10]
+    if len(dt) == 10 and dt[4] == "-":
+        dt = f"{dt[8:10]}/{dt[5:7]}/{dt[0:4]}"
+    # cabeçalho: título à esquerda, nº/série/data à direita
+    d.text((24, y), "DANFE SIMPLIFICADO", font=fonte(26, True), fill=0)
+    d.text((W - 24, y + 4), f"NF-e {nfe.get('numero', '')}  ·  Série {nfe.get('serie', '')}  ·  {dt}", font=fonte(20, True), fill=0, anchor="ra")
+    y += 36
+    if chave:
+        bc = code128(chave, 96, W - 48)
+        canvas.paste(bc, ((W - bc.width) // 2, y))
+        y += bc.height + 4
+        d.text((W // 2, y), " ".join(chave[i:i + 4] for i in range(0, len(chave), 4)), font=fonte(20), fill=0, anchor="ma")
+        y += 30
+    # duas colunas: emitente | destinatário
+    col = (W - 48) // 2
+    d.text((24, y), "EMITENTE", font=fonte(14, True), fill=0)
+    d.text((24 + col, y), "DESTINATÁRIO", font=fonte(14, True), fill=0)
+    y += 17
+    f_c = fonte(18)
+    def cabe(txt, maxw):
+        txt = str(txt or "")
+        while txt and d.textlength(txt, font=f_c) > maxw:
+            txt = txt[:-2]
+        return txt
+    en = emit.get("nome") or EMITENTE
+    ec = emit.get("cnpj") or EMITENTE_CNPJ
+    d.text((24, y), cabe(en, col - 12), font=f_c, fill=0); d.text((24, y + 22), f"CNPJ {ec}" if ec else "", font=f_c, fill=0)
+    d.text((24 + col, y), cabe(cont.get("nome", ""), col - 12), font=f_c, fill=0); d.text((24 + col, y + 22), str(cont.get("numeroDocumento", "")), font=f_c, fill=0)
+    y += 52
     d.line([(24, y), (W - 24, y)], fill=0, width=2)
     y += 8
-    total = nfe.get("valorNota") or nfe.get("valorTotal") or ""
-    d.text((24, y), f"Pedido ML {ml_order_id}", font=f_s, fill=0)
-    d.text((W - 24, y), f"VALOR TOTAL R$ {total}", font=f_b, fill=0, anchor="ra")
-    d.text((24, H - 34), "Consulte pela chave em www.nfe.fazenda.gov.br", font=fonte(18), fill=0)
+    d.text((24, y + 4), f"Pedido ML {ml_order_id}", font=fonte(19), fill=0)
+    d.text((W - 24, y), f"TOTAL R$ {total}", font=fonte(30, True), fill=0, anchor="ra")
+    d.text((24, H - 26), "Consulte pela chave de acesso em www.nfe.fazenda.gov.br", font=fonte(16), fill=0)
     return canvas
 
 
