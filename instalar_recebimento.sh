@@ -288,12 +288,27 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
         pcs = pedidos_compra_do_fornecedor(r["fornecedor_cnpj"])
         d["pedidos_compra"] = [{k: v for k, v in pc.items() if k != "itens"} | {"n_itens": len(pc["itens"])} for pc in pcs]
         d["pedido_compra"] = next((pc for pc in pcs if pc["id"] == r["pedido_compra_id"]), None)
+    if com_pc:
+        d["divergencias_pedido"] = _divergencias(d, conferencia=False)
+    d["permite_liberar"] = PERMITE_LIBERAR
     d["exigir_lote"] = EXIGIR_LOTE
     d["eh_gestor"] = eh_gestor()
     return d
 
 
-PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.02"))   # 2% de diferença de preço tolerada
+PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.01"))   # R$ por unidade (só arredondamento)
+PERMITE_LIBERAR = os.environ.get("RECEB_PERMITE_LIBERAR", "0") == "1"   # padrão: divergência NUNCA é liberada
+
+
+def _item_pc(pc, it):
+    """Item do pedido que corresponde ao item da nota: SKU igual, ou código do fornecedor igual."""
+    for x in pc["itens"]:
+        if x["sku"] and it["sku"] and str(x["sku"]).upper() == str(it["sku"]).upper():
+            return x
+    for x in pc["itens"]:
+        if x["cprod"] and it["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper():
+            return x
+    return None
 
 
 def _preencher_skus_pelo_pedido(c, d: dict):
@@ -314,31 +329,41 @@ def _preencher_skus_pelo_pedido(c, d: dict):
     return mudou
 
 
-def _divergencias(d: dict) -> list:
+def _divergencias(d: dict, conferencia: bool = True) -> list:
+    """conferencia=False: só NF x pedido (preço, quantidade, itens) — mostrado na tela antes de bipar."""
     m = []
     pc = d.get("pedido_compra")
+    usados = set()
     for it in d["itens"]:
         nome = it["descricao"][:40]
         if not it["sku"]:
             m.append(f"Item {it['n_item']} ({nome}): sem SKU vinculado")
-        if it["qtd_conferida"] < it["qtd_nf"]:
+        if conferencia and it["qtd_conferida"] < it["qtd_nf"]:
             m.append(f"Item {it['n_item']} ({nome}): FALTOU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
-        elif it["qtd_conferida"] > it["qtd_nf"]:
+        elif conferencia and it["qtd_conferida"] > it["qtd_nf"]:
             m.append(f"Item {it['n_item']} ({nome}): SOBROU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
-        if EXIGIR_LOTE and (not (it["lote"] or "").strip() or not (it["validade"] or "").strip()):
+        if conferencia and EXIGIR_LOTE and (not (it["lote"] or "").strip() or not (it["validade"] or "").strip()):
             m.append(f"Item {it['n_item']} ({nome}): sem lote/validade")
         if pc:
-            pi = next((x for x in pc["itens"] if (x["sku"] and it["sku"] and str(x["sku"]).upper() == str(it["sku"]).upper())
-                       or (x["cprod"] and it["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper())), None)
+            pi = _item_pc(pc, it)
             if not pi:
                 m.append(f"Item {it['n_item']} ({nome}): NÃO está no pedido de compra {pc['numero']}")
             else:
-                falta_pc = float(pi["qtd"] or 0) - float(pi["atendido"] or 0)
-                if it["qtd_nf"] > falta_pc + 1e-9:
-                    m.append(f"Item {it['n_item']} ({nome}): NF traz {it['qtd_nf']:g}, pedido só tem {falta_pc:g} em aberto")
+                usados.add(id(pi))
+                qpc = float(pi["qtd"] or 0)
+                if abs(it["qtd_nf"] - qpc) > 1e-6:
+                    m.append(f"Item {it['n_item']} ({nome}): QUANTIDADE não bate — NF {it['qtd_nf']:g} x pedido {qpc:g}")
                 vpc, vnf = float(pi.get("valor") or 0), float(it.get("valor_unit") or 0)
-                if vpc > 0 and abs(vnf - vpc) / vpc > PRECO_TOL:
-                    m.append(f"Item {it['n_item']} ({nome}): preço NF R$ {vnf:.2f} x pedido R$ {vpc:.2f}")
+                if abs(vnf - vpc) > PRECO_TOL:
+                    m.append(f"Item {it['n_item']} ({nome}): VALOR não bate — NF R$ {vnf:,.4f} x pedido R$ {vpc:,.4f}")
+    if pc:
+        for pi in pc["itens"]:
+            if id(pi) not in usados:
+                m.append(f"Item do pedido {pc['numero']} NÃO veio na nota: {(pi.get('descricao') or pi.get('sku') or '')[:40]} ({float(pi.get('qtd') or 0):g})")
+        tot_nf = round(sum(it["qtd_nf"] * float(it.get("valor_unit") or 0) for it in d["itens"]), 2)
+        tot_pc = round(sum(float(pi.get("qtd") or 0) * float(pi.get("valor") or 0) for pi in pc["itens"]), 2)
+        if abs(tot_nf - tot_pc) > 0.05:
+            m.append(f"TOTAL dos produtos não bate — NF R$ {tot_nf:,.2f} x pedido R$ {tot_pc:,.2f}")
     if not pc:
         m.append("Nenhum pedido de compra vinculado"
                  + (f" (a nota diz pedido {d['pedido_xml']}, que não está em aberto para esse fornecedor no Bling)" if d.get("pedido_xml") else ""))
@@ -562,6 +587,9 @@ def fechar(nid):
 @recebimento_routes.post("/recebimento/notas/<int:nid>/resolver")
 @login_required
 def resolver(nid):
+    if not PERMITE_LIBERAR:
+        return jsonify({"error": "Nota com divergência NÃO pode ser liberada. Corrija o pedido de compra no Bling "
+                                 "(ou peça carta de correção/nova NF ao fornecedor) e clique em Reabrir para conferir de novo."}), 403
     if not eh_gestor():
         return jsonify({"error": "Somente supervisor/admin libera uma nota recusada."}), 403
     texto = ((request.get_json(silent=True) or {}).get("texto") or "").strip()
