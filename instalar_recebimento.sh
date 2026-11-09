@@ -108,6 +108,11 @@ def garantir_tabelas():
                 pc_qtd NUMERIC, pc_item TEXT
             )""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_receb_itens_nota ON receb_itens (nota_id)")
+        for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped")):
+            try:
+                c.execute(f"ALTER TABLE {tb} ADD COLUMN IF NOT EXISTS {col} TEXT" if pg else f"ALTER TABLE {tb} ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
@@ -135,11 +140,17 @@ def parse_nfe(xml_txt: str) -> dict:
             "descricao": g(p, "n:xProd"), "ncm": g(p, "n:NCM"), "unidade": g(p, "n:uCom"),
             "qtd_nf": float(g(p, "n:qCom") or 0), "valor_unit": float(g(p, "n:vUnCom") or 0),
             "lote_xml": g(ras, "n:nLote"), "validade_xml": g(ras, "n:dVal"),
+            "xped": _dig(g(p, "n:xPed")),
         })
+    infcpl = g(inf.find("n:infAdic", NS), "n:infCpl")
+    xpeds = sorted({it["xped"] for it in itens if it["xped"]})
+    ped_txt = re.findall(r"pedido(?:\s+de\s+compra)?\D{0,12}?(\d{2,9})", infcpl, flags=re.I)
     return {
         "chave": chave, "numero": g(ide, "n:nNF"), "serie": g(ide, "n:serie"), "emissao": g(ide, "n:dhEmi")[:10],
         "fornecedor_cnpj": _dig(g(emit, "n:CNPJ") or g(emit, "n:CPF")), "fornecedor_nome": g(emit, "n:xNome"),
         "valor": float(g(tot, "n:vNF") or 0), "itens": itens,
+        # nº do pedido de compra informado pelo fornecedor: campo xPed dos itens (certo) ou texto adicional (reserva)
+        "pedido_xml": ",".join(xpeds) if xpeds else (ped_txt[0] if ped_txt else ""),
     }
 
 
@@ -155,17 +166,18 @@ def _importar_xml(xml_txt: str, origem: str) -> dict:
                 c.execute("UPDATE receb_notas SET xml=?, atualizado_em=? WHERE id=?", (xml_txt, _agora(), r["id"]))
             return {"id": r["id"], "ja_existia": True, "status": r["status"]}
         c.execute("""INSERT INTO receb_notas (chave, numero, serie, emissao, fornecedor_cnpj, fornecedor_nome, valor, xml,
-                        status, criado_em, origem, atualizado_em) VALUES (?,?,?,?,?,?,?,?,'aguardando',?,?,?)""",
+                        status, criado_em, origem, atualizado_em, pedido_xml) VALUES (?,?,?,?,?,?,?,?,'aguardando',?,?,?,?)""",
                   (nf["chave"], nf["numero"], nf["serie"], nf["emissao"], nf["fornecedor_cnpj"], nf["fornecedor_nome"],
-                   nf["valor"], xml_txt, _agora(), origem, _agora()))
+                   nf["valor"], xml_txt, _agora(), origem, _agora(), nf["pedido_xml"] or None))
         nid = c.execute("SELECT id FROM receb_notas WHERE chave=?", (nf["chave"],)).fetchone()["id"]
         vinc = {v["cprod"]: v["sku"] for v in c.execute("SELECT cprod, sku FROM receb_vinculos WHERE fornecedor_cnpj=?", (nf["fornecedor_cnpj"],)).fetchall()}
         for it in nf["itens"]:
             sku = vinc.get(it["cprod"]) or _sku_existente(c, it["cprod"], it["ean"])
             c.execute("""INSERT INTO receb_itens (nota_id, n_item, cprod, ean, descricao, ncm, unidade, qtd_nf, valor_unit,
-                            lote_xml, validade_xml, sku, lote, validade) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            lote_xml, validade_xml, sku, lote, validade, xped) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (nid, it["n_item"], it["cprod"], it["ean"], it["descricao"], it["ncm"], it["unidade"], it["qtd_nf"],
-                       it["valor_unit"], it["lote_xml"], it["validade_xml"], sku, it["lote_xml"] or None, it["validade_xml"] or None))
+                       it["valor_unit"], it["lote_xml"], it["validade_xml"], sku, it["lote_xml"] or None, it["validade_xml"] or None,
+                       it["xped"] or None))
     return {"id": nid, "ja_existia": False, "status": "aguardando"}
 
 
@@ -222,6 +234,26 @@ def pedidos_compra_do_fornecedor(cnpj: str) -> list:
     return out
 
 
+def _xml_bling_por_chave(chave: str):
+    """Nota de fornecedor já lançada no Bling como nota de entrada: acha pela chave e baixa o XML (só leitura)."""
+    b = _bling()
+    if not b:
+        return None
+    try:
+        for params in ({"chaveAcesso": chave, "limite": 5}, {"tipo": 0, "chaveAcesso": chave, "limite": 5}):
+            for n in b._get_json("/nfe", params).get("data") or []:
+                if _dig(n.get("chaveAcesso")) != chave:
+                    continue
+                det = (b._get_json(f"/nfe/{n['id']}") or {}).get("data") or {}
+                if det.get("xml"):
+                    txt = b._download(det["xml"]).decode("utf-8", "ignore")
+                    if "infNFe" in txt and chave in txt:
+                        return txt
+    except Exception as e:
+        print(f"⚠️ recebimento: busca no Bling por chave falhou: {e}", flush=True)
+    return None
+
+
 # ───────────────────────── Meu Danfe (opcional) ─────────────────────────
 def buscar_xml_por_chave(chave: str):
     """Plano C: Meu Danfe. Configure MEUDANFE_URL (com {chave}) e MEUDANFE_TOKEN. Sem isso devolve None."""
@@ -261,6 +293,27 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
     return d
 
 
+PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.02"))   # 2% de diferença de preço tolerada
+
+
+def _preencher_skus_pelo_pedido(c, d: dict):
+    """Com o pedido vinculado, item sem SKU pega o SKU do item do pedido de mesmo código do fornecedor (e aprende)."""
+    pc = d.get("pedido_compra")
+    if not pc:
+        return False
+    mudou = False
+    for it in d["itens"]:
+        if it["sku"] or not it["cprod"]:
+            continue
+        pi = next((x for x in pc["itens"] if x["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper() and x["sku"]), None)
+        if pi:
+            c.execute("UPDATE receb_itens SET sku=? WHERE id=?", (pi["sku"], it["id"]))
+            c.execute("""INSERT INTO receb_vinculos (fornecedor_cnpj, cprod, sku, criado_por, criado_em) VALUES (?,?,?,?,?)
+                         ON CONFLICT (fornecedor_cnpj, cprod) DO NOTHING""", (d["fornecedor_cnpj"], it["cprod"], pi["sku"], "pedido", _agora()))
+            mudou = True
+    return mudou
+
+
 def _divergencias(d: dict) -> list:
     m = []
     pc = d.get("pedido_compra")
@@ -283,8 +336,12 @@ def _divergencias(d: dict) -> list:
                 falta_pc = float(pi["qtd"] or 0) - float(pi["atendido"] or 0)
                 if it["qtd_nf"] > falta_pc + 1e-9:
                     m.append(f"Item {it['n_item']} ({nome}): NF traz {it['qtd_nf']:g}, pedido só tem {falta_pc:g} em aberto")
+                vpc, vnf = float(pi.get("valor") or 0), float(it.get("valor_unit") or 0)
+                if vpc > 0 and abs(vnf - vpc) / vpc > PRECO_TOL:
+                    m.append(f"Item {it['n_item']} ({nome}): preço NF R$ {vnf:.2f} x pedido R$ {vpc:.2f}")
     if not pc:
-        m.append("Nenhum pedido de compra vinculado")
+        m.append("Nenhum pedido de compra vinculado"
+                 + (f" (a nota diz pedido {d['pedido_xml']}, que não está em aberto para esse fornecedor no Bling)" if d.get("pedido_xml") else ""))
     return m
 
 
@@ -314,6 +371,12 @@ def por_chave():
         r = c.execute("SELECT id, status FROM receb_notas WHERE chave=?", (chave,)).fetchone()
     if r:
         return jsonify({"success": True, "id": r["id"], "status": r["status"]})
+    xml = _xml_bling_por_chave(chave)
+    if xml:
+        try:
+            return jsonify({"success": True, **_importar_xml(xml, "bling")})
+        except Exception as e:
+            print(f"⚠️ recebimento: XML do Bling inválido: {e}", flush=True)
     xml = buscar_xml_por_chave(chave)
     if xml:
         try:
@@ -364,10 +427,15 @@ def detalhe(nid):
             return jsonify({"error": "Nota não encontrada."}), 404
         if d["status"] == "aguardando":
             c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=?", (_agora(), nid)); d["status"] = "conferindo"
-        # vincula pedido de compra sozinho quando só tem um candidato
-        if not d["pedido_compra_id"] and len(d.get("pedidos_compra") or []) == 1:
-            pc = d["pedidos_compra"][0]
-            c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=? WHERE id=?", (pc["id"], str(pc["numero"]), nid))
+        # vínculo AUTOMÁTICO só quando a nota traz o nº do pedido (xPed) e ele é desse fornecedor: 100%, sem chute
+        if not d["pedido_compra_id"] and d.get("pedido_xml"):
+            nums = [x.strip().lstrip("0") for x in str(d["pedido_xml"]).split(",") if x.strip()]
+            pc = next((p for p in (d.get("pedidos_compra") or []) if str(p.get("numero") or "").lstrip("0") in nums), None)
+            if pc:
+                c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, vinculo_por='xml' WHERE id=?",
+                          (pc["id"], str(pc["numero"]), nid))
+                d = _nota_dict(c, nid)
+        if _preencher_skus_pelo_pedido(c, d):
             d = _nota_dict(c, nid)
     return jsonify(d)
 
@@ -385,10 +453,13 @@ def vincular_pedido(nid):
             pc = next((p for p in pedidos_compra_do_fornecedor(r["fornecedor_cnpj"]) if str(p["id"]) == str(pid)), None)
             if not pc:
                 return jsonify({"error": "Pedido de compra não é desse fornecedor."}), 400
-            c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, atualizado_em=? WHERE id=?", (pc["id"], str(pc["numero"]), _agora(), nid))
+            c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, vinculo_por=?, atualizado_em=? WHERE id=?",
+                      (pc["id"], str(pc["numero"]), "manual:" + _quem(), _agora(), nid))
         else:
             c.execute("UPDATE receb_notas SET pedido_compra_id=NULL, pedido_compra_numero=NULL, atualizado_em=? WHERE id=?", (_agora(), nid))
         d = _nota_dict(c, nid)
+        if _preencher_skus_pelo_pedido(c, d):
+            d = _nota_dict(c, nid)
     return jsonify(d)
 
 
