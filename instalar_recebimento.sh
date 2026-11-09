@@ -613,9 +613,10 @@ def resolver(nid):
 def reabrir(nid):
     garantir_tabelas()
     with db_session() as c:
-        r = c.execute("SELECT status FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        r = c.execute("SELECT status, fornecedor_cnpj FROM receb_notas WHERE id=?", (nid,)).fetchone()
         if not r:
             return jsonify({"error": "Nota não encontrada."}), 404
+        _pc_cache.pop(_dig(r["fornecedor_cnpj"]), None)     # pedido pode ter sido corrigido no Bling: relê
         if r["status"] == "conferida" and not eh_gestor():
             return jsonify({"error": "Nota conferida: só supervisor/admin reabre."}), 403
         c.execute("UPDATE receb_notas SET status='conferindo', motivos=NULL, atualizado_em=? WHERE id=?", (_agora(), nid))
