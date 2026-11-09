@@ -9,6 +9,7 @@ cp mapa_routes.py "$BK"
 curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF/mapa_routes.py" -o mapa_routes.py.novo
 venv/bin/python -m py_compile mapa_routes.py.novo
 mv mapa_routes.py.novo mapa_routes.py
+rm -f fotos_cache/*.sem 2>/dev/null || true
 sudo systemctl restart wms-russia.service
 sleep 3
 code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/mapa/foto/TESTE)

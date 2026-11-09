@@ -308,6 +308,10 @@ def foto_arquivo(sku):
             return (_servir(arq) if os.path.exists(arq) else ("", 404))
         if novo:
             dados, ctype = _baixar_img(novo)
+    if not dados:                                     # Bling sem foto: pega a 1ª foto do anúncio no Mercado Livre
+        ml = _foto_ml(sku)
+        if ml:
+            dados, ctype = _baixar_img(ml)
     if not dados:
         open(sem, "w").close()
         return (_servir(arq) if os.path.exists(arq) else ("", 404))
@@ -324,6 +328,46 @@ def foto_arquivo(sku):
             conn.execute("UPDATE mapa_produto_cache SET foto=? WHERE sku_key=?", (novo, key))
             conn.execute("UPDATE mapa_localizacao SET foto=? WHERE sku_key=?", (novo, key))
     return _servir(arq)
+
+
+def _ml_cred():
+    tok, uid = os.environ.get("ML_ACCESS_TOKEN"), os.environ.get("ML_SELLER_ID")
+    try:                                   # o token do ML é renovado no .env pelo resto do sistema: lê o atual
+        from dotenv import dotenv_values
+        env = dotenv_values(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+        tok, uid = env.get("ML_ACCESS_TOKEN") or tok, env.get("ML_SELLER_ID") or uid
+    except Exception:
+        pass
+    return tok, uid
+
+
+def _foto_ml(sku: str):
+    """1ª foto do anúncio do ML com esse SKU (seller_sku). Só leitura, timeout curto, nunca renova token."""
+    tok, uid = _ml_cred()
+    if not tok or not uid:
+        return None
+    h = {"Authorization": f"Bearer {tok}"}
+    try:
+        r = requests.get(f"https://api.mercadolibre.com/users/{uid}/items/search", params={"seller_sku": sku, "limit": 5},
+                         headers=h, timeout=TIMEOUT)
+        ids = (r.json().get("results") or []) if r.status_code == 200 else []
+        if not ids:
+            return None
+        r = requests.get("https://api.mercadolibre.com/items", params={"ids": ",".join(ids[:5]), "attributes": "id,pictures,thumbnail"},
+                         headers=h, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return None
+        for it in r.json() or []:
+            body = it.get("body") or {}
+            for pic in body.get("pictures") or []:
+                u = pic.get("secure_url") or pic.get("url")
+                if u:
+                    return u
+            if body.get("thumbnail"):
+                return body["thumbnail"].replace("http://", "https://")
+    except Exception as e:
+        logging.getLogger(__name__).info("foto ML %s: %s", sku, e)
+    return None
 
 
 def _servir(arq):
