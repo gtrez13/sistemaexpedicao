@@ -86,7 +86,7 @@ def main():
     chaves = [re.sub(r"\D", "", a) for a in sys.argv[1:] if len(re.sub(r"\D", "", a)) == 44]
     if chaves:
         for ch in chaves:
-            r = b._request("GET", f"/nfe/documento/{ch}")
+            r = b._request("GET", f"/nfe/documento/{ch}", params={"formato": "xml"})
             print(f"\n>> /nfe/documento/{ch[:6]}…{ch[-6:]} -> HTTP {r.status_code} {r.headers.get('content-type')}", flush=True)
             txt = r.content.decode("utf-8", "ignore")
             if "<infNFe" not in txt:
