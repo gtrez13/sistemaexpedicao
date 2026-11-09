@@ -43,7 +43,7 @@ def analisar(xml_txt: str, origem: str, pcs_cache: dict):
     emit = inf.find("n:emit", NS)
     cnpj = re.sub(r"\D", "", g(emit, "n:CNPJ"))
     if cnpj == MEU_CNPJ:
-        return   # nota nossa (devolução/entrada própria), não interessa
+        print(f"  [{origem}] emitente = LHVMED (nota própria) — pulada"); return   # nota nossa (devolução/entrada própria), não interessa
     nome = g(emit, "n:xNome")[:35]
     nnf = g(inf.find("n:ide", NS), "n:nNF")
     infcpl = g(inf.find("n:infAdic", NS), "n:infCpl")
@@ -94,6 +94,7 @@ def main():
     print(f"\n>> notas de ENTRADA no Bling desde {ini} (baixando XML pelo link)…")
     for pagina in (1, 2, 3):
         lst = b._get_json("/nfe", {"tipo": 0, "dataEmissaoInicial": ini, "dataEmissaoFinal": date.today().isoformat(), "limite": 50, "pagina": pagina}).get("data") or []
+        print(f"   página {pagina}: {len(lst)} nota(s)", flush=True)
         if not lst:
             break
         for n in lst:
@@ -101,7 +102,7 @@ def main():
                 det = (b._get_json(f"/nfe/{n['id']}") or {}).get("data") or {}
                 link = det.get("xml")
                 if not link:
-                    continue
+                    print(f"  [bling #{det.get('numero')}] sem link de XML — situação {det.get('situacao')} contato {(det.get('contato') or {}).get('nome')}"); continue
                 xml = b._download(link).decode("utf-8", "ignore")
                 analisar(xml, f"bling #{det.get('numero')}", pcs_cache)
                 time.sleep(0.4)
