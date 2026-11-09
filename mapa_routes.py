@@ -7,6 +7,7 @@ Endpoints (registrar com url_prefix="/api"):
     POST   /api/mapa/localizacao         adiciona {sku, porta_palet, posicao, nome, foto} (N:N)
     DELETE /api/mapa/localizacao/<sku>   remove o SKU (?porta_palet=&posicao= => só daquela posição)
     GET    /api/mapa/produto/<sku>       nome + foto (cache -> mapa -> Bling, nessa ordem)
+    GET    /api/mapa/foto/<sku>          a IMAGEM em si (baixada do Bling e guardada em disco; link do Bling expira)
     GET    /api/mapa/status              estado do Bling para este módulo (sem segredos)
 
 Regras de segurança contra 429 / travamento (o WMS roda com 1 worker, 1 thread):
@@ -20,11 +21,12 @@ Regras de segurança contra 429 / travamento (o WMS roda com 1 worker, 1 thread)
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
 import requests
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, g, jsonify, request, send_file
 from flask_login import login_required   # mesma sessão do resto do WMS (/api/auth/me)
 
 try:                                  # produção: escolhe Postgres/SQLite pelo DATABASE_URL
@@ -253,6 +255,84 @@ def produto(sku):
                     consultado_em=EXCLUDED.consultado_em
             """, (key, nome, _foto_ok(foto), 1 if (nome or foto) else 0, agora))
     return jsonify({"sku": sku, "nome": nome, "foto": _foto_ok(foto)})
+
+
+FOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fotos_cache")
+FOTO_TTL = 30 * 86400            # imagem guardada vale 30 dias
+FOTO_TTL_SEM = 6 * 3600          # "não tem foto / falhou": tenta de novo depois de 6h
+
+
+def _baixar_img(url):
+    try:
+        r = requests.get(url, timeout=TIMEOUT)
+        if r.status_code == 200 and r.content and (r.headers.get("content-type") or "").startswith("image"):
+            return r.content, r.headers.get("content-type")
+    except Exception:
+        pass
+    return None, None
+
+
+@mapa_routes.get("/mapa/foto/<path:sku>")
+@login_required
+def foto_arquivo(sku):
+    """Serve a foto do produto. 1º disco; senão tenta o link guardado; se expirou, pede link novo ao Bling."""
+    sku = _norm(sku)
+    key = _key(sku)
+    if not key:
+        return ("", 404)
+    os.makedirs(FOTO_DIR, exist_ok=True)
+    nomearq = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
+    arq, sem = os.path.join(FOTO_DIR, nomearq + ".img"), os.path.join(FOTO_DIR, nomearq + ".sem")
+    agora = time.time()
+    if os.path.exists(arq) and agora - os.path.getmtime(arq) < FOTO_TTL:
+        return _servir(arq)
+    if os.path.exists(sem) and agora - os.path.getmtime(sem) < FOTO_TTL_SEM:
+        return (_servir(arq) if os.path.exists(arq) else ("", 404))
+
+    _garantir_tabelas()
+    with db_session() as conn:
+        links = [r["foto"] for r in conn.execute(
+            "SELECT foto FROM mapa_produto_cache WHERE sku_key=? AND foto IS NOT NULL AND foto<>'' "
+            "UNION SELECT foto FROM mapa_localizacao WHERE sku_key=? AND foto IS NOT NULL AND foto<>''",
+            (key, key)).fetchall()]
+    dados = ctype = None
+    for u in links:                                   # link guardado ainda vale?
+        dados, ctype = _baixar_img(u)
+        if dados:
+            break
+    novo = None
+    if not dados:                                     # expirou: link novo do Bling
+        try:
+            _, novo, _ = _consultar_bling(sku)
+        except _Indisponivel:
+            return (_servir(arq) if os.path.exists(arq) else ("", 404))
+        if novo:
+            dados, ctype = _baixar_img(novo)
+    if not dados:
+        open(sem, "w").close()
+        return (_servir(arq) if os.path.exists(arq) else ("", 404))
+    tmp = arq + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(dados)
+    os.replace(tmp, arq)
+    with open(arq + ".ct", "w") as f:
+        f.write(ctype or "image/jpeg")
+    if os.path.exists(sem):
+        os.remove(sem)
+    if novo:                                          # guarda o link novo também
+        with db_session() as conn:
+            conn.execute("UPDATE mapa_produto_cache SET foto=? WHERE sku_key=?", (novo, key))
+            conn.execute("UPDATE mapa_localizacao SET foto=? WHERE sku_key=?", (novo, key))
+    return _servir(arq)
+
+
+def _servir(arq):
+    try:
+        ct = open(arq + ".ct").read().strip() or "image/jpeg"
+    except Exception:
+        ct = "image/jpeg"
+    resp = send_file(arq, mimetype=ct, max_age=86400)
+    return resp
 
 
 @mapa_routes.get("/mapa/status")
