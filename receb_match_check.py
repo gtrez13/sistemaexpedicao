@@ -83,6 +83,27 @@ def analisar(xml_txt: str, origem: str, pcs_cache: dict):
 
 def main():
     pcs_cache = {}
+    chaves = [re.sub(r"\D", "", a) for a in sys.argv[1:] if len(re.sub(r"\D", "", a)) == 44]
+    if chaves:
+        for ch in chaves:
+            r = b._request("GET", f"/nfe/documento/{ch}")
+            print(f"\n>> /nfe/documento/{ch[:6]}…{ch[-6:]} -> HTTP {r.status_code} {r.headers.get('content-type')}", flush=True)
+            txt = r.content.decode("utf-8", "ignore")
+            if "<infNFe" not in txt:
+                try:
+                    import json
+                    j = r.json(); print("   resposta:", json.dumps(j, ensure_ascii=False)[:600])
+                    d = j.get("data") if isinstance(j, dict) else None
+                    cand = (d or {}).get("xml") if isinstance(d, dict) else None
+                    if cand and cand.startswith("http"):
+                        txt = b._download(cand).decode("utf-8", "ignore")
+                    elif cand:
+                        txt = cand
+                except Exception:
+                    print("   resposta:", txt[:400])
+            if "<infNFe" in txt:
+                analisar(txt, f"chave {ch[-8:]}", pcs_cache)
+        return
     pasta = sys.argv[1] if len(sys.argv) > 1 else None
     if pasta:
         arqs = glob.glob(os.path.join(pasta, "**", "*.xml"), recursive=True)
