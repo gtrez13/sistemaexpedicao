@@ -857,6 +857,29 @@ def _classificar(r) -> tuple:
     return "com_custo", f"Conferência no galpão (WMS): {motivo}" + (f" · ML avisado: {r['ml_review']}" if r["ml_review"] else "")
 
 
+import re as _re
+_SEM_CUSTO_RX = _re.compile(r"arrepend|desist|n[aã]o (gostou|quer|precis)|mudou de ideia|comprou errado|tamanho|n[aã]o atend.*expectativ|engano", _re.I)
+_COM_CUSTO_RX = _re.compile(r"defeit|danific|quebr|avari|diferente|incomplet|falt|n[aã]o funciona|usad|vencid|errad", _re.I)
+
+
+def _motivo_de(r) -> str:
+    """Motivo escolhido na conferência; senão o motivo que o ML mandou (guardado nas observações pela importação)."""
+    if (r["motivo"] or "").strip():
+        return r["motivo"].strip()
+    m = _re.search(r"Motivo ML:\s*(.+?)\.\s*(Envio de volta|$)", r["observacoes"] or "")
+    if m and m.group(1).strip() not in ("—", ""):
+        return _re.sub(r"\s*\([A-Z]{2,4}\d+\)\s*$", "", m.group(1)).strip()
+    return "Não informado"
+
+
+def _previsao(motivo: str) -> str:
+    if _COM_CUSTO_RX.search(motivo or ""):
+        return "com_custo"
+    if _SEM_CUSTO_RX.search(motivo or ""):
+        return "sem_custo"
+    return "indefinido"
+
+
 @devolucoes_routes.get("/devolucoes/admin")
 @login_required
 def painel_admin():
@@ -866,24 +889,36 @@ def painel_admin():
     with db_session() as conn:
         rows = conn.execute("SELECT * FROM devolucoes ORDER BY criado_em DESC").fetchall()
     grupos = {k: {"valor": 0.0, "qtd": 0, "frete": 0.0, "itens": []} for k in ("sem_custo", "com_custo", "em_aberto")}
+    previsto = {k: {"valor": 0.0, "qtd": 0} for k in ("sem_custo", "com_custo", "indefinido")}
+    ranking = {}
     total, frete_total = 0.0, 0.0
     for r in rows:
         valor = float(r["valor"] or 0) * float(r["qtd"] or 1)
         frete = float(r["custo_devolucao"] if r["custo_devolucao"] is not None else (r["custo_ml"] or 0))
         g, fonte = _classificar(r)
         total += valor; frete_total += frete
+        motivo = _motivo_de(r)
+        rk = ranking.setdefault(motivo, {"motivo": motivo, "qtd": 0, "valor": 0.0, "frete": 0.0})
+        rk["qtd"] += 1; rk["valor"] += valor; rk["frete"] += frete
+        prev = None
+        if g == "em_aberto":            # ainda não confirmado: previsão pelo motivo que o cliente deu
+            prev = _previsao(motivo)
+            previsto[prev]["valor"] += valor; previsto[prev]["qtd"] += 1
         G = grupos[g]
         G["valor"] += valor; G["qtd"] += 1; G["frete"] += frete
         G["itens"].append({"id": r["id"], "produto": r["produto"] or r["sku"], "sku": r["sku"], "venda": r["numero_venda"],
                            "cliente": r["cliente"], "valor": valor, "frete": frete, "status": r["status"], "fonte": fonte,
-                           "criado_em": r["criado_em"]})
-    return jsonify({"total": total, "qtd": len(rows), "frete_total": frete_total, "grupos": grupos,
+                           "criado_em": r["criado_em"], "motivo": motivo, "previsao": prev})
+    return jsonify({"total": total, "qtd": len(rows), "frete_total": frete_total, "grupos": grupos, "previsto": previsto,
+                    "ranking": sorted(ranking.values(), key=lambda x: (-x["qtd"], -x["valor"])),
                     "prazo_full_dias": FULL_PRAZO_DIAS,
                     "fontes": {
                         "valor": "Valor da venda × quantidade (vem do pedido no ML na importação, ou digitado na conferência)",
                         "frete": "Frete de volta cobrado do vendedor pelo ML (reclamação → devolução → envio, campo do recebedor); ou o custo digitado na conferência",
                         "galpao": "Devoluções que voltam ao galpão: resultado da conferência no WMS (como chegou, avaria, faltou item, pode voltar ao estoque)",
                         "full": "Devoluções FULL: histórico do estoque FULL do ML, operação 'devolução do comprador' (sale_return)",
+                        "previsao": "Previsão (ainda não confirmada): pelo motivo que o cliente deu no ML — defeito, danificado, diferente, incompleto = provável custo; arrependimento, desistência = provável sem custo",
+                        "motivo": "Motivo escolhido na conferência; se ainda não conferida, o motivo que o cliente informou no ML",
                     }})
 
 
