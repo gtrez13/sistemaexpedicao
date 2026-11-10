@@ -19,11 +19,13 @@ from db import db_session
 
 MARCA = "[encerrada no ML antes do WMS; status anterior: {}]"
 gravar, desfazer = "--gravar" in sys.argv, "--desfazer" in sys.argv
+em_transito = "--reabrir-em-transito" in sys.argv
 
 with db_session() as c:
-    if desfazer:
+    if desfazer or em_transito:
         n = 0
-        for r in c.execute("SELECT id, observacoes FROM devolucoes WHERE observacoes LIKE '%[encerrada no ML antes do WMS%'").fetchall():
+        filtro = " AND COALESCE(ml_envio,'') NOT IN ('delivered','cancelled','')" if em_transito else ""
+        for r in c.execute("SELECT id, observacoes FROM devolucoes WHERE observacoes LIKE '%[encerrada no ML antes do WMS%'" + filtro).fetchall():
             m = re.search(r"status anterior: (\w+)\]", r["observacoes"] or "")
             obs = re.sub(r"\s*\[encerrada no ML antes do WMS; status anterior: \w+\]", "", r["observacoes"] or "")
             c.execute("UPDATE devolucoes SET status=?, observacoes=?, finalizada_em=NULL, finalizada_por=NULL WHERE id=?",
