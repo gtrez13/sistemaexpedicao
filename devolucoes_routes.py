@@ -86,10 +86,11 @@ def eh_gestor() -> bool:
 EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", "BIGINT"), ("finalizada_em", "BIGINT"),
              ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT"),
              ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT"),
-             ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT")]
+             ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT"),
+             ("canal", "TEXT"), ("servico", "TEXT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
-            "observacoes", "status"]
+            "observacoes", "status", "canal", "servico"]
 COLS_BOOL = ["teve_reclamacao", "avaria", "faltou_item", "volta_estoque"]
 
 
@@ -725,6 +726,61 @@ def ml_revisao_enviar(did):
         conn.execute("UPDATE devolucoes SET ml_review=?, ml_review_em=?, ml_review_por=?, ml_review_msg=?, atualizado_em=? WHERE id=?",
                      (resultado, agora, _quem(), msg, agora, did))
     return jsonify({"success": True, "resultado": resultado, "msg": msg})
+
+
+# ───────────────────────────── PRANCHETA: preenche sozinho o que dá (igual ao Forms de devolução) ─────────────────────────────
+EMPRESAS_FORMS = ["MEDICAL", "LHVMED", "CONTA DA TICI", "CONTA DA SIMONE", "CONTA DO DAVID"]
+SERVICOS = ["Devolução", "Troca", "Conserto", "Retorno (exposição / empréstimo)"]
+
+
+@devolucoes_routes.get("/devolucoes/<int:did>/preencher")
+@login_required
+def preencher(did):
+    """Busca o que falta e grava: canal, empresa, NF de saída (do ML), taxa de devolução (frete de volta)."""
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r:
+        return jsonify({"error": "Devolução não encontrada."}), 404
+    novos, fontes, avisos = {}, {}, []
+    eh_ml = bool(r["ml_claim_id"]) or str(r["numero_venda"] or "").startswith("2000")
+    if not r["canal"]:
+        novos["canal"] = "MERCADO LIVRE" if eh_ml else None
+        fontes["canal"] = "veio de uma reclamação do Mercado Livre" if eh_ml else ""
+    if not r["loja"] or r["loja"] in ("LHV Med",):
+        novos["loja"] = os.environ.get("DEVOLUCAO_EMPRESA_PADRAO", "LHVMED")
+        fontes["loja"] = "conta do Mercado Livre deste WMS"
+    if eh_ml and not (r["nf_saida"] or "").strip() and r["numero_venda"]:
+        try:
+            from services.ml_service import MercadoLivreService
+            ml = MercadoLivreService()
+            rr = ml._request("GET", f"/users/{ml.user_id}/invoices/orders/{r['numero_venda']}")
+            if rr is not None and rr.status_code == 200:
+                j = rr.json()
+                num = str(j.get("invoice_number") or "").strip()
+                if num:
+                    novos["nf_saida"] = num + (f"/{j.get('invoice_series')}" if j.get("invoice_series") else "")
+                    fontes["nf_saida"] = "nota fiscal da venda no Mercado Livre"
+            else:
+                avisos.append(f"NF de saída: o ML respondeu {getattr(rr, 'status_code', 'sem resposta')} (preencha à mão)")
+        except Exception as e:
+            avisos.append(f"NF de saída: {e}")
+    if r["custo_devolucao"] is None:
+        taxa = r["custo_ml"]
+        if taxa is None and r["ml_claim_id"]:
+            try:
+                taxa, _, _ = _custo_frete_volta(lambda p, params=None: _ml_req("GET", p, params=params), r["ml_claim_id"])
+            except Exception as e:
+                avisos.append(f"Taxa de devolução: {e}")
+        if taxa is not None:
+            novos["custo_devolucao"] = float(taxa)
+            fontes["custo_devolucao"] = "frete de volta cobrado pelo Mercado Livre"
+    novos = {k: v for k, v in novos.items() if v is not None}
+    if novos:
+        sets = ",".join(f"{k}=?" for k in novos)
+        with db_session() as conn:
+            conn.execute(f"UPDATE devolucoes SET {sets}, atualizado_em=? WHERE id=?", tuple(novos.values()) + (int(time.time()), did))
+    return jsonify({"preenchido": novos, "fontes": fontes, "avisos": avisos, "empresas": EMPRESAS_FORMS, "servicos": SERVICOS})
 
 
 # ───────────────────────────── DEVOLUÇÃO FULL: voltou mesmo pro estoque do ML? ─────────────────────────────
