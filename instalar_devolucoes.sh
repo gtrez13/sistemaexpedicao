@@ -92,7 +92,8 @@ def eh_gestor() -> bool:
 
 EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", "BIGINT"), ("finalizada_em", "BIGINT"),
              ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT"),
-             ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT")]
+             ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT"),
+             ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status"]
@@ -804,7 +805,104 @@ def full_retorno(did):
         out["situacao"] = "nao_chegou"
         if ultimo_erro:
             out["aviso"] = ultimo_erro
+    if not (out["situacao"] == "nao_chegou" and ultimo_erro):       # guarda o resultado pro painel do admin
+        with db_session() as conn:
+            conn.execute("UPDATE devolucoes SET full_situacao=?, full_info=?, full_em=? WHERE id=?",
+                         (out["situacao"], json.dumps({"operacoes": saida[-3:], "inventory_id": inv}), int(time.time()), did))
     return jsonify(out)
+
+
+@devolucoes_routes.post("/devolucoes/full-conferir-todas")
+@login_required
+def full_conferir_todas():
+    """Admin: confere no FULL as devoluções do armazém do ML (as mais antigas sem conferir primeiro). Poucas por vez."""
+    garantir_tabelas()
+    n = min(int((request.get_json(silent=True) or {}).get("limite") or 8), 15)
+    with db_session() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM devolucoes WHERE status='armazem_ml' AND numero_venda IS NOT NULL "
+            "ORDER BY COALESCE(full_em,0) ASC, criado_em ASC LIMIT ?", (n,)).fetchall()]
+        total = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE status='armazem_ml'").fetchone()["n"]
+    feitos, erros = 0, []
+    for did in ids:
+        try:
+            r = full_retorno.__wrapped__(did) if hasattr(full_retorno, "__wrapped__") else full_retorno(did)
+            feitos += 1
+        except Exception as e:
+            erros.append(f"#{did}: {e}")
+        time.sleep(0.6)
+    return jsonify({"success": True, "conferidas": feitos, "total_armazem": total, "erros": erros})
+
+
+# ───────────────────────────── PAINEL DO ADMIN: quanto voltou bem e quanto virou prejuízo ─────────────────────────────
+FULL_PRAZO_DIAS = int(os.environ.get("DEVOLUCAO_FULL_PRAZO_DIAS", "20"))   # depois disso, "não entrou no FULL" vira prejuízo
+
+
+def _classificar(r) -> tuple:
+    """-> (grupo, fonte). grupo: sem_custo | com_custo | em_aberto"""
+    v = r["status"]
+    if v == "armazem_ml":
+        fs, quando = r["full_situacao"], r["full_em"]
+        dt = time.strftime("%d/%m %H:%M", time.localtime(quando)) if quando else ""
+        if fs == "disponivel":
+            return "sem_custo", f"Histórico do estoque FULL do ML: devolução do comprador entrou DISPONÍVEL (consultado {dt})"
+        if fs == "bloqueado":
+            return "com_custo", f"Histórico do estoque FULL do ML: entrou BLOQUEADA, não vendável (consultado {dt})"
+        idade = (time.time() - (r["criado_em"] or time.time())) / 86400
+        if fs == "nao_chegou" and idade > FULL_PRAZO_DIAS:
+            return "com_custo", f"Histórico do estoque FULL do ML: sem entrada de devolução após {int(idade)} dias (consultado {dt})"
+        if fs == "nao_chegou":
+            return "em_aberto", f"Ainda não entrou no FULL ({int(idade)} dias; prazo {FULL_PRAZO_DIAS}) — consultado {dt}"
+        return "em_aberto", "Vai para o armazém do ML: ainda não conferido no histórico do FULL"
+    if v == "esperada":
+        return "em_aberto", f"A caminho do galpão (envio de volta no ML: {r['ml_envio'] or '—'})"
+    if r["volta_estoque"] is None:
+        return "em_aberto", "Chegou no galpão, mas a conferência ainda não disse se volta ao estoque"
+    if r["volta_estoque"] and not tem_problema(r):
+        return "sem_custo", "Conferência no galpão (WMS): produto em ordem, volta ao estoque"
+    motivo = r["chegada"] or ("avaria" if r["avaria"] else "faltou item" if r["faltou_item"] else "não volta ao estoque")
+    return "com_custo", f"Conferência no galpão (WMS): {motivo}" + (f" · ML avisado: {r['ml_review']}" if r["ml_review"] else "")
+
+
+@devolucoes_routes.get("/devolucoes/admin")
+@login_required
+def painel_admin():
+    if not eh_gestor():
+        return jsonify({"error": "Somente supervisor/admin."}), 403
+    garantir_tabelas()
+    with db_session() as conn:
+        rows = conn.execute("SELECT * FROM devolucoes ORDER BY criado_em DESC").fetchall()
+    grupos = {k: {"valor": 0.0, "qtd": 0, "frete": 0.0, "itens": []} for k in ("sem_custo", "com_custo", "em_aberto")}
+    total, frete_total = 0.0, 0.0
+    for r in rows:
+        valor = float(r["valor"] or 0) * float(r["qtd"] or 1)
+        frete = float(r["custo_devolucao"] if r["custo_devolucao"] is not None else (r["custo_ml"] or 0))
+        g, fonte = _classificar(r)
+        total += valor; frete_total += frete
+        G = grupos[g]
+        G["valor"] += valor; G["qtd"] += 1; G["frete"] += frete
+        G["itens"].append({"id": r["id"], "produto": r["produto"] or r["sku"], "sku": r["sku"], "venda": r["numero_venda"],
+                           "cliente": r["cliente"], "valor": valor, "frete": frete, "status": r["status"], "fonte": fonte,
+                           "criado_em": r["criado_em"]})
+    return jsonify({"total": total, "qtd": len(rows), "frete_total": frete_total, "grupos": grupos,
+                    "prazo_full_dias": FULL_PRAZO_DIAS,
+                    "fontes": {
+                        "valor": "Valor da venda × quantidade (vem do pedido no ML na importação, ou digitado na conferência)",
+                        "frete": "Frete de volta cobrado do vendedor pelo ML (reclamação → devolução → envio, campo do recebedor); ou o custo digitado na conferência",
+                        "galpao": "Devoluções que voltam ao galpão: resultado da conferência no WMS (como chegou, avaria, faltou item, pode voltar ao estoque)",
+                        "full": "Devoluções FULL: histórico do estoque FULL do ML, operação 'devolução do comprador' (sale_return)",
+                    }})
+
+
+@devolucoes_routes.get("/devolucoes/chegaram")
+@login_required
+def chegaram():
+    """Devoluções que o ML diz que já foram ENTREGUES no galpão e ninguém conferiu ainda."""
+    garantir_tabelas()
+    with db_session() as conn:
+        rows = conn.execute("SELECT id, produto, sku, cliente, numero_venda, atualizado_em FROM devolucoes "
+                            "WHERE status='esperada' AND ml_envio='delivered' ORDER BY atualizado_em DESC LIMIT 50").fetchall()
+    return jsonify({"n": len(rows), "itens": [dict(r) for r in rows]})
 
 
 # ───────────────────────────── SAC ─────────────────────────────
