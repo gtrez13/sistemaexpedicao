@@ -865,8 +865,8 @@ def _classificar(r) -> tuple:
 
 
 import re as _re
-_SEM_CUSTO_RX = _re.compile(r"arrepend|desist|n[aã]o (gostou|quer|precis)|mudou de ideia|comprou errado|tamanho|n[aã]o atend.*expectativ|engano", _re.I)
-_COM_CUSTO_RX = _re.compile(r"defeit|danific|quebr|avari|diferente|incomplet|falt|n[aã]o funciona|usad|vencid|errad", _re.I)
+_SEM_CUSTO_RX = _re.compile(r"n[aã]o (a|o) quero mais|chegou bem|boas condi[cç]|n[aã]o [eé] da cor|arrepend|desist|n[aã]o (gostou|quer|precis)|mudou de ideia|comprou errado|tamanho|n[aã]o atend.*expectativ|engano", _re.I)
+_COM_CUSTO_RX = _re.compile(r"descumpre|caracter[ií]sticas do an[uú]ncio|defeit|danific|quebr|avari|diferente|incomplet|falt|n[aã]o funciona|usad|vencid|errad", _re.I)
 
 
 def _motivo_de(r) -> str:
