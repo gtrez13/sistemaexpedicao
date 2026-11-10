@@ -763,6 +763,63 @@ EMPRESAS_FORMS = ["MEDICAL", "LHVMED", "CONTA DA TICI", "CONTA DA SIMONE", "CONT
 SERVICOS = ["Devolução", "Troca", "Conserto", "Retorno (exposição / empréstimo)"]
 
 
+def _nf_saida_bling(numero_venda):
+    """NF de saída pelo Bling (a LHVMED emite lá; o ML só conhece a nota se ela foi enviada para ele).
+    Pedido de venda do Bling com numeroLoja = venda (ou pacote) do ML -> nota fiscal ligada. -> (nf|None, fonte/aviso)"""
+    from datetime import datetime, timedelta
+    from services.bling_service import BlingService
+    venda = str(numero_venda or "").strip()
+    alvos, data_venda = [venda], None
+    st, o = _ml_req("GET", f"/orders/{venda}")
+    if st != 200:                                   # pode ser o número do pacote
+        sp, pk = _ml_req("GET", f"/packs/{venda}")
+        if sp == 200 and isinstance(pk, dict) and pk.get("orders"):
+            oid = str(pk["orders"][0].get("id"))
+            alvos.append(oid)
+            st, o = _ml_req("GET", f"/orders/{oid}")
+    if st == 200 and isinstance(o, dict):
+        if o.get("pack_id"):
+            alvos.append(str(o["pack_id"]))
+        data_venda = str(o.get("date_created") or "")[:10] or None
+    alvos = list(dict.fromkeys(a for a in alvos if a))
+    b = BlingService()
+    pv_id = None
+    for a in alvos:                                  # 1) filtro direto pelo número da loja
+        try:
+            d = b._get_json("/pedidos/vendas", params={"numerosLojas[]": a, "limite": 100}, timeout=(10, 30))
+            pv_id = next((x.get("id") for x in d.get("data") or [] if str(x.get("numeroLoja") or "").strip() in alvos), None)
+        except Exception as e:
+            print(f"[NF-SAIDA] bling numerosLojas {a}: {e}", flush=True)
+        if pv_id:
+            break
+    if not pv_id and data_venda:                     # 2) pedidos do dia da venda (até 5 páginas)
+        try:
+            dv = datetime.strptime(data_venda, "%Y-%m-%d")
+            ini, fim = (dv - timedelta(days=1)).strftime("%Y-%m-%d"), (dv + timedelta(days=2)).strftime("%Y-%m-%d")
+            for pag in range(1, 6):
+                d = b._get_json("/pedidos/vendas", params={"dataInicial": ini, "dataFinal": fim, "pagina": pag, "limite": 100}, timeout=(10, 30))
+                itens = d.get("data") or []
+                pv_id = next((x.get("id") for x in itens if str(x.get("numeroLoja") or "").strip() in alvos), None)
+                if pv_id or len(itens) < 100:
+                    break
+        except Exception as e:
+            print(f"[NF-SAIDA] bling por data {data_venda}: {e}", flush=True)
+    print(f"[NF-SAIDA] venda {venda} alvos={alvos} data={data_venda} -> pedido Bling {pv_id}", flush=True)
+    if not pv_id:
+        return None, f"NF de saída: não achei a venda {venda} no Bling (preencha à mão)"
+    det = b.get_pedido_venda_detalhe(int(pv_id))
+    det = det.get("data") or det
+    nf_id = (det.get("notaFiscal") or {}).get("id")
+    if not nf_id:
+        return None, f"NF de saída: o pedido {det.get('numero')} do Bling ainda não tem nota fiscal (preencha à mão)"
+    nf = b.obter_nfe_detalhe(int(nf_id))
+    num = str(nf.get("numero") or "").strip().lstrip("0")
+    if not num:
+        return None, "NF de saída: o Bling não devolveu o número da nota (preencha à mão)"
+    serie = str(nf.get("serie") or "").strip()
+    return num + (f"/{serie}" if serie else ""), f"nota fiscal do pedido {det.get('numero')} no Bling"
+
+
 @devolucoes_routes.get("/devolucoes/<int:did>/preencher")
 @login_required
 def preencher(did):
@@ -791,10 +848,17 @@ def preencher(did):
                 if num:
                     novos["nf_saida"] = num + (f"/{j.get('invoice_series')}" if j.get("invoice_series") else "")
                     fontes["nf_saida"] = "nota fiscal da venda no Mercado Livre"
-            else:
-                avisos.append(f"NF de saída: o ML respondeu {getattr(rr, 'status_code', 'sem resposta')} (preencha à mão)")
         except Exception as e:
-            avisos.append(f"NF de saída: {e}")
+            print(f"[NF-SAIDA] ML invoices {r['numero_venda']}: {e}", flush=True)
+        if not novos.get("nf_saida"):                # o ML não tem a nota: busca no Bling, onde ela é emitida
+            try:
+                nf, info = _nf_saida_bling(r["numero_venda"])
+                if nf:
+                    novos["nf_saida"], fontes["nf_saida"] = nf, info
+                else:
+                    avisos.append(info)
+            except Exception as e:
+                avisos.append(f"NF de saída: erro ao consultar o Bling ({str(e)[:150]}) — preencha à mão")
     if r["custo_devolucao"] is None:
         taxa = r["custo_ml"]
         if taxa is None and r["ml_claim_id"]:
