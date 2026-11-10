@@ -1196,8 +1196,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             cid = str(c.get("id"))
             v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
             tem_linha = conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone() is not None
-            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha) or v["resultado"] == "fechada_ok"
-                      or (v["resultado"] in ("sem_devolucao",) or str(v["resultado"]).startswith("erro_"))
+            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
+                      or (v["resultado"] in ("sem_devolucao", "fechada_ok") or str(v["resultado"]).startswith("erro_"))
                       and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S):
                 conhecidas += 1
                 continue
@@ -1217,7 +1217,14 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 tem, destino, st_envio = _destino_da_devolucao(ret)
                 resultado = "armazem_ml" if (tem and destino == "warehouse") else ("importada" if tem else "sem_devolucao")
                 if c.get("_fechada") and resultado != "sem_devolucao" and st_envio not in EM_TRANSITO:
-                    resultado = "fechada_ok"        # reclamação fechada e a caixa já chegou/encerrou: nada a esperar
+                    # reclamação fechada e a caixa já chegou. MAS se o ML ainda espera a REVISÃO do vendedor
+                    # ("Para sua revisão" no painel do ML), ela continua pendente pra nós: importa.
+                    cc, cl = ml_get(f"/post-purchase/v1/claims/{cid}")
+                    if cc == 429:
+                        parou_429 = True
+                        continue
+                    if not (cc == 200 and any(a in _acoes_seller(cl or {}) for a in ("return_review_ok", "return_review_fail"))):
+                        resultado = "fechada_ok"
             else:
                 resultado = f"erro_{code}"        # ex.: 403 sem acesso à reclamação; guarda e recheca em 30 min
                 erros.append({"claim_id": cid, "pedido": c.get("resource_id"), "http": code,
