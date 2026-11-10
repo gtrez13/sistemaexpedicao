@@ -470,13 +470,20 @@ def editar(did):
             return jsonify({"error": "Devolução não encontrada."}), 404
         if r["status"] == "finalizada" and not eh_gestor():
             return jsonify({"error": "Devolução finalizada: só supervisor/admin altera."}), 403
-        # alterou depois de enviada ao SAC: volta a "pendente" para reenviar a versão certa
-        if r["sac_status"] == "enviado":
-            sets += ",sac_status='pendente'"
         conn.execute(f"UPDATE devolucoes SET {sets} WHERE id=?", tuple(novos.values()) + (did,))
         _recalcular(conn, did)
-        st = conn.execute("SELECT status FROM devolucoes WHERE id=?", (did,)).fetchone()["status"]
-    return jsonify({"success": True, "status": st})
+        row = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+        st = row["status"]
+    sac = None
+    # chegou fora do esperado (avaria, faltou item, diferente, usado...) e já foi bipado: abre O.S. no SAC sozinho (uma vez)
+    if row["bipado"] and tem_problema(row) and row["chegada"] != CHEGADAS[1] and not row["sac_os_id"]:
+        s_st, s_msg, s_os = enviar_ao_sac(row)
+        with db_session() as conn:
+            conn.execute("UPDATE devolucoes SET sac_status=?, sac_msg=?, sac_os_id=?, sac_enviado_em=? WHERE id=?",
+                         ("enviado" if s_st == "enviado" else ("pendente" if s_st == "simulado" else "erro"),
+                          s_msg, s_os, int(time.time()) if s_st == "enviado" else None, did))
+        sac = {"status": s_st, "msg": s_msg, "os_id": s_os}
+    return jsonify({"success": True, "status": st, "sac": sac})
 
 
 # ───────────────────────────── fotos ─────────────────────────────
@@ -720,7 +727,14 @@ def ml_revisao_enviar(did):
                            json={"reason": motivo, "message": mensagem, "attachments": anexos})
         resultado, msg = "problema", f"{motivo}: {mensagem}" + (f" ({len(anexos)} foto(s))" if anexos else "")
     if st not in (200, 201):
-        return jsonify({"error": f"O ML recusou ({st}): {str(resp)[:500]}"}), 502
+        # 422 (e não 502): a Cloudflare troca qualquer 502 pela página dela e a mensagem do ML se perde
+        det = resp.get("message") or resp.get("error") or resp if isinstance(resp, dict) else resp
+        print(f"[ML-REVISAO] devolucao={did} claim={claim} ok={bool(b.get('ok'))} ML {st}: {str(resp)[:800]}", flush=True)
+        dica = {429: "O ML está limitando as chamadas agora. Espere 1 minuto e tente de novo.",
+                401: "O token do ML venceu e não renovou.",
+                403: "O ML não deixou esta conta fazer esta ação."}.get(st, "")
+        return jsonify({"error": f"O ML recusou ({st}): {str(det)[:400]}" + (f" — {dica}" if dica else ""), "ml_status": st}), 422
+    print(f"[ML-REVISAO] devolucao={did} claim={claim} {resultado} enviado ao ML ({st})", flush=True)
     agora = int(time.time())
     with db_session() as conn:
         conn.execute("UPDATE devolucoes SET ml_review=?, ml_review_em=?, ml_review_por=?, ml_review_msg=?, atualizado_em=? WHERE id=?",
@@ -1015,11 +1029,23 @@ def _payload_sac(r) -> dict:
         f"Avaria: {f['desc_avaria']}" if f.get("avaria") and f.get("desc_avaria") else "",
         f"Faltou: {f['qual_item']}" if f.get("faltou_item") and f.get("qual_item") else "",
         f"Destino: {f['destino']}" if f.get("destino") else ""] if x)
+    canal = str(f.get("canal") or "").upper()
+    channel = "Mercado Livre" if "MERCADO" in canal else "Shopee" if "SHOPEE" in canal else "Comercial" if "COMERCIAL" in canal else "Outros"
+    emp = {"LHVMED": "LHV Med", "LHV MED": "LHV Med", "MEDICAL": "Medical D", "CONTA DA TICI": "Tici", "CONTA DA SIMONE": "Simone"}.get(str(f.get("loja") or "").upper(), f.get("loja"))
+    obs = str(f.get("observacoes") or "")
+    conf = obs.split("Conferência:", 1)[1].strip() if "Conferência:" in obs else ""
+    texto = "; ".join(x for x in [problema, f"Observação da conferência: {conf}" if conf else "",
+                                  f"Serviço: {f.get('servico')}" if f.get("servico") else "",
+                                  f"Venda {f.get('numero_venda')}" if f.get("numero_venda") else "",
+                                  f"Reclamação ML {f.get('ml_claim_id')}" if f.get("ml_claim_id") else "",
+                                  f"Devolução WMS #{f['id']}"] if x)
     return {
         "origem": "wms-lhvmed", "tipo": "devolucao", "wms_id": f["id"],
+        "type": "devolucao", "status": "aberto", "priority": "alta" if f.get("avaria") else "media",
         "name": f.get("cliente"), "numero_nf": f.get("nf_saida"), "invoice_number": f.get("nf_saida"),
+        "purchase_origin": f.get("canal"), "channel": channel,
         "product": f"{f.get('sku')} - {f.get('produto') or ''}".strip(" -"),
-        "problem_type": f.get("motivo"), "problem": problema, "empresa": f.get("loja"),
+        "problem_type": f"Devolução {channel}: {f.get('chegada') or f.get('motivo') or 'chegou com problema'}", "problem": texto, "empresa": emp,
         "criado_por": f.get("responsavel"), "devolucao": f,
     }
 
@@ -1029,7 +1055,7 @@ def enviar_ao_sac(r):
     base = os.environ.get("SAC_API_URL", "").strip().rstrip("/")
     if not base:
         return "simulado", "SAC_API_URL não definido: nada foi enviado (modo simulado).", None
-    path = os.environ.get("SAC_DEVOLUCAO_PATH", "/devolucoes").strip()
+    path = os.environ.get("SAC_DEVOLUCAO_PATH", "/api/service-orders").strip()
     try:
         import requests
         h = {"Content-Type": "application/json"}
@@ -1043,7 +1069,26 @@ def enviar_ao_sac(r):
             j = resp.json()
         except ValueError:
             j = {}
-        return "enviado", "ok", str(j.get("id") or j.get("os_id") or "") or None
+        os_id = str(j.get("id") or j.get("os_id") or (j.get("data") or {}).get("id") or "") or None
+        # fotos da conferência como anexos da O.S.
+        enviadas = 0
+        if os_id:
+            try:
+                with db_session() as conn:
+                    fs = conn.execute("SELECT arquivo FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (r["id"],)).fetchall()
+                files = []
+                for k, fr in enumerate(fs, 1):
+                    cam = os.path.join(_pasta_fotos(), os.path.basename(fr["arquivo"]))
+                    if os.path.exists(cam):
+                        files.append(("files", (f"devolucao_{r['id']}_foto{k}.jpg", open(cam, "rb"), "image/jpeg")))
+                if files:
+                    ra = requests.post(f"{base}{path}/{os_id}/anexos", files=files, headers={k: v for k, v in h.items() if k != "Content-Type"}, timeout=30)
+                    enviadas = len(files) if ra.status_code < 300 else 0
+                    for _, (_, fh, _) in files:
+                        fh.close()
+            except Exception:
+                pass
+        return "enviado", f"O.S. {os_id} criada" + (f" com {enviadas} foto(s)" if enviadas else ""), os_id
     except Exception as e:  # noqa: BLE001
         return "erro", f"falha ao falar com o SAC: {e}"[:300], None
 
@@ -1051,18 +1096,21 @@ def enviar_ao_sac(r):
 @devolucoes_routes.post("/devolucoes/<int:did>/sac")
 @login_required
 def sac(did):
-    if not eh_gestor():
-        return jsonify({"error": "Somente supervisor/admin envia ao SAC."}), 403
+    """Envia (ou reenvia, se deu erro) a devolução ao SAC. Já tem O.S.: não duplica."""
     garantir_tabelas()
     with db_session() as conn:
         r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
         if not r:
             return jsonify({"error": "Devolução não encontrada."}), 404
+        if r["sac_os_id"]:
+            return jsonify({"success": True, "sac_status": "enviado", "msg": f"Já está no SAC: O.S. {r['sac_os_id']}", "os_id": r["sac_os_id"]})
         st, msg, osid = enviar_ao_sac(r)
         conn.execute("UPDATE devolucoes SET sac_status=?, sac_msg=?, sac_os_id=?, sac_enviado_em=? WHERE id=?",
                      ("enviado" if st == "enviado" else ("pendente" if st == "simulado" else "erro"),
                       msg, osid, int(time.time()) if st == "enviado" else None, did))
-    return jsonify({"success": st != "erro", "sac_status": st, "msg": msg, "os_id": osid})
+    if st == "erro":
+        return jsonify({"error": msg, "sac_status": st}), 422
+    return jsonify({"success": True, "sac_status": st, "msg": msg, "os_id": osid})
 
 
 @devolucoes_routes.get("/devolucoes/export.csv")
