@@ -1090,7 +1090,7 @@ def _motivo_texto(ml_get, reason_id):
 
 
 ORCAMENTO_CUSTOS = 15             # devoluções cujo frete de volta é consultado por rodada (2 chamadas cada)
-RECHECAR_CUSTO_S = 2 * 3600       # custo e status do envio de devolução ainda aberta: atualiza a cada 2 h
+RECHECAR_CUSTO_S = 20 * 60         # status do envio de volta de devolução aberta: atualiza a cada 20 min (aviso de "chegou")
 
 
 class _LimiteML(Exception):
