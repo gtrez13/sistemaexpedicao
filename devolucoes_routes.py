@@ -765,10 +765,9 @@ def full_retorno(did):
     if not inv:
         return jsonify({"ok": True, "full": False, "msg": "Este anúncio não tem estoque FULL (inventory_id não encontrado)." , "item_id": item_id})
     from datetime import datetime, timedelta, timezone
-    ini = datetime.fromtimestamp((r["criado_em"] or time.time()) - 86400, tz=timezone.utc)
+    # janela máxima que o ML permite (60 dias). NÃO usar criado_em: é a data em que o WMS importou, não a da devolução
     fim = datetime.now(timezone.utc)
-    if (fim - ini).days > 59:
-        ini = fim - timedelta(days=59)
+    ini = fim - timedelta(days=59)
     seller = str(os.environ.get("ML_SELLER_ID", "")).strip()
     ops, ultimo_erro = [], None
     for base in ("/marketplace/stock/fulfillment/operations/search", "/stock/fulfillment/operations/search"):
