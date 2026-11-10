@@ -12,25 +12,33 @@ try:
     from dotenv import load_dotenv; load_dotenv(".env")
 except Exception:
     pass
+import os, atexit
 import devolucoes_routes as d
 from db import db_session
 
+# trava: enquanto este script roda, o site NÃO consulta o ML (senão os dois disputam o limite e tudo dá 429)
+open(d.SYNC_LOCK, "w").close()
+atexit.register(lambda: os.path.exists(d.SYNC_LOCK) and os.remove(d.SYNC_LOCK))
+
 
 def req(path, **kw):
-    for _ in range(8):
+    for n in range(10):
         st, j = d._ml_req("GET", path, **kw)
         if st != 429:
             return st, j
-        print("   (limite do ML, esperando 60 s…)", flush=True); time.sleep(60)
+        print(f"   (limite do ML: esperando {60 + n * 30} s, tentativa {n + 1}/10)", flush=True); time.sleep(60 + n * 30)
     return st, j
 
 
 print(">> 1) atualizando envio de volta das devoluções abertas…", flush=True)
 with db_session() as c:
     rows = c.execute("SELECT id, ml_claim_id, numero_venda, produto, status, ml_envio, bipado FROM devolucoes "
-                     "WHERE status IN ('esperada','armazem_ml') AND ml_claim_id IS NOT NULL ORDER BY id").fetchall()
+                     "WHERE status IN ('esperada','armazem_ml') AND ml_claim_id IS NOT NULL "
+                     "AND COALESCE(ml_envio,'') NOT IN ('delivered','cancelled') ORDER BY id").fetchall()
+print(f"   {len(rows)} ainda sem entrega confirmada para checar", flush=True)
 mud = 0
-for r in rows:
+for k, r in enumerate(rows, 1):
+    print(f"   [{k}/{len(rows)}] #{r['id']} {str(r['produto'] or '')[:40]}", flush=True)
     st, ret = req(f"/post-purchase/v2/claims/{r['ml_claim_id']}/returns")
     if st != 200 or not isinstance(ret, dict):
         continue

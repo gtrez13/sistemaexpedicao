@@ -1038,6 +1038,7 @@ def exportar():
 
 # ───────────────────────────── importar do Mercado Livre ─────────────────────────────
 _ultima_importacao = 0.0
+SYNC_LOCK = "/tmp/wms_devolucoes_sync.lock"
 ORCAMENTO_POR_RODADA = 25          # reclamações checadas por rodada (o ML limita as consultas: 429)
 RECHECAR_SEM_DEVOLUCAO_S = 1800    # reclamação sem devolução ainda: olha de novo depois de 30 min
 _reasons_cache: dict = {}
@@ -1295,8 +1296,12 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
 def importar_ml():
     global _ultima_importacao
     agora = time.time()
-    if agora - _ultima_importacao < 60:
-        return jsonify({"ok": True, "pulado": True, "motivo": "importado há menos de 1 min"})
+    # o ML limita MUITO as consultas de reclamação (429): no máximo 1 importação a cada 5 min, e nenhuma
+    # enquanto o script devolucoes_sincronizar.py estiver rodando (ele cria SYNC_LOCK)
+    if os.path.exists(SYNC_LOCK) and agora - os.path.getmtime(SYNC_LOCK) < 3600:
+        return jsonify({"ok": True, "pulado": True, "motivo": "sincronização manual em andamento"})
+    if agora - _ultima_importacao < 300:
+        return jsonify({"ok": True, "pulado": True, "motivo": "importado há menos de 5 min"})
     _ultima_importacao = agora
     try:
         return jsonify(importar_do_ml())
