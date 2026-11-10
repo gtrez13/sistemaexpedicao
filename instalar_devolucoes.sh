@@ -276,6 +276,8 @@ def faltando_para_fechar(r, n_fotos) -> list:
                         ("nf_saida", "NF de saída"), ("motivo", "motivo"), ("chegada", "como o produto chegou"),
                         ("destino", "destino")):
         if not (r[campo] or "").strip():
+            if campo == "nf_saida" and r["ml_claim_id"]:
+                continue        # devolução do ML: a NF de saída não é exigida na conferência (prancheta)
             f.append(nome)
     if r["valor"] is None:
         f.append("valor")
