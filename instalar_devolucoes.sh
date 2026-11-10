@@ -880,6 +880,8 @@ def _motivo_de(r) -> str:
 
 
 def _previsao(motivo: str) -> str:
+    if _re.search(r"compr(ou|ei|a) errad|pedi errad", motivo or "", _re.I):
+        return "sem_custo"
     if _COM_CUSTO_RX.search(motivo or ""):
         return "com_custo"
     if _SEM_CUSTO_RX.search(motivo or ""):
