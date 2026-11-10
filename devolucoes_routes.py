@@ -84,7 +84,8 @@ def eh_gestor() -> bool:
 
 
 EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", "BIGINT"), ("finalizada_em", "BIGINT"),
-             ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT")]
+             ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT"),
+             ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status"]
@@ -599,6 +600,128 @@ def finalizar(did):
         conn.execute("UPDATE devolucoes SET status='finalizada', finalizada_em=?, finalizada_por=?, atualizado_em=? WHERE id=?",
                      (agora, _quem(), agora, did))
     return jsonify({"success": True})
+
+
+# ───────────────────────────── REVISÃO DA DEVOLUÇÃO NO MERCADO LIVRE ─────────────────────────────
+# Depois de conferir, o operador avisa o ML: "chegou tudo certo" (return-review-ok) ou "chegou com problema"
+# (return-review-fail, com motivo SRFx, mensagem e fotos). Doc: developers.mercadolibre.com.ar/devsite/manage-returns
+ML_API = "https://api.mercadolibre.com"
+MOTIVOS_FAIL_PADRAO = [("SRF2", "O produto chegou danificado"), ("SRF3", "A devolução está incompleta"),
+                       ("SRF4", "O produto devolvido é diferente do enviado"), ("SRF5", "O produto não está no pacote"),
+                       ("SRF6", "Outro defeito no produto"), ("SRF7", "A devolução ainda não chegou")]
+
+
+def _ml_req(method, path, **kw):
+    """Chamada ao ML com o token do WMS (renova 1x se vier 401). -> (status, json|texto)."""
+    import requests as _rq
+    from services.ml_service import MercadoLivreService
+    ml = MercadoLivreService()
+    for tent in (1, 2):
+        r = _rq.request(method, ML_API + path, headers={"Authorization": f"Bearer {ml.access_token}"}, timeout=30, **kw)
+        if r.status_code == 401 and tent == 1:
+            try:
+                ml.renovar_token()
+            except Exception:
+                pass
+            continue
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, r.text
+    return 401, "token do ML inválido"
+
+
+def _acoes_seller(claim: dict) -> list:
+    for p in (claim or {}).get("players") or []:
+        if p.get("type") == "seller" or p.get("role") == "respondent":
+            return [a.get("action") for a in (p.get("available_actions") or []) if a.get("action")]
+    return []
+
+
+@devolucoes_routes.get("/devolucoes/<int:did>/ml-revisao")
+@login_required
+def ml_revisao_info(did):
+    """Pode revisar no ML agora? + motivos de 'problema'."""
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT ml_claim_id, ml_review, ml_review_em, ml_review_por, ml_review_msg FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r:
+        return jsonify({"error": "Devolução não encontrada."}), 404
+    out = {"claim": r["ml_claim_id"], "feita": r["ml_review"], "feita_em": r["ml_review_em"], "feita_por": r["ml_review_por"],
+           "msg": r["ml_review_msg"], "pode_ok": False, "pode_fail": False, "motivos": [{"id": a, "nome": b} for a, b in MOTIVOS_FAIL_PADRAO]}
+    if not r["ml_claim_id"]:
+        out["aviso"] = "Esta devolução não veio do Mercado Livre."
+        return jsonify(out)
+    st, claim = _ml_req("GET", f"/marketplace/v2/claims/{r['ml_claim_id']}")
+    if st != 200:
+        st, claim = _ml_req("GET", f"/post-purchase/v1/claims/{r['ml_claim_id']}")
+    if st != 200:
+        out["aviso"] = f"ML respondeu {st} ao consultar a reclamação: {str(claim)[:300]}"
+        return jsonify(out)
+    acoes = _acoes_seller(claim)
+    out.update({"pode_ok": "return_review_ok" in acoes, "pode_fail": "return_review_fail" in acoes,
+                "acoes": acoes, "status_claim": claim.get("status"), "stage": claim.get("stage")})
+    st2, mot = _ml_req("GET", "/marketplace/v2/returns/reasons/return-fail")
+    if st2 == 200 and isinstance(mot, list) and mot:
+        out["motivos"] = [{"id": m.get("id"), "nome": m.get("detail") or m.get("name") or m.get("id")} for m in mot if m.get("id")]
+    if not (out["pode_ok"] or out["pode_fail"]) and not out["feita"]:
+        out["aviso"] = ("O ML ainda não liberou a revisão desta devolução (ações disponíveis: "
+                        + (", ".join(acoes) or "nenhuma") + f"; reclamação {claim.get('status')}/{claim.get('stage')}).")
+    return jsonify(out)
+
+
+@devolucoes_routes.post("/devolucoes/<int:did>/ml-revisao")
+@login_required
+def ml_revisao_enviar(did):
+    """body: {"ok": true}  ou  {"ok": false, "motivo": "SRF2", "mensagem": "...", "fotos": [ids]}"""
+    garantir_tabelas()
+    b = request.get_json(silent=True) or {}
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+        if not r:
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        fotos = conn.execute("SELECT id, arquivo FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()
+    claim = r["ml_claim_id"]
+    if not claim:
+        return jsonify({"error": "Esta devolução não veio do Mercado Livre (sem número de reclamação)."}), 400
+    if r["ml_review"]:
+        return jsonify({"error": f"O ML já foi avisado ({r['ml_review']}) por {r['ml_review_por']}."}), 409
+    if b.get("ok"):
+        st, resp = _ml_req("POST", f"/marketplace/v2/claims/{claim}/actions/return-review-ok")
+        resultado, msg = "ok", "Chegou tudo certo"
+    else:
+        motivo = (b.get("motivo") or "").strip()
+        mensagem = (b.get("mensagem") or "").strip()
+        if not motivo or not mensagem:
+            return jsonify({"error": "Escolha o motivo e escreva a mensagem para o ML."}), 400
+        quer = {int(x) for x in (b.get("fotos") or []) if str(x).isdigit()} or {f["id"] for f in fotos}
+        anexos, erros = [], []
+        for f in fotos:
+            if f["id"] not in quer:
+                continue
+            caminho = os.path.join(_pasta_fotos(), os.path.basename(f["arquivo"]))
+            if not os.path.exists(caminho):
+                continue
+            ext, mime = _tipo_imagem(open(caminho, "rb").read(16))
+            with open(caminho, "rb") as fh:
+                sa, ra = _ml_req("POST", f"/post-purchase/v1/claims/{claim}/returns/attachments",
+                                 files={"file": (f"foto_{f['id']}.{ext or 'jpg'}", fh, mime or "image/jpeg")})
+            if sa in (200, 201) and isinstance(ra, dict) and ra.get("file_name"):
+                anexos.append(ra["file_name"])
+            else:
+                erros.append(f"foto {f['id']}: ML {sa} {str(ra)[:200]}")
+        if motivo in ("SRF2", "SRF4") and not anexos:
+            return jsonify({"error": "O ML exige foto para este motivo e nenhuma foto subiu. " + " | ".join(erros)}), 400
+        st, resp = _ml_req("POST", f"/marketplace/v2/claims/{claim}/actions/return-review-fail",
+                           json={"reason": motivo, "message": mensagem, "attachments": anexos})
+        resultado, msg = "problema", f"{motivo}: {mensagem}" + (f" ({len(anexos)} foto(s))" if anexos else "")
+    if st not in (200, 201):
+        return jsonify({"error": f"O ML recusou ({st}): {str(resp)[:500]}"}), 502
+    agora = int(time.time())
+    with db_session() as conn:
+        conn.execute("UPDATE devolucoes SET ml_review=?, ml_review_em=?, ml_review_por=?, ml_review_msg=?, atualizado_em=? WHERE id=?",
+                     (resultado, agora, _quem(), msg, agora, did))
+    return jsonify({"success": True, "resultado": resultado, "msg": msg})
 
 
 # ───────────────────────────── SAC ─────────────────────────────
