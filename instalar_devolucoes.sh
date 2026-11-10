@@ -649,6 +649,19 @@ def _ml_req(method, path, **kw):
     return 401, "token do ML inválido"
 
 
+def _ml_review_post(claim, tipo, **kw):
+    """Revisão da devolução. Conta local (MLB) usa /post-purchase/v1; /marketplace/v2 é do Global Selling e dá 403 aqui.
+    Só tenta o 2º caminho se o 1º nem existir para a conta (403/404/405) — nesses casos o ML não fez nada."""
+    primeiro = None
+    for base in ("/post-purchase/v1", "/marketplace/v2"):
+        st, resp = _ml_req("POST", f"{base}/claims/{claim}/actions/return-review-{tipo}", **kw)
+        print(f"[ML-REVISAO] POST {base}/claims/{claim}/actions/return-review-{tipo} -> {st} {str(resp)[:300]}", flush=True)
+        if st not in (403, 404, 405):
+            return st, resp
+        primeiro = primeiro or (st, resp)
+    return primeiro
+
+
 def _acoes_seller(claim: dict) -> list:
     for p in (claim or {}).get("players") or []:
         if p.get("type") == "seller" or p.get("role") == "respondent":
@@ -670,16 +683,20 @@ def ml_revisao_info(did):
     if not r["ml_claim_id"]:
         out["aviso"] = "Esta devolução não veio do Mercado Livre."
         return jsonify(out)
-    st, claim = _ml_req("GET", f"/marketplace/v2/claims/{r['ml_claim_id']}")
+    st, claim = _ml_req("GET", f"/post-purchase/v1/claims/{r['ml_claim_id']}")
     if st != 200:
-        st, claim = _ml_req("GET", f"/post-purchase/v1/claims/{r['ml_claim_id']}")
+        st, claim = _ml_req("GET", f"/marketplace/v2/claims/{r['ml_claim_id']}")
     if st != 200:
         out["aviso"] = f"ML respondeu {st} ao consultar a reclamação: {str(claim)[:300]}"
         return jsonify(out)
     acoes = _acoes_seller(claim)
     out.update({"pode_ok": "return_review_ok" in acoes, "pode_fail": "return_review_fail" in acoes,
                 "acoes": acoes, "status_claim": claim.get("status"), "stage": claim.get("stage")})
-    st2, mot = _ml_req("GET", "/marketplace/v2/returns/reasons/return-fail")
+    st2, mot = _ml_req("GET", "/post-purchase/v1/returns/reasons", params={"flow": "seller_return_failed", "claim_id": r["ml_claim_id"]})
+    if st2 != 200:
+        st2, mot = _ml_req("GET", "/marketplace/v2/returns/reasons/return-fail")
+    if isinstance(mot, dict):
+        mot = mot.get("reasons") or mot.get("results") or mot.get("data") or []
     if st2 == 200 and isinstance(mot, list) and mot:
         out["motivos"] = [{"id": m.get("id"), "nome": m.get("detail") or m.get("name") or m.get("id")} for m in mot if m.get("id")]
     if not (out["pode_ok"] or out["pode_fail"]) and not out["feita"]:
@@ -705,7 +722,7 @@ def ml_revisao_enviar(did):
     if r["ml_review"]:
         return jsonify({"error": f"O ML já foi avisado ({r['ml_review']}) por {r['ml_review_por']}."}), 409
     if b.get("ok"):
-        st, resp = _ml_req("POST", f"/marketplace/v2/claims/{claim}/actions/return-review-ok")
+        st, resp = _ml_review_post(claim, "ok")
         resultado, msg = "ok", "Chegou tudo certo"
     else:
         motivo = (b.get("motivo") or "").strip()
@@ -730,8 +747,7 @@ def ml_revisao_enviar(did):
                 erros.append(f"foto {f['id']}: ML {sa} {str(ra)[:200]}")
         if motivo in ("SRF2", "SRF4") and not anexos:
             return jsonify({"error": "O ML exige foto para este motivo e nenhuma foto subiu. " + " | ".join(erros)}), 400
-        st, resp = _ml_req("POST", f"/marketplace/v2/claims/{claim}/actions/return-review-fail",
-                           json={"reason": motivo, "message": mensagem, "attachments": anexos})
+        st, resp = _ml_review_post(claim, "fail", json={"reason": motivo, "message": mensagem, "attachments": anexos})
         resultado, msg = "problema", f"{motivo}: {mensagem}" + (f" ({len(anexos)} foto(s))" if anexos else "")
     if st not in (200, 201):
         # 422 (e não 502): a Cloudflare troca qualquer 502 pela página dela e a mensagem do ML se perde
@@ -739,7 +755,7 @@ def ml_revisao_enviar(did):
         print(f"[ML-REVISAO] devolucao={did} claim={claim} ok={bool(b.get('ok'))} ML {st}: {str(resp)[:800]}", flush=True)
         dica = {429: "O ML está limitando as chamadas agora. Espere 1 minuto e tente de novo.",
                 401: "O token do ML venceu e não renovou.",
-                403: "O ML não deixou esta conta fazer esta ação."}.get(st, "")
+                403: "O ML não deixou a aplicação do WMS fazer esta ação (permissão da aplicação no ML)."}.get(st, "")
         return jsonify({"error": f"O ML recusou ({st}): {str(det)[:400]}" + (f" — {dica}" if dica else ""), "ml_status": st}), 422
     print(f"[ML-REVISAO] devolucao={did} claim={claim} {resultado} enviado ao ML ({st})", flush=True)
     agora = int(time.time())
