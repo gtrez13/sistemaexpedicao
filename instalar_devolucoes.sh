@@ -777,15 +777,27 @@ def full_retorno(did):
     ini = fim - timedelta(days=59)
     seller = str(os.environ.get("ML_SELLER_ID", "")).strip()
     ops, ultimo_erro = [], None
-    for base in ("/marketplace/stock/fulfillment/operations/search", "/stock/fulfillment/operations/search"):
-        for tipo in ("sale_return", "sale_delivery_cancelation"):
-            st, j = _ml_req("GET", base, params={"seller_id": seller, "inventory_id": inv, "type": tipo, "limit": 100,
-                                                 "date_from": ini.strftime("%Y-%m-%d"), "date_to": fim.strftime("%Y-%m-%d")})
-            if st == 200 and isinstance(j, dict):
-                ops += j.get("results") or []
-            else:
+    # Sem filtro de tipo na chamada (o ML usa MAIÚSCULAS e ignora/recusa variações): pega tudo da janela,
+    # pagina pelo 'scroll' e filtra aqui. Caminho sem /marketplace (o com /marketplace dá 403 'Invalid caller.id').
+    for base in ("/stock/fulfillment/operations/search", "/marketplace/stock/fulfillment/operations/search"):
+        params = {"seller_id": seller, "inventory_id": inv, "limit": 1000,
+                  "date_from": ini.strftime("%Y-%m-%d"), "date_to": fim.strftime("%Y-%m-%d")}
+        todas, ok = [], False
+        for _ in range(10):
+            st, j = _ml_req("GET", base, params=params)
+            if st != 200 or not isinstance(j, dict):
                 ultimo_erro = f"ML {st}: {str(j)[:200]}"
-        if ops:
+                break
+            ok = True
+            todas += j.get("results") or []
+            sc = (j.get("paging") or {}).get("scroll") or j.get("scroll")
+            if not sc or not j.get("results"):
+                break
+            params = {"seller_id": seller, "inventory_id": inv, "scroll": sc}
+        if ok:
+            ultimo_erro = None
+            ops = [op for op in todas if "RETURN" in str(op.get("type") or "").upper()
+                   or str(op.get("type") or "").upper() == "SALE_DELIVERY_CANCELATION"]
             break
     saida = []
     for op in sorted(ops, key=lambda x: x.get("date_created") or ""):
