@@ -724,6 +724,82 @@ def ml_revisao_enviar(did):
     return jsonify({"success": True, "resultado": resultado, "msg": msg})
 
 
+# ───────────────────────────── DEVOLUÇÃO FULL: voltou mesmo pro estoque do ML? ─────────────────────────────
+# Histórico do estoque FULL (operações 'sale_return' = devolução do comprador). Doc: devsite/fulfillment-stock
+STATUS_FULL = {"damaged": "chegou danificado", "damaged_in_full": "danificado no armazém", "return_problem": "devolvido com problema",
+               "lost": "perdido", "not_supported": "não aceito pelo FULL", "not supportted": "não aceito pelo FULL",
+               "transfer": "em transferência", "withdrawal": "em retirada", "internal_process": "processo interno do ML"}
+
+
+def _inventory_id(numero_venda, sku):
+    st, o = _ml_req("GET", f"/orders/{numero_venda}")
+    if st != 200 or not isinstance(o, dict):
+        return None, None
+    alvo = None
+    for oi in o.get("order_items") or []:
+        it = oi.get("item") or {}
+        if not alvo or (sku and str(it.get("seller_sku") or "").upper() == str(sku).upper()):
+            alvo = it
+    if not alvo:
+        return None, None
+    st, item = _ml_req("GET", f"/items/{alvo.get('id')}")
+    if st != 200 or not isinstance(item, dict):
+        return None, alvo.get("id")
+    var = alvo.get("variation_id")
+    for v in item.get("variations") or []:
+        if var and str(v.get("id")) == str(var) and v.get("inventory_id"):
+            return v["inventory_id"], alvo.get("id")
+    return item.get("inventory_id"), alvo.get("id")
+
+
+@devolucoes_routes.get("/devolucoes/<int:did>/full")
+@login_required
+def full_retorno(did):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT numero_venda, sku, criado_em, qtd FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r or not r["numero_venda"]:
+        return jsonify({"error": "Devolução sem número de venda."}), 404
+    inv, item_id = _inventory_id(r["numero_venda"], r["sku"])
+    if not inv:
+        return jsonify({"ok": True, "full": False, "msg": "Este anúncio não tem estoque FULL (inventory_id não encontrado)." , "item_id": item_id})
+    from datetime import datetime, timedelta, timezone
+    ini = datetime.fromtimestamp((r["criado_em"] or time.time()) - 86400, tz=timezone.utc)
+    fim = datetime.now(timezone.utc)
+    if (fim - ini).days > 59:
+        ini = fim - timedelta(days=59)
+    seller = str(os.environ.get("ML_SELLER_ID", "")).strip()
+    ops, ultimo_erro = [], None
+    for base in ("/marketplace/stock/fulfillment/operations/search", "/stock/fulfillment/operations/search"):
+        for tipo in ("sale_return", "sale_delivery_cancelation"):
+            st, j = _ml_req("GET", base, params={"seller_id": seller, "inventory_id": inv, "type": tipo, "limit": 100,
+                                                 "date_from": ini.strftime("%Y-%m-%d"), "date_to": fim.strftime("%Y-%m-%d")})
+            if st == 200 and isinstance(j, dict):
+                ops += j.get("results") or []
+            else:
+                ultimo_erro = f"ML {st}: {str(j)[:200]}"
+        if ops:
+            break
+    saida = []
+    for op in sorted(ops, key=lambda x: x.get("date_created") or ""):
+        det = op.get("detail") or {}
+        res = op.get("result") or {}
+        bloq = [{"status": d.get("status"), "nome": STATUS_FULL.get(d.get("status"), d.get("status")), "qtd": d.get("quantity")}
+                for d in (det.get("not_available_detail") or []) if d.get("quantity")]
+        saida.append({"data": op.get("date_created"), "tipo": op.get("type"),
+                      "voltou_disponivel": det.get("available_quantity") or 0, "voltou_bloqueado": bloq,
+                      "estoque_full_depois": res.get("available_quantity"), "bloqueado_full_depois": res.get("not_available_quantity")})
+    out = {"ok": True, "full": True, "inventory_id": inv, "item_id": item_id, "operacoes": saida}
+    if saida:
+        u = saida[-1]
+        out["situacao"] = "disponivel" if u["voltou_disponivel"] and not u["voltou_bloqueado"] else ("bloqueado" if u["voltou_bloqueado"] else "registrado")
+    else:
+        out["situacao"] = "nao_chegou"
+        if ultimo_erro:
+            out["aviso"] = ultimo_erro
+    return jsonify(out)
+
+
 # ───────────────────────────── SAC ─────────────────────────────
 def _payload_sac(r) -> dict:
     """Mapeia a devolução para os campos-ponte da O.S. do SAC (+ o detalhe completo em 'devolucao')."""
