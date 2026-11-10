@@ -24,8 +24,9 @@ em_transito = "--reabrir-em-transito" in sys.argv
 with db_session() as c:
     if desfazer or em_transito:
         n = 0
-        filtro = " AND COALESCE(ml_envio,'') NOT IN ('delivered','cancelled','')" if em_transito else ""
-        for r in c.execute("SELECT id, observacoes FROM devolucoes WHERE observacoes LIKE '%[encerrada no ML antes do WMS%'" + filtro).fetchall():
+        filtro = " AND COALESCE(ml_envio,'') NOT IN (?,?,?)" if em_transito else ""
+        for r in c.execute("SELECT id, observacoes FROM devolucoes WHERE observacoes LIKE ?" + filtro,
+                           ("%[encerrada no ML antes do WMS%",) + (("delivered", "cancelled", "") if em_transito else ())).fetchall():
             m = re.search(r"status anterior: (\w+)\]", r["observacoes"] or "")
             obs = re.sub(r"\s*\[encerrada no ML antes do WMS; status anterior: \w+\]", "", r["observacoes"] or "")
             c.execute("UPDATE devolucoes SET status=?, observacoes=?, finalizada_em=NULL, finalizada_por=NULL WHERE id=?",
