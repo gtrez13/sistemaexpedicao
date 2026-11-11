@@ -23,9 +23,15 @@ for n in (b._get_json("/naturezas-operacoes", params={"limite": 100}).get("data"
 
 if num:
     achou = None
-    for tipo in (0, 1):
-        params = {"numero": num, "tipo": tipo, "limite": 20}
-        for nf in (b._get_json("/nfe", params=params).get("data") or []):
+    if not num.isdigit():
+        sys.exit("Passe o NÚMERO da NF de devolução (só dígitos), ex.: 120772")
+    for params in ({"numero": num, "tipo": 0}, {"numero": num, "tipo": 1}, {"numero": num}):
+        try:
+            lst = b._get_json("/nfe", params={**params, "limite": 20}).get("data") or []
+        except Exception as e:
+            print(f"   (busca {params} recusada: {str(e)[:120]})")
+            continue
+        for nf in lst:
             if str(nf.get("numero")).lstrip("0") == str(num).lstrip("0") and (not serie or str(nf.get("serie")) == str(serie)):
                 achou = nf
                 break
