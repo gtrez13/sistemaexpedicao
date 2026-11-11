@@ -1270,7 +1270,7 @@ def _motivo_texto(ml_get, reason_id):
 
 
 ORCAMENTO_CUSTOS = 15             # devoluções cujo frete de volta é consultado por rodada (2 chamadas cada)
-RECHECAR_CUSTO_S = 20 * 60         # status do envio de volta de devolução aberta: atualiza a cada 20 min (aviso de "chegou")
+RECHECAR_CUSTO_S = 10 * 60         # status do envio de volta de devolução aberta: atualiza a cada 20 min (aviso de "chegou")
 
 
 class _LimiteML(Exception):
@@ -1312,7 +1312,9 @@ def atualizar_custos(conn, ml_get, agora, orcamento=ORCAMENTO_CUSTOS):
     rows = conn.execute(
         "SELECT id, ml_claim_id FROM devolucoes WHERE ml_claim_id IS NOT NULL AND "
         "(custo_ml_em IS NULL OR (ml_envio IS NULL AND custo_ml_em < ?) "
-        "OR (status IN ('esperada','armazem_ml') AND custo_ml_em < ?)) ORDER BY custo_ml_em, id LIMIT ?",
+        "OR (status IN ('esperada','armazem_ml') AND custo_ml_em < ?)) "
+        # prioridade: a caminho do NOSSO galpão sem revisão no ML (tem prazo) > resto; dentro disso, quem está há mais tempo sem checar
+        "ORDER BY CASE WHEN status='esperada' AND ml_review IS NULL THEN 0 ELSE 1 END, COALESCE(custo_ml_em, 0), id LIMIT ?",
         (agora - 600, agora - RECHECAR_CUSTO_S, orcamento)).fetchall()
     feitos, limite = 0, False
     for r in rows:
