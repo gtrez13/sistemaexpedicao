@@ -540,6 +540,73 @@ def trocar():
     return jsonify({"success": True})
 
 
+# ───────────────────────── etiqueta direto do Mercado Livre (reimprimir) ─────────────────────────
+@mapa_routes.get("/etiqueta-ml/<ml_id>")
+@login_required
+def etiqueta_ml(ml_id):
+    """Etiqueta de envio FRESCA do ML (/shipment_labels, ZPL) para o pedido/pacote. -> {success, zpl, shipment_id, status}
+    Só funciona enquanto o envio está 'ready_to_ship' (pronto para imprimir ou já impresso); depois que sai, o ML não dá mais."""
+    import io, zipfile
+    try:
+        from services.ml_service import MercadoLivreService
+        ml = MercadoLivreService()
+    except Exception as e:
+        return jsonify({"success": False, "error": f"ML indisponível: {e}"}), 500
+    ml_id = str(ml_id).strip()
+    ship = None
+    try:
+        with db_session() as conn:
+            r = conn.execute("SELECT * FROM pedidos WHERE ml_id=?", (ml_id,)).fetchone()
+            if r:
+                r = dict(r)
+                ship = r.get("ml_shipping_id") or None
+    except Exception:
+        pass
+    if not ship:
+        ro = ml._request("GET", f"/orders/{ml_id}")
+        if ro is not None and ro.status_code == 200:
+            ship = (ro.json().get("shipping") or {}).get("id")
+        else:
+            rp = ml._request("GET", f"/packs/{ml_id}")
+            if rp is not None and rp.status_code == 200:
+                ship = (rp.json().get("shipment") or {}).get("id")
+                if not ship and rp.json().get("orders"):
+                    ro = ml._request("GET", f"/orders/{rp.json()['orders'][0].get('id')}")
+                    if ro is not None and ro.status_code == 200:
+                        ship = (ro.json().get("shipping") or {}).get("id")
+    if not ship:
+        return jsonify({"success": False, "error": "não achei o envio desse pedido no ML"}), 404
+    st, sub = None, None
+    rs = ml._request("GET", f"/shipments/{ship}")
+    if rs is not None and rs.status_code == 200:
+        st, sub = rs.json().get("status"), rs.json().get("substatus")
+    rl = ml._request("GET", "/shipment_labels", params={"shipment_ids": ship, "response_type": "zpl2"})
+    if rl is None or rl.status_code != 200:
+        det = ""
+        try:
+            det = (rl.json().get("message") or rl.json().get("error") or "") if rl is not None else "sem resposta"
+        except Exception:
+            det = (rl.text[:200] if rl is not None else "sem resposta")
+        dica = " — o envio já saiu ou foi cancelado; o ML só dá etiqueta enquanto está pronto para envio" if st and st != "ready_to_ship" else ""
+        return jsonify({"success": False, "error": f"ML não deu a etiqueta (HTTP {getattr(rl, 'status_code', '-')}, envio {st}/{sub}): {det}{dica}",
+                        "shipment_id": ship, "status": st, "substatus": sub}), 422
+    zpl = None
+    conteudo = rl.content or b""
+    if conteudo[:2] == b"PK":
+        z = zipfile.ZipFile(io.BytesIO(conteudo))
+        for n in z.namelist():
+            t = z.read(n).decode("utf-8", errors="ignore")
+            if "^XA" in t:
+                zpl = t
+                break
+    elif b"^XA" in conteudo:
+        zpl = conteudo.decode("utf-8", errors="ignore")
+    if not zpl:
+        return jsonify({"success": False, "error": "o ML respondeu, mas sem ZPL dentro", "shipment_id": ship}), 502
+    _slowlog.info("etiqueta ML %s envio %s (%s/%s) %d bytes", ml_id, ship, st, sub, len(zpl))
+    return jsonify({"success": True, "zpl": zpl, "shipment_id": ship, "status": st, "substatus": sub, "via": "ml"})
+
+
 @mapa_routes.get("/mapa/status")
 @login_required
 def status():
