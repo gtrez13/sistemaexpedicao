@@ -658,6 +658,33 @@ def comercial_info():
     return jsonify({"pedidos": out})
 
 
+@mapa_routes.get("/pedido-resumo/<path:ml_id>")
+@login_required
+def pedido_resumo(ml_id):
+    """Resumo de UM pedido (o QR da etiqueta abre isto): cliente, status, origem, itens com bipados, PV/transportadora do Comercial."""
+    with db_session() as conn:
+        p = conn.execute("SELECT * FROM pedidos WHERE ml_id=?", (str(ml_id),)).fetchone()
+        if not p:
+            return jsonify({"error": "pedido não encontrado no WMS"}), 404
+        p = dict(p)
+        its = [dict(r) for r in conn.execute(
+            "SELECT pr.sku, pr.nome, pp.quantidade, pp.quantidade_bipada FROM pedido_produtos pp "
+            "JOIN produtos pr ON pr.id=pp.produto_id WHERE pp.pedido_id=? ORDER BY pr.nome", (p["id"],)).fetchall()]
+        info = {}
+        try:
+            r = conn.execute("SELECT * FROM comercial_info WHERE ml_id=?", (str(ml_id),)).fetchone()
+            info = dict(r) if r else {}
+        except Exception:
+            pass
+    return jsonify({
+        "ml_id": p["ml_id"], "cliente_nome": p.get("cliente_nome"), "status": p.get("status"),
+        "origem": p.get("origem") or "ML", "criado_em": str(p.get("criado_em") or ""),
+        "atualizado_em": str(p.get("atualizado_em") or ""),
+        "bling_numero": info.get("pv_numero") or p.get("bling_numero"), "transportadora": info.get("transportadora"),
+        "itens": [{"sku": i["sku"], "nome": i["nome"], "quantidade": i["quantidade"], "quantidade_bipada": i["quantidade_bipada"]} for i in its],
+    })
+
+
 @mapa_routes.get("/comercial/pv/<ml_id>")
 @login_required
 def comercial_pv(ml_id):
