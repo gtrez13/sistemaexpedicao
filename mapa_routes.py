@@ -602,7 +602,7 @@ def etiqueta_ml(ml_id):
     elif b"^XA" in conteudo:
         zpl = conteudo.decode("utf-8", errors="ignore")
     if not zpl:
-        return jsonify({"success": False, "error": "o ML respondeu, mas sem ZPL dentro", "shipment_id": ship}), 502
+        return jsonify({"success": False, "error": "o ML respondeu, mas sem ZPL dentro", "shipment_id": ship}), 422
     _slowlog.info("etiqueta ML %s envio %s (%s/%s) %d bytes", ml_id, ship, st, sub, len(zpl))
     return jsonify({"success": True, "zpl": zpl, "shipment_id": ship, "status": st, "substatus": sub, "via": "ml"})
 
