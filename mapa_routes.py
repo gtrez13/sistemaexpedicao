@@ -607,6 +607,16 @@ def etiqueta_ml(ml_id):
     return jsonify({"success": True, "zpl": zpl, "shipment_id": ship, "status": st, "substatus": sub, "via": "ml"})
 
 
+@mapa_routes.get("/comercial/pv/<ml_id>")
+@login_required
+def comercial_pv(ml_id):
+    """Nº do pedido de venda do Bling (o que aparece na tela do Bling, não o id interno) de um pedido do Comercial."""
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM pedidos WHERE ml_id=?", (str(ml_id),)).fetchone()
+    r = dict(r) if r else {}
+    return jsonify({"numero": r.get("bling_numero"), "cliente": r.get("cliente_nome"), "id_bling": r.get("bling_pedido_venda_id")})
+
+
 @mapa_routes.get("/mapa/status")
 @login_required
 def status():
