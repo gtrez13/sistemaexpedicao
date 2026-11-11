@@ -38,6 +38,7 @@ import csv
 import io
 import json
 import os
+import re
 import time
 import uuid
 
@@ -94,7 +95,9 @@ EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", 
              ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT"),
              ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT"),
              ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT"),
-             ("canal", "TEXT"), ("servico", "TEXT"), ("embalagem", "TEXT"), ("estado_produto", "TEXT")]
+             ("canal", "TEXT"), ("servico", "TEXT"), ("embalagem", "TEXT"), ("estado_produto", "TEXT"),
+             ("nf_dev_id", "TEXT"), ("nf_dev_numero", "TEXT"), ("nf_dev_deposito", "TEXT"), ("nf_dev_por", "TEXT"),
+             ("nf_dev_em", "BIGINT"), ("nf_dev_msg", "TEXT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status", "canal", "servico", "embalagem", "estado_produto"]
@@ -470,6 +473,9 @@ def detalhe(did):
         d["fotos"] = [x["id"] for x in conn.execute("SELECT id FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
         d["videos"] = [{"id": x["id"], "duracao": x["duracao"], "por": x["criado_por"], "em": x["criado_em"]}
                        for x in conn.execute("SELECT id, duracao, criado_por, criado_em FROM devolucao_videos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
+    d["nf_dev_sugerido"] = _deposito_sugerido(r)
+    for k in ("nf_dev_id", "nf_dev_numero", "nf_dev_deposito", "nf_dev_por", "nf_dev_em", "nf_dev_msg"):
+        d[k] = r[k] if k in r.keys() else None
     return jsonify(d)
 
 
@@ -864,6 +870,12 @@ SERVICOS = ["Devolução", "Troca", "Conserto", "Retorno (exposição / emprést
 def _nf_saida_bling(numero_venda):
     """NF de saída pelo Bling (a LHVMED emite lá; o ML só conhece a nota se ela foi enviada para ele).
     Pedido de venda do Bling com numeroLoja = venda (ou pacote) do ML -> nota fiscal ligada. -> (nf|None, fonte/aviso)"""
+    nf, info, _ = _venda_bling(numero_venda)
+    return nf, info
+
+
+def _venda_bling(numero_venda):
+    """-> (nº 'NUM/SERIE' | None, fonte/aviso, {"pv": detalhe do pedido, "nf": detalhe da NF de venda} | None)"""
     from datetime import datetime, timedelta
     from services.bling_service import BlingService
     venda = str(numero_venda or "").strip()
@@ -904,18 +916,214 @@ def _nf_saida_bling(numero_venda):
             print(f"[NF-SAIDA] bling por data {data_venda}: {e}", flush=True)
     print(f"[NF-SAIDA] venda {venda} alvos={alvos} data={data_venda} -> pedido Bling {pv_id}", flush=True)
     if not pv_id:
-        return None, f"NF de saída: não achei a venda {venda} no Bling (preencha à mão)"
+        return None, f"NF de saída: não achei a venda {venda} no Bling (preencha à mão)", None
     det = b.get_pedido_venda_detalhe(int(pv_id))
     det = det.get("data") or det
     nf_id = (det.get("notaFiscal") or {}).get("id")
     if not nf_id:
-        return None, f"NF de saída: o pedido {det.get('numero')} do Bling ainda não tem nota fiscal (preencha à mão)"
-    nf = b.obter_nfe_detalhe(int(nf_id))
+        return None, f"NF de saída: o pedido {det.get('numero')} do Bling ainda não tem nota fiscal (preencha à mão)", {"pv": det, "nf": None}
+    nf = b._get_json(f"/nfe/{int(nf_id)}").get("data") or {}
     num = str(nf.get("numero") or "").strip().lstrip("0")
     if not num:
-        return None, "NF de saída: o Bling não devolveu o número da nota (preencha à mão)"
+        return None, "NF de saída: o Bling não devolveu o número da nota (preencha à mão)", {"pv": det, "nf": nf}
     serie = str(nf.get("serie") or "").strip()
-    return num + (f"/{serie}" if serie else ""), f"nota fiscal do pedido {det.get('numero')} no Bling"
+    return num + (f"/{serie}" if serie else ""), f"nota fiscal do pedido {det.get('numero')} no Bling", {"pv": det, "nf": nf}
+
+
+# ───────────────────────── NOTA DE DEVOLUÇÃO NO BLING (fica PENDENTE, não vai à SEFAZ) ─────────────────────────
+DEPOSITO_LOCAL = os.environ.get("BLING_DEPOSITO_LOCAL", "Local")
+DEPOSITO_DEFEITOS = os.environ.get("BLING_DEPOSITO_DEFEITOS", "Defeitos / Garantia")
+NATUREZA_DEVOLUCAO = os.environ.get("BLING_NATUREZA_DEVOLUCAO", "Devolução de mercadorias")
+
+
+def _norm_txt(t):
+    import unicodedata
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()).strip()
+
+
+def _id_por_nome(b, caminho, nome):
+    if str(nome).isdigit():
+        return int(nome)
+    for x in (b._get_json(caminho, params={"limite": 100}).get("data") or []):
+        if _norm_txt(x.get("descricao")) == _norm_txt(nome):
+            return int(x["id"])
+    return None
+
+
+def _deposito_sugerido(r):
+    """LOCAL | DEFEITOS | None (= o operador escolhe). Regras do Biel."""
+    ch = str(r["chegada"] or "")
+    emb = _norm_txt(r["embalagem"])
+    if r["avaria"] or r["faltou_item"] or ch in ("Produto danificado", "Produto diferente do enviado"):
+        return "DEFEITOS"
+    if ch == "Produto usado ou com sinais de uso" or "danific" in emb or "violad" in emb or ch == "Embalagem danificada, produto intacto":
+        return None
+    if ch == "Correto e sem danos aparentes":
+        return "LOCAL"
+    return None
+
+
+def _bling_uma_vez(b, metodo, caminho, payload=None):
+    """POST no Bling SEM retry (o _request do serviço repete em 5xx e poderia criar 2 notas). -> (status, texto, json|None)"""
+    import requests
+    try:
+        rr = requests.request(metodo, f"{b.base_url}{caminho}", headers=b._headers(), json=payload, timeout=(10, 60))
+    except Exception as e:
+        return 0, f"sem resposta do Bling: {e}", None
+    try:
+        js = rr.json()
+    except Exception:
+        js = None
+    return rr.status_code, (rr.text or "")[:800], js
+
+
+def _msg_bling(txt):
+    """Tira a mensagem legível do erro do Bling (inclui os campos com problema)."""
+    try:
+        e = json.loads(txt).get("error") or {}
+        partes = [e.get("description") or e.get("message") or ""]
+        for f in e.get("fields") or []:
+            partes.append(f"{f.get('element') or ''}: {f.get('msg') or ''}".strip(": "))
+        return " | ".join(p for p in partes if p)[:400]
+    except Exception:
+        return str(txt or "")[:400]
+
+
+def _cfop_devolucao(cfop_venda):
+    c = re.sub(r"\D", "", str(cfop_venda or ""))
+    if len(c) != 4:
+        return None
+    pref = {"5": "1", "6": "2", "7": "3"}.get(c[0])
+    if not pref:
+        return None
+    return pref + ("411" if c[1:] in ("405", "403", "401") else "202")
+
+
+@devolucoes_routes.get("/devolucoes/<int:did>/nf-devolucao")
+@login_required
+def nf_dev_info(did):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r:
+        return jsonify({"error": "Devolução não encontrada."}), 404
+    return jsonify({"sugerido": _deposito_sugerido(r), "nf_dev_numero": r["nf_dev_numero"], "nf_dev_id": r["nf_dev_id"],
+                    "nf_dev_deposito": r["nf_dev_deposito"], "nf_dev_por": r["nf_dev_por"], "nf_dev_em": r["nf_dev_em"],
+                    "nf_dev_msg": r["nf_dev_msg"], "full": r["status"] == "armazem_ml"})
+
+
+@devolucoes_routes.post("/devolucoes/<int:did>/nf-devolucao")
+@login_required
+def nf_dev_gerar(did):
+    """Cria no Bling a NF de ENTRADA de devolução (pendente, sem enviar à SEFAZ) e lança o estoque no depósito."""
+    from services.bling_service import BlingService
+    garantir_tabelas()
+    body = request.get_json(silent=True) or {}
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r:
+        return jsonify({"error": "Devolução não encontrada."}), 404
+    if r["nf_dev_numero"] or r["nf_dev_id"]:
+        return jsonify({"error": f"Essa devolução já tem nota de devolução no Bling (NF {r['nf_dev_numero'] or r['nf_dev_id']}).", "ja": True}), 409
+    if r["status"] == "armazem_ml":
+        return jsonify({"error": "Devolução FULL: o WMS não gera nota (volta para o armazém do ML)."}), 409
+    if not r["bipado"] or not r["chegada"]:
+        return jsonify({"error": "Conclua a conferência na prancheta antes (bipar, como chegou, como está)."}), 409
+    dep = str(body.get("deposito") or "").upper() or _deposito_sugerido(r)
+    if dep not in ("LOCAL", "DEFEITOS"):
+        return jsonify({"error": "Escolha o depósito: Local (volta para venda) ou Defeitos / Garantia.", "escolher": True}), 400
+
+    nfv, info, ctx = _venda_bling(r["numero_venda"])
+    venda = (ctx or {}).get("nf")
+    if not venda:
+        return jsonify({"error": f"Não achei a NF de venda no Bling: {info}"}), 422
+    sku = str(r["sku"] or "").strip().upper()
+    item = next((it for it in venda.get("itens") or []
+                 if sku and sku in (str(it.get("codigo") or "").strip().upper(), str(it.get("gtin") or "").strip().upper())), None)
+    if not item:
+        cods = ", ".join(str(it.get("codigo")) for it in venda.get("itens") or [])
+        return jsonify({"error": f"O SKU bipado ({r['sku']}) NÃO está na NF de venda {nfv} (itens: {cods}). Confira o produto."}), 422
+    qtd = float(r["qtd"] or 1)
+    if qtd > float(item.get("quantidade") or 0) + 1e-6:
+        return jsonify({"error": f"Quantidade devolvida ({qtd:g}) maior que a vendida ({float(item.get('quantidade') or 0):g})."}), 422
+    cfop = _cfop_devolucao(item.get("cfop"))
+    if not cfop:
+        return jsonify({"error": f"Não sei o CFOP de devolução para o CFOP de venda {item.get('cfop')}: gere essa à mão no Bling."}), 422
+
+    b = BlingService()
+    nat = _id_por_nome(b, "/naturezas-operacoes", NATUREZA_DEVOLUCAO)
+    dep_id = _id_por_nome(b, "/depositos", DEPOSITO_LOCAL if dep == "LOCAL" else DEPOSITO_DEFEITOS)
+    if not nat or not dep_id:
+        return jsonify({"error": f"Não achei no Bling a natureza '{NATUREZA_DEVOLUCAO}' ou o depósito escolhido."}), 422
+
+    # já existe devolução dessa venda? (nota de entrada do mesmo cliente com esse item, depois da venda)
+    try:
+        ini = str(venda.get("dataEmissao") or "")[:10]
+        for pag in range(1, 4):
+            lst = b._get_json("/nfe", params={"tipo": 0, "dataEmissaoInicial": ini, "pagina": pag, "limite": 100}).get("data") or []
+            for n in lst:
+                if str((n.get("contato") or {}).get("id")) != str((venda.get("contato") or {}).get("id")):
+                    continue
+                dn = b._get_json(f"/nfe/{n['id']}").get("data") or {}
+                if any(str(i.get("codigo") or "").strip().upper() == sku for i in dn.get("itens") or []):
+                    with db_session() as conn:
+                        conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_msg=?, nf_dev_em=? WHERE id=?",
+                                     (str(dn.get("id")), str(dn.get("numero")), "já existia no Bling (não criei outra)", int(time.time()), did))
+                    return jsonify({"error": f"Já existe nota de devolução desse cliente com esse produto no Bling: NF {dn.get('numero')}. Não criei outra.", "ja": True}), 409
+            if len(lst) < 100:
+                break
+    except Exception as e:
+        print(f"[NF-DEV] checagem de duplicata falhou ({did}): {e}", flush=True)
+
+    obs = (f"Devolução referente à NF-e {venda.get('numero')} série {venda.get('serie')}, chave {venda.get('chaveAcesso')}. "
+           f"Venda {r['numero_venda']}. Devolução WMS #{did}.")
+    it = {"codigo": item.get("codigo"), "descricao": item.get("descricao"), "unidade": item.get("unidade") or "UN",
+          "quantidade": qtd, "valor": item.get("valor"), "tipo": "P", "classificacaoFiscal": item.get("classificacaoFiscal"),
+          "origem": item.get("origem", 0), "gtin": item.get("gtin") or "", "cfop": cfop}
+    cont = dict(venda.get("contato") or {})
+    doc = re.sub(r"\D", "", str(cont.get("numeroDocumento") or ""))
+    cont.setdefault("tipoPessoa", "J" if len(doc) == 14 else "F")
+    if not cont.get("ie"):
+        cont.setdefault("contribuinte", 9)
+    base = {"tipo": 0, "dataOperacao": time.strftime("%Y-%m-%d %H:%M:%S"), "contato": cont,
+            "naturezaOperacao": {"id": nat}, "loja": {"id": (venda.get("loja") or {}).get("id") or 0}, "itens": [it]}
+    if venda.get("intermediador", {}).get("cnpj"):
+        base["intermediador"] = venda["intermediador"]
+    tentativas = [
+        {**base, "finalidade": 4, "observacoes": obs,
+         "documentoReferenciado": {"modelo": "55", "data": str(venda.get("dataEmissao") or "")[:10],
+                                   "numero": str(venda.get("numero") or ""), "serie": str(venda.get("serie") or ""),
+                                   "chaveAcesso": venda.get("chaveAcesso")}},
+        {**base, "finalidade": 4, "observacoes": obs},   # sem a referência (aí confira a chave no Bling antes de enviar)
+    ]
+    criado, ultimo = None, None
+    for k, payload in enumerate(tentativas):
+        st, txt, js = _bling_uma_vez(b, "POST", "/nfe", payload)
+        print(f"[NF-DEV] devolução {did} tentativa {k + 1}: HTTP {st} {txt[:400]}", flush=True)
+        if st in (200, 201):
+            criado = ((js or {}).get("data") or {}).get("id")
+            break
+        ultimo = txt
+        if st not in (400, 422):   # timeout/5xx: pode ter criado; não tenta de novo (evita nota dupla)
+            ultimo = f"HTTP {st} {txt} (confira no Bling se a nota foi criada antes de tentar de novo)"
+            break
+    if not criado:
+        with db_session() as conn:
+            conn.execute("UPDATE devolucoes SET nf_dev_msg=? WHERE id=?", (f"Bling recusou: {ultimo}"[:500], did))
+        return jsonify({"error": f"O Bling não criou a nota: {_msg_bling(ultimo)}"}), 422
+    det = b._get_json(f"/nfe/{criado}").get("data") or {}
+    est_st, est_txt, _ = _bling_uma_vez(b, "POST", f"/nfe/{criado}/lancar-estoque/{dep_id}")
+    est_ok = est_st in (200, 201, 204)
+    print(f"[NF-DEV] devolução {did}: lancar-estoque {dep_id} HTTP {est_st} {est_txt[:300]}", flush=True)
+    msg = (f"NF {det.get('numero')} criada PENDENTE no Bling (confira e clique em Enviar). "
+           + (f"Estoque lançado em {'Local' if dep == 'LOCAL' else 'Defeitos / Garantia'}." if est_ok
+              else f"ATENÇÃO: estoque NÃO lançado ({_msg_bling(est_txt) or est_st}): lance no Bling."))
+    with db_session() as conn:
+        conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_deposito=?, nf_dev_por=?, nf_dev_em=?, nf_dev_msg=? WHERE id=?",
+                     (str(criado), str(det.get("numero") or ""), dep, _quem(), int(time.time()), msg, did))
+    print(f"[NF-DEV] devolução {did}: {msg}", flush=True)
+    return jsonify({"success": True, "nf_id": criado, "numero": det.get("numero"), "deposito": dep, "estoque_lancado": est_ok, "msg": msg,
+                    "referencia_gravada": bool(det.get("documentoReferenciado") or det.get("notasReferenciadas"))})
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>/preencher")
