@@ -671,17 +671,22 @@ def pedido_resumo(ml_id):
         its = [dict(r) for r in conn.execute(
             "SELECT pr.sku, pr.nome, pp.quantidade, pp.quantidade_bipada FROM pedido_produtos pp "
             "JOIN produtos pr ON pr.id=pp.produto_id WHERE pp.pedido_id=? ORDER BY pr.nome", (p["id"],)).fetchall()]
-        info = {}
+        info, saida = {}, None
         try:
             r = conn.execute("SELECT * FROM comercial_info WHERE ml_id=?", (str(ml_id),)).fetchone()
             info = dict(r) if r else {}
+        except Exception:
+            pass
+        try:
+            r = conn.execute("SELECT por, em FROM saida_bipes WHERE ml_id=?", (str(ml_id),)).fetchone()
+            saida = {"por": r["por"], "em": int(r["em"])} if r else None
         except Exception:
             pass
     return jsonify({
         "ml_id": p["ml_id"], "cliente_nome": p.get("cliente_nome"), "status": p.get("status"),
         "origem": p.get("origem") or "ML", "criado_em": str(p.get("criado_em") or ""),
         "atualizado_em": str(p.get("atualizado_em") or ""),
-        "bling_numero": info.get("pv_numero") or p.get("bling_numero"), "transportadora": info.get("transportadora"),
+        "bling_numero": info.get("pv_numero") or p.get("bling_numero"), "transportadora": info.get("transportadora"), "saida": saida,
         "itens": [{"sku": i["sku"], "nome": i["nome"], "quantidade": i["quantidade"], "quantidade_bipada": i["quantidade_bipada"]} for i in its],
     })
 
@@ -707,7 +712,19 @@ def _saida_tabelas(conn):
     global _saida_ok
     if not _saida_ok:
         conn.execute("CREATE TABLE IF NOT EXISTS saida_bipes (ml_id TEXT PRIMARY KEY, codigo TEXT, por TEXT, em BIGINT)")
+        # histórico que NUNCA é apagado: quem bipou, quando, o que aconteceu (carregou, recusado, desfez, liberou com falta)
+        conn.execute("CREATE TABLE IF NOT EXISTS saida_log (id BIGSERIAL PRIMARY KEY, ml_id TEXT, cliente TEXT, acao TEXT, "
+                     "codigo TEXT, tipo TEXT, carro TEXT, por TEXT, em BIGINT, detalhe TEXT)")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_saida_log_em ON saida_log (em)")
         _saida_ok = True
+
+
+def _log_saida(conn, acao, ml_id=None, cliente=None, codigo=None, tipo=None, carro=None, detalhe=None):
+    try:
+        conn.execute("INSERT INTO saida_log (ml_id, cliente, acao, codigo, tipo, carro, por, em, detalhe) VALUES (?,?,?,?,?,?,?,?,?)",
+                     (ml_id, (cliente or "")[:120], acao, (codigo or "")[:120], tipo, carro, _quem_saida(), int(time.time()), (detalhe or "")[:400]))
+    except Exception as e:
+        _slowlog.warning("saida_log: %s", e)
 
 
 def _tipo_saida(p):
@@ -763,7 +780,7 @@ def _gestor_saida():
 def _quem_saida():
     try:
         from flask_login import current_user
-        return getattr(current_user, "username", None) or getattr(current_user, "nome", None) or str(getattr(current_user, "id", ""))
+        return str(getattr(current_user, "nome", None) or getattr(current_user, "username", None) or getattr(current_user, "email", None) or getattr(current_user, "id", ""))[:80]
     except Exception:
         return ""
 
@@ -867,10 +884,12 @@ def saida_bipar():
         _saida_tabelas(conn)
         p = _achar_pedido_por_codigo(conn, cod)
         if not p:
+            _log_saida(conn, "recusado", codigo=cod, carro=carro or None, detalhe="etiqueta desconhecida")
             return jsonify({"error": f"essa etiqueta ({cod[:40]}) não é de nenhum pedido do WMS: NÃO carregue, mostre ao supervisor", "codigo_erro": "desconhecido"}), 404
         tipo = _tipo_saida(p)
         if carro and tipo != carro:
             nomes = {"COLETA": "COLETA ML", "FLEX": "FLEX", "SHOPEE": "SHOPEE", "COMERCIAL": "COMERCIAL"}
+            _log_saida(conn, "recusado", p["ml_id"], p.get("cliente_nome"), cod, tipo, carro, "pacote de outro carro")
             return jsonify({"error": f"esse pacote é {nomes.get(tipo, tipo)}, não é desse carro ({nomes.get(carro, carro)}): separe ele",
                             "codigo_erro": "outro_carro", "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo}), 409
         lim = None
@@ -882,16 +901,39 @@ def saida_bipar():
                 pass
         dia = _dia_saida(p, lim)
         if dia and dia > hoje:
+            _log_saida(conn, "recusado", p["ml_id"], p.get("cliente_nome"), cod, tipo, carro or None, f"pacote para {dia}, não é de hoje")
             return jsonify({"error": f"esse pacote é para {dia[8:10]}/{dia[5:7]}, NÃO é de hoje: não carregue",
                             "codigo_erro": "outro_dia", "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo}), 409
         ja = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (p["ml_id"],)).fetchone()
         conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (p["ml_id"],))
         conn.execute("INSERT INTO saida_bipes (ml_id, codigo, por, em) VALUES (?,?,?,?)", (p["ml_id"], cod[:120], _quem_saida(), int(time.time())))
+        _log_saida(conn, "repetido" if ja else "carregou", p["ml_id"], p.get("cliente_nome"), cod, _tipo_saida(p), carro or None,
+                   None if p.get("status") == "CONCLUIDO" or _tipo_saida(p) == "COMERCIAL" else f"pedido {p.get('status')} no WMS (não expedido)")
     aviso = None
     if p.get("status") != "CONCLUIDO" and _tipo_saida(p) != "COMERCIAL":
         aviso = f"ATENÇÃO: esse pedido está {p.get('status')} no WMS — não foi expedido (sem NF/etiqueta pelo sistema)"
     return jsonify({"success": True, "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": _tipo_saida(p),
                     "repetido": bool(ja), "aviso": aviso})
+
+
+@mapa_routes.get("/saida/historico")
+@login_required
+def saida_historico():
+    """Histórico da Saída de um dia (padrão hoje): quem bipou o quê, recusas, desfeitos e liberações com falta."""
+    dia = request.args.get("dia") or time.strftime("%Y-%m-%d", time.localtime())
+    try:
+        ini = int(time.mktime(time.strptime(dia, "%Y-%m-%d")))
+    except ValueError:
+        return jsonify({"error": "dia no formato AAAA-MM-DD"}), 400
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        rows = [dict(r) for r in conn.execute("SELECT * FROM saida_log WHERE em >= ? AND em < ? ORDER BY em DESC, id DESC",
+                                              (ini, ini + 86400)).fetchall()]
+    por = {}
+    for r in rows:
+        if r["acao"] == "carregou":
+            por[r["por"] or "?"] = por.get(r["por"] or "?", 0) + 1
+    return jsonify({"dia": dia, "eventos": rows[:500], "carregados_por": por})
 
 
 @mapa_routes.post("/saida/liberar")
@@ -905,9 +947,11 @@ def saida_liberar():
     if len(motivo) < 5:
         return jsonify({"error": "Escreva o motivo."}), 400
     with db_session() as conn:
+        _saida_tabelas(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS saida_liberacoes (id BIGSERIAL PRIMARY KEY, tipo TEXT, motivo TEXT, faltando TEXT, por TEXT, em BIGINT)")
         conn.execute("INSERT INTO saida_liberacoes (tipo, motivo, faltando, por, em) VALUES (?,?,?,?,?)",
                      (str(b.get("tipo") or ""), motivo[:500], ",".join(str(x) for x in (b.get("faltando") or []))[:2000], _quem_saida(), int(time.time())))
+        _log_saida(conn, "liberou_com_falta", carro=str(b.get("tipo") or ""), detalhe=f"{motivo[:300]} | faltando: {', '.join(str(x) for x in (b.get('faltando') or []))[:300]}")
     _slowlog.warning("SAIDA liberada com pendência: %s por %s — %s", b.get("tipo"), _quem_saida(), motivo)
     return jsonify({"success": True})
 
@@ -918,7 +962,10 @@ def saida_desfazer():
     mid = str((request.get_json(silent=True) or {}).get("ml_id") or "")
     with db_session() as conn:
         _saida_tabelas(conn)
+        b0 = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (mid,)).fetchone()
         conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (mid,))
+        p0 = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
+        _log_saida(conn, "desfez", mid, p0["cliente_nome"] if p0 else None, detalhe=f"tinha sido bipado por {b0['por']}" if b0 else None)
     return jsonify({"success": True})
 
 
