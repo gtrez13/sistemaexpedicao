@@ -25,7 +25,7 @@ def rodar(c):
         return
 
     print("Situação atual (todas as telas):")
-    for r in c.execute("SELECT status, COALESCE(origem,'?') AS origem, COUNT(*) AS n FROM pedidos GROUP BY status, origem ORDER BY status, origem").fetchall():
+    for r in c.execute("SELECT status, COALESCE(origem,'-') AS origem, COUNT(*) AS n FROM pedidos GROUP BY status, origem ORDER BY status, origem").fetchall():
         print(f"   {r['status']:<10} {r['origem']:<10} {r['n']}")
     n = c.execute(f"SELECT COUNT(*) AS n FROM pedidos WHERE status IN {TELA1}").fetchone()["n"]
     print(f"\nTela 1 (PENDENTE + PARCIAL): {n} pedidos")
