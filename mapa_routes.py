@@ -757,7 +757,7 @@ def _quem_saida():
 @mapa_routes.get("/saida/lista")
 @login_required
 def saida_lista():
-    """Tudo que tem que sair: não expedido no WMS (qualquer data), expedido nos últimos 5 dias e ainda não coletado."""
+    """O que sai HOJE (limite de despacho do ML / prazo do WMS / dia em que foi expedido): faltam, não expedidos, carregados."""
     desde = time.strftime("%Y-%m-%d 00:00:00", time.localtime(time.time() - 5 * 86400))
     hoje = time.strftime("%Y-%m-%d", time.localtime())
     with db_session() as conn:
@@ -802,12 +802,12 @@ def saida_lista():
             dia_saida = None
         if bip_hoje(p["ml_id"]):
             situacao = "carregado"
+        elif not dia_saida or dia_saida < hoje:
+            continue        # SÓ o que sai HOJE (pedido sem data ou de dia anterior não entra na Saída)
+        elif dia_saida > hoje:
+            situacao = "outro_dia"
         elif st in ("shipped", "delivered", "not_delivered"):
             situacao = "saiu"
-        elif dia_saida and dia_saida > hoje:
-            situacao = "outro_dia"
-        elif tipo in ("SHOPEE", "COMERCIAL") and p.get("status") == "CONCLUIDO" and dia_saida and dia_saida < hoje:
-            continue        # sem como confirmar a coleta: expedido em dia anterior conta como já saído
         elif p.get("status") == "CONCLUIDO":
             situacao = "pronto"
         else:
