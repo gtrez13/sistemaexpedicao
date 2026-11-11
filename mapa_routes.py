@@ -746,6 +746,20 @@ def _status_envio_ml(ml, ship):
     return None, None, None
 
 
+def _dia_saida(p, lim=None):
+    exp_dia = str(p.get("atualizado_em") or "")[:10] if p.get("status") == "CONCLUIDO" else ""
+    d = lim or str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10] or exp_dia or None
+    return d if d and re.match(r"\d{4}-\d{2}-\d{2}$", d) else None
+
+
+def _gestor_saida():
+    try:
+        from flask_login import current_user
+        return str(getattr(current_user, "role", "") or "").lower() in ("admin", "supervisor")
+    except Exception:
+        return False
+
+
 def _quem_saida():
     try:
         from flask_login import current_user
@@ -796,10 +810,7 @@ def saida_lista():
         if st in ("cancelled",):
             continue
         # dia em que TEM que sair: limite do ML > prazo gravado no WMS > (sem data) dia em que foi expedido
-        exp_dia = str(p.get("atualizado_em") or "")[:10] if p.get("status") == "CONCLUIDO" else ""
-        dia_saida = lim or str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10] or exp_dia or None
-        if dia_saida and not re.match(r"\d{4}-\d{2}-\d{2}$", dia_saida):
-            dia_saida = None
+        dia_saida = _dia_saida(p, lim)
         if bip_hoje(p["ml_id"]):
             situacao = "carregado"
         elif not dia_saida or dia_saida < hoje:
@@ -846,14 +857,33 @@ def _achar_pedido_por_codigo(conn, cod):
 @mapa_routes.post("/saida/bipar")
 @login_required
 def saida_bipar():
-    cod = str((request.get_json(silent=True) or {}).get("codigo") or "").strip()
+    body = request.get_json(silent=True) or {}
+    cod = str(body.get("codigo") or "").strip()
+    carro = str(body.get("tipo") or "").upper()           # carregando QUAL carro (FLEX, COLETA, SHOPEE, COMERCIAL)
     if not cod:
         return jsonify({"error": "bipe a etiqueta"}), 400
+    hoje = time.strftime("%Y-%m-%d", time.localtime())
     with db_session() as conn:
         _saida_tabelas(conn)
         p = _achar_pedido_por_codigo(conn, cod)
         if not p:
-            return jsonify({"error": f"essa etiqueta ({cod[:40]}) não é de nenhum pedido do WMS: confira se o pedido passou pela separação"}), 404
+            return jsonify({"error": f"essa etiqueta ({cod[:40]}) não é de nenhum pedido do WMS: NÃO carregue, mostre ao supervisor", "codigo_erro": "desconhecido"}), 404
+        tipo = _tipo_saida(p)
+        if carro and tipo != carro:
+            nomes = {"COLETA": "COLETA ML", "FLEX": "FLEX", "SHOPEE": "SHOPEE", "COMERCIAL": "COMERCIAL"}
+            return jsonify({"error": f"esse pacote é {nomes.get(tipo, tipo)}, não é desse carro ({nomes.get(carro, carro)}): separe ele",
+                            "codigo_erro": "outro_carro", "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo}), 409
+        lim = None
+        if tipo in ("FLEX", "COLETA") and p.get("ml_shipping_id"):
+            try:
+                from services.ml_service import MercadoLivreService
+                _, _, lim = _status_envio_ml(MercadoLivreService(), p.get("ml_shipping_id"))
+            except Exception:
+                pass
+        dia = _dia_saida(p, lim)
+        if dia and dia > hoje:
+            return jsonify({"error": f"esse pacote é para {dia[8:10]}/{dia[5:7]}, NÃO é de hoje: não carregue",
+                            "codigo_erro": "outro_dia", "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo}), 409
         ja = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (p["ml_id"],)).fetchone()
         conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (p["ml_id"],))
         conn.execute("INSERT INTO saida_bipes (ml_id, codigo, por, em) VALUES (?,?,?,?)", (p["ml_id"], cod[:120], _quem_saida(), int(time.time())))
@@ -862,6 +892,24 @@ def saida_bipar():
         aviso = f"ATENÇÃO: esse pedido está {p.get('status')} no WMS — não foi expedido (sem NF/etiqueta pelo sistema)"
     return jsonify({"success": True, "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": _tipo_saida(p),
                     "repetido": bool(ja), "aviso": aviso})
+
+
+@mapa_routes.post("/saida/liberar")
+@login_required
+def saida_liberar():
+    """Carro saiu com pacote faltando: só supervisor/admin, com motivo. Fica registrado."""
+    if not _gestor_saida():
+        return jsonify({"error": "Só supervisor ou admin libera o motorista com pacote faltando."}), 403
+    b = request.get_json(silent=True) or {}
+    motivo = str(b.get("motivo") or "").strip()
+    if len(motivo) < 5:
+        return jsonify({"error": "Escreva o motivo."}), 400
+    with db_session() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS saida_liberacoes (id BIGSERIAL PRIMARY KEY, tipo TEXT, motivo TEXT, faltando TEXT, por TEXT, em BIGINT)")
+        conn.execute("INSERT INTO saida_liberacoes (tipo, motivo, faltando, por, em) VALUES (?,?,?,?,?)",
+                     (str(b.get("tipo") or ""), motivo[:500], ",".join(str(x) for x in (b.get("faltando") or []))[:2000], _quem_saida(), int(time.time())))
+    _slowlog.warning("SAIDA liberada com pendência: %s por %s — %s", b.get("tipo"), _quem_saida(), motivo)
+    return jsonify({"success": True})
 
 
 @mapa_routes.post("/saida/desfazer")
