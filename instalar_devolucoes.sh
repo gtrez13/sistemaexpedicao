@@ -94,10 +94,10 @@ EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", 
              ("finalizada_por", "TEXT"), ("dados_ml_em", "BIGINT"),
              ("ml_review", "TEXT"), ("ml_review_em", "BIGINT"), ("ml_review_por", "TEXT"), ("ml_review_msg", "TEXT"),
              ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT"),
-             ("canal", "TEXT"), ("servico", "TEXT")]
+             ("canal", "TEXT"), ("servico", "TEXT"), ("embalagem", "TEXT"), ("estado_produto", "TEXT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
-            "observacoes", "status", "canal", "servico"]
+            "observacoes", "status", "canal", "servico", "embalagem", "estado_produto"]
 COLS_BOOL = ["teve_reclamacao", "avaria", "faltou_item", "volta_estoque"]
 
 
@@ -189,6 +189,19 @@ def garantir_tabelas(conn=None):
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucao_fotos ON devolucao_fotos (devolucao_id)")
+        c.execute(f"""
+            CREATE TABLE IF NOT EXISTS devolucao_videos (
+                id            {pk},
+                devolucao_id  BIGINT NOT NULL,
+                arquivo       TEXT NOT NULL,
+                mime          TEXT,
+                duracao       REAL,
+                tamanho       BIGINT,
+                criado_em     BIGINT NOT NULL,
+                criado_por    TEXT
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS ix_devolucao_videos ON devolucao_videos (devolucao_id)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_status ON devolucoes (status, criado_em)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_devolucoes_venda ON devolucoes (numero_venda)")
 
@@ -455,6 +468,8 @@ def detalhe(did):
             return jsonify({"error": "Devolução não encontrada."}), 404
         d = _fmt_com_fotos(conn, [r])[0]
         d["fotos"] = [x["id"] for x in conn.execute("SELECT id FROM devolucao_fotos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
+        d["videos"] = [{"id": x["id"], "duracao": x["duracao"], "por": x["criado_por"], "em": x["criado_em"]}
+                       for x in conn.execute("SELECT id, duracao, criado_por, criado_em FROM devolucao_videos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
     return jsonify(d)
 
 
@@ -536,6 +551,82 @@ def foto_enviar(did):
                      (did, nome, int(time.time()), _quem()))
         fid = conn.execute("SELECT id FROM devolucao_fotos WHERE arquivo=?", (nome,)).fetchone()["id"]
     return jsonify({"success": True, "id": fid})
+
+
+MAX_VIDEO = 60 * 1024 * 1024
+VIDEO_MIN_S = 5
+
+
+def _tipo_video(b: bytes):
+    if b[4:8] == b"ftyp":
+        return ("mov", "video/quicktime") if b[8:10] == b"qt" else ("mp4", "video/mp4")
+    if b[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm", "video/webm"
+    return None, None
+
+
+@devolucoes_routes.post("/devolucoes/<int:did>/video")
+@login_required
+def video_enviar(did):
+    """Vídeo da conferência (mínimo 5 s, gravado na prancheta)."""
+    f = request.files.get("video")
+    if not f:
+        return jsonify({"error": "Envie o vídeo (campo 'video')."}), 400
+    try:
+        dur = float(request.form.get("duracao") or 0)
+    except ValueError:
+        dur = 0
+    if dur < VIDEO_MIN_S:
+        return jsonify({"error": f"O vídeo precisa ter pelo menos {VIDEO_MIN_S} segundos."}), 400
+    dados = f.read(MAX_VIDEO + 1)
+    if len(dados) > MAX_VIDEO:
+        return jsonify({"error": "Vídeo grande demais (máx. 60 MB)."}), 413
+    ext, mime = _tipo_video(dados)
+    if not ext:
+        return jsonify({"error": "Arquivo não é um vídeo (MP4, MOV ou WEBM)."}), 400
+    garantir_tabelas()
+    with db_session() as conn:
+        if not conn.execute("SELECT 1 FROM devolucoes WHERE id=?", (did,)).fetchone():
+            return jsonify({"error": "Devolução não encontrada."}), 404
+        nome = f"{did}_video_{uuid.uuid4().hex}.{ext}"
+        with open(os.path.join(_pasta_fotos(), nome), "wb") as out:
+            out.write(dados)
+        conn.execute("INSERT INTO devolucao_videos (devolucao_id, arquivo, mime, duracao, tamanho, criado_em, criado_por) VALUES (?,?,?,?,?,?,?)",
+                     (did, nome, mime, dur, len(dados), int(time.time()), _quem()))
+        vid = conn.execute("SELECT id FROM devolucao_videos WHERE arquivo=?", (nome,)).fetchone()["id"]
+    return jsonify({"success": True, "id": vid, "duracao": dur})
+
+
+@devolucoes_routes.get("/devolucoes/videos/<int:vid>")
+@login_required
+def video_ver(vid):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT arquivo, mime FROM devolucao_videos WHERE id=?", (vid,)).fetchone()
+    if not r:
+        return jsonify({"error": "Vídeo não encontrado."}), 404
+    caminho = os.path.join(_pasta_fotos(), os.path.basename(r["arquivo"]))
+    if not os.path.exists(caminho):
+        return jsonify({"error": "Arquivo do vídeo não encontrado."}), 404
+    return send_file(caminho, mimetype=r["mime"] or "video/mp4", conditional=True, max_age=86400)
+
+
+@devolucoes_routes.delete("/devolucoes/videos/<int:vid>")
+@login_required
+def video_apagar(vid):
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT v.arquivo, d.status FROM devolucao_videos v JOIN devolucoes d ON d.id=v.devolucao_id WHERE v.id=?", (vid,)).fetchone()
+        if not r:
+            return jsonify({"error": "Vídeo não encontrado."}), 404
+        if r["status"] == "finalizada" and not eh_gestor():
+            return jsonify({"error": "Devolução finalizada: só supervisor apaga."}), 403
+        conn.execute("DELETE FROM devolucao_videos WHERE id=?", (vid,))
+    try:
+        os.remove(os.path.join(_pasta_fotos(), os.path.basename(r["arquivo"])))
+    except OSError:
+        pass
+    return jsonify({"success": True})
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>/fotos")
