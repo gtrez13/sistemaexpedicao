@@ -1029,7 +1029,10 @@ def nf_dev_gerar(did):
         return jsonify({"error": "Devolução FULL: o WMS não gera nota (volta para o armazém do ML)."}), 409
     if not r["bipado"] or not r["chegada"]:
         return jsonify({"error": "Conclua a conferência na prancheta antes (bipar, como chegou, como está)."}), 409
-    dep = str(body.get("deposito") or "").upper() or _deposito_sugerido(r)
+    sug = _deposito_sugerido(r)
+    dep = str(body.get("deposito") or "").upper() or sug
+    if sug == "DEFEITOS" and dep == "LOCAL":
+        return jsonify({"error": "Produto com problema (avariado, faltando peça ou diferente) não volta para o Local: vai para Defeitos / Garantia."}), 409
     if dep not in ("LOCAL", "DEFEITOS"):
         return jsonify({"error": "Escolha o depósito: Local (volta para venda) ou Defeitos / Garantia.", "escolher": True}), 400
 
