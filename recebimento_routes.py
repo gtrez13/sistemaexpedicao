@@ -244,17 +244,42 @@ def _xml_bling_por_chave(chave: str):
     return None
 
 
-# ───────────────────────── Meu Danfe (opcional) ─────────────────────────
+# ───────────────────────── Meu Danfe (API v2) ─────────────────────────
+MEUDANFE_BASE = os.environ.get("MEUDANFE_BASE", "https://api.meudanfe.com.br/v2")
+
+
 def buscar_xml_por_chave(chave: str):
-    """Plano C: Meu Danfe. Configure MEUDANFE_URL (com {chave}) e MEUDANFE_TOKEN. Sem isso devolve None."""
-    url, tok = os.environ.get("MEUDANFE_URL"), os.environ.get("MEUDANFE_TOKEN")
-    if not url or not tok:
+    """XML da NF pela chave no Meu Danfe: GET (grátis se já está na área); senão PUT /fd/add (R$0,03, busca na SEFAZ)
+    e espera o XML aparecer (até ~20 s). Sem MEUDANFE_TOKEN no .env devolve None."""
+    tok = (os.environ.get("MEUDANFE_TOKEN") or "").strip()
+    if not tok:
         return None
+    import requests
+    h = {"Api-Key": tok}
+
+    def pegar():
+        r = requests.get(f"{MEUDANFE_BASE}/fd/get/xml/{chave}", headers=h, timeout=20)
+        if r.status_code != 200:
+            return None
+        try:
+            txt = (r.json() or {}).get("data") or ""
+        except Exception:
+            txt = r.text or ""
+        return txt if "infNFe" in txt else None
+
     try:
-        import requests
-        r = requests.get(url.format(chave=chave), headers={"Authorization": f"Bearer {tok}", "Accept": "application/xml"}, timeout=20)
-        if r.status_code == 200 and b"infNFe" in r.content:
-            return r.text
+        x = pegar()
+        if x:
+            return x
+        r = requests.put(f"{MEUDANFE_BASE}/fd/add/{chave}", headers=h, timeout=60)
+        print(f"[RECEB] meudanfe add {chave}: HTTP {r.status_code} {r.text[:160]}", flush=True)
+        if r.status_code not in (200, 201):
+            return None
+        for _ in range(7):
+            time.sleep(3)
+            x = pegar()
+            if x:
+                return x
     except Exception as e:
         print(f"⚠️ meudanfe: {e}", flush=True)
     return None
@@ -278,6 +303,12 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
         pcs = pedidos_compra_do_fornecedor(r["fornecedor_cnpj"])
         d["pedidos_compra"] = [{k: v for k, v in pc.items() if k != "itens"} | {"n_itens": len(pc["itens"])} for pc in pcs]
         d["pedido_compra"] = next((pc for pc in pcs if pc["id"] == r["pedido_compra_id"]), None)
+        try:
+            _, sug = sugestoes_pedido(d, pcs)
+            d["sugestoes_pc"] = [{k: v for k, v in x.items() if not k.startswith("_")} for x in sug[:6]]
+        except Exception as e:
+            print(f"⚠️ recebimento: sugestões falharam: {e}", flush=True)
+            d["sugestoes_pc"] = []
     if com_pc:
         d["divergencias_pedido"] = _divergencias(d, conferencia=False)
     d["permite_liberar"] = PERMITE_LIBERAR
@@ -317,6 +348,93 @@ def _preencher_skus_pelo_pedido(c, d: dict):
                          ON CONFLICT (fornecedor_cnpj, cprod) DO NOTHING""", (d["fornecedor_cnpj"], it["cprod"], pi["sku"], "pedido", _agora()))
             mudou = True
     return mudou
+
+
+# ───────────────────────── casar NF x pedido de compra pelos ITENS ─────────────────────────
+# Quando a nota NÃO traz o nº do pedido (xPed): compara item a item com os pedidos em aberto do fornecedor.
+# Vínculo automático só se UM ÚNICO pedido bate 100% (todos os itens, quantidades, preços e total) e sem item ambíguo.
+def _txt_norm(t):
+    import unicodedata
+    return unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()
+
+
+def _sim(a, b):
+    ta, tb = set(re.findall(r"[a-z0-9]{3,}", _txt_norm(a))), set(re.findall(r"[a-z0-9]{3,}", _txt_norm(b)))
+    return len(ta & tb) / max(1, min(len(ta), len(tb))) if ta and tb else 0.0
+
+
+def _parear(itens_nf, pc):
+    up = lambda v: str(v or "").strip().upper()
+    livres = list(range(len(pc["itens"])))
+    pares = {}
+    for i, it in enumerate(itens_nf):                         # 1) código: SKU nosso ou código do fornecedor
+        for k in livres:
+            x = pc["itens"][k]
+            if (x.get("sku") and it.get("sku") and up(x["sku"]) == up(it["sku"])) or \
+               (x.get("cprod") and it.get("cprod") and up(x["cprod"]) == up(it["cprod"])):
+                pares[i] = (k, "codigo"); livres.remove(k); break
+    for i, it in enumerate(itens_nf):                         # 2) sem código: mesma quantidade E mesmo preço
+        if i in pares:
+            continue
+        cands = [k for k in livres if abs(float(pc["itens"][k].get("qtd") or 0) - float(it["qtd_nf"] or 0)) < 1e-6
+                 and abs(float(pc["itens"][k].get("valor") or 0) - float(it.get("valor_unit") or 0)) <= PRECO_TOL]
+        if not cands:
+            continue
+        cands.sort(key=lambda k: -_sim(it.get("descricao"), pc["itens"][k].get("descricao")))
+        amb = len(cands) > 1 and _sim(it.get("descricao"), pc["itens"][cands[0]].get("descricao")) == \
+            _sim(it.get("descricao"), pc["itens"][cands[1]].get("descricao"))
+        pares[i] = (cands[0], "valores_ambiguo" if amb else "valores"); livres.remove(cands[0])
+    batem, problemas = 0, []
+    for i, it in enumerate(itens_nf):
+        nome = (it.get("descricao") or "")[:38]
+        if i not in pares:
+            problemas.append(f"{nome}: não está no pedido"); continue
+        x = pc["itens"][pares[i][0]]
+        q_ok = abs(float(x.get("qtd") or 0) - float(it["qtd_nf"] or 0)) < 1e-6
+        v_ok = abs(float(x.get("valor") or 0) - float(it.get("valor_unit") or 0)) <= PRECO_TOL
+        if q_ok and v_ok:
+            batem += 1
+        else:
+            problemas.append(f"{nome}: " + ("quantidade NF {:g} x pedido {:g}".format(float(it["qtd_nf"] or 0), float(x.get("qtd") or 0)) if not q_ok
+                                            else "preço NF R$ {:.2f} x pedido R$ {:.2f}".format(float(it.get("valor_unit") or 0), float(x.get("valor") or 0))))
+    for k in livres:
+        x = pc["itens"][k]
+        problemas.append(f"pedido tem {(x.get('descricao') or x.get('sku') or '')[:38]} ({float(x.get('qtd') or 0):g}) que não veio")
+    tot_nf = round(sum(float(it["qtd_nf"] or 0) * float(it.get("valor_unit") or 0) for it in itens_nf), 2)
+    tot_pc = round(sum(float(x.get("qtd") or 0) * float(x.get("valor") or 0) for x in pc["itens"]), 2)
+    if abs(tot_nf - tot_pc) > 0.05:
+        problemas.append(f"total NF R$ {tot_nf:,.2f} x pedido R$ {tot_pc:,.2f}")
+    ambiguo = any(m == "valores_ambiguo" for _, m in pares.values())
+    exato = not problemas and batem == len(itens_nf) and len(itens_nf) > 0
+    return {"pares": pares, "batem": batem, "exato": exato, "ambiguo": ambiguo, "problemas": problemas,
+            "por_codigo": sum(1 for _, m in pares.values() if m == "codigo")}
+
+
+def sugestoes_pedido(d, pcs):
+    """Ranking dos pedidos em aberto do fornecedor contra a nota + o que é vínculo 100% (auto)."""
+    res = []
+    for pc in pcs:
+        r = _parear(d["itens"], pc)
+        res.append({"id": pc["id"], "numero": pc.get("numero"), "data": pc.get("data"), "total": pc.get("total"),
+                    "n_itens": len(pc["itens"]), "batem": r["batem"], "itens_nf": len(d["itens"]), "exato": r["exato"],
+                    "ambiguo": r["ambiguo"], "por_codigo": r["por_codigo"], "problemas": r["problemas"][:5], "_r": r, "_pc": pc})
+    res.sort(key=lambda x: (not x["exato"], -x["batem"], len(x["problemas"])))
+    exatos = [x for x in res if x["exato"] and not x["ambiguo"]]
+    auto = exatos[0] if len([x for x in res if x["exato"]]) == 1 and exatos else None
+    return auto, res
+
+
+def _aprender_skus(c, d, sug):
+    """Pedido vinculado pelos itens: item da nota sem SKU herda o SKU do item do pedido que casou (e grava o vínculo)."""
+    pc, r = sug["_pc"], sug["_r"]
+    for i, (k, metodo) in r["pares"].items():
+        it, x = d["itens"][i], pc["itens"][k]
+        if it.get("sku") or not x.get("sku") or metodo == "valores_ambiguo":
+            continue
+        c.execute("UPDATE receb_itens SET sku=? WHERE id=?", (x["sku"], it["id"]))
+        if it.get("cprod"):
+            c.execute("""INSERT INTO receb_vinculos (fornecedor_cnpj, cprod, sku, criado_por, criado_em) VALUES (?,?,?,?,?)
+                         ON CONFLICT (fornecedor_cnpj, cprod) DO NOTHING""", (d["fornecedor_cnpj"], it["cprod"], x["sku"], "itens", _agora()))
 
 
 def _divergencias(d: dict, conferencia: bool = True) -> list:
@@ -450,6 +568,16 @@ def detalhe(nid):
                 c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, vinculo_por='xml' WHERE id=?",
                           (pc["id"], str(pc["numero"]), nid))
                 d = _nota_dict(c, nid)
+        # sem nº de pedido na nota: vínculo AUTOMÁTICO só se um único pedido em aberto bate 100% item a item
+        if not d["pedido_compra_id"] and d["status"] in ("aguardando", "conferindo"):
+            pcs = pedidos_compra_do_fornecedor(d["fornecedor_cnpj"])
+            auto, _ = sugestoes_pedido(d, pcs) if pcs else (None, [])
+            if auto:
+                c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, vinculo_por='itens', atualizado_em=? WHERE id=?",
+                          (auto["id"], str(auto["numero"]), _agora(), nid))
+                _aprender_skus(c, d, auto)
+                print(f"[RECEB] nota {d['numero']} vinculada pelos itens ao pedido {auto['numero']}", flush=True)
+                d = _nota_dict(c, nid)
         if _preencher_skus_pelo_pedido(c, d):
             d = _nota_dict(c, nid)
     return jsonify(d)
@@ -470,6 +598,10 @@ def vincular_pedido(nid):
                 return jsonify({"error": "Pedido de compra não é desse fornecedor."}), 400
             c.execute("UPDATE receb_notas SET pedido_compra_id=?, pedido_compra_numero=?, vinculo_por=?, atualizado_em=? WHERE id=?",
                       (pc["id"], str(pc["numero"]), "manual:" + _quem(), _agora(), nid))
+            d0 = _nota_dict(c, nid, com_pc=False)
+            r0 = _parear(d0["itens"], pc)
+            _aprender_skus(c, d0, {"_pc": pc, "_r": {"pares": {i: v for i, v in r0["pares"].items()
+                                                              if abs(float(pc["itens"][v[0]].get("qtd") or 0) - float(d0["itens"][i]["qtd_nf"] or 0)) < 1e-6}}})
         else:
             c.execute("UPDATE receb_notas SET pedido_compra_id=NULL, pedido_compra_numero=NULL, atualizado_em=? WHERE id=?", (_agora(), nid))
         d = _nota_dict(c, nid)
