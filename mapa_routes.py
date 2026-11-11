@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -693,6 +694,171 @@ def comercial_pv(ml_id):
         r = conn.execute("SELECT * FROM pedidos WHERE ml_id=?", (str(ml_id),)).fetchone()
     r = dict(r) if r else {}
     return jsonify({"numero": r.get("bling_numero"), "cliente": r.get("cliente_nome"), "id_bling": r.get("bling_pedido_venda_id")})
+
+
+# ───────────────────────── SAÍDA: bipar a etiqueta na hora de entregar ao motorista ─────────────────────────
+# Nenhum pedido fica para trás: lista tudo que tem que sair (ML Flex/Coleta, Shopee, Comercial), confere no ML se já
+# saiu, e cada etiqueta bipada na saída fica marcada como carregada.
+_saida_ok = False
+_ship_cache = {}            # shipment_id -> (quando, status, substatus)
+
+
+def _saida_tabelas(conn):
+    global _saida_ok
+    if not _saida_ok:
+        conn.execute("CREATE TABLE IF NOT EXISTS saida_bipes (ml_id TEXT PRIMARY KEY, codigo TEXT, por TEXT, em BIGINT)")
+        _saida_ok = True
+
+
+def _tipo_saida(p):
+    o = str(p.get("origem") or "ML").upper()
+    lt = str(p.get("logistic_type") or "").lower()
+    if o == "COMERCIAL":
+        return "COMERCIAL"
+    if o == "SHOPEE":
+        return "SHOPEE"
+    if "self_service" in lt or "flex" in lt:
+        return "FLEX"
+    if "fulfillment" in lt:
+        return "FULL"
+    return "COLETA"
+
+
+def _status_envio_ml(ml, ship):
+    if not ship:
+        return None, None
+    agora = time.time()
+    c = _ship_cache.get(str(ship))
+    if c and (agora - c[0] < 180 or (c[1] in ("shipped", "delivered", "cancelled", "not_delivered") and agora - c[0] < 86400)):
+        return c[1], c[2]
+    try:
+        r = ml._request("GET", f"/shipments/{ship}")
+        if r is not None and r.status_code == 200:
+            j = r.json()
+            _ship_cache[str(ship)] = (agora, j.get("status"), j.get("substatus"))
+            return j.get("status"), j.get("substatus")
+    except Exception:
+        pass
+    return None, None
+
+
+def _quem_saida():
+    try:
+        from flask_login import current_user
+        return getattr(current_user, "username", None) or getattr(current_user, "nome", None) or str(getattr(current_user, "id", ""))
+    except Exception:
+        return ""
+
+
+@mapa_routes.get("/saida/lista")
+@login_required
+def saida_lista():
+    """Tudo que tem que sair: não expedido no WMS (qualquer data), expedido nos últimos 5 dias e ainda não coletado."""
+    desde = time.strftime("%Y-%m-%d 00:00:00", time.localtime(time.time() - 5 * 86400))
+    hoje = time.strftime("%Y-%m-%d", time.localtime())
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        peds = [dict(r) for r in conn.execute(
+            "SELECT * FROM pedidos WHERE status IN ('PENDENTE','PARCIAL','SEPARADO') OR (status='CONCLUIDO' AND atualizado_em >= ?)",
+            (desde,)).fetchall()]
+        bips = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_bipes").fetchall()}
+    ml = None
+    try:
+        from services.ml_service import MercadoLivreService
+        ml = MercadoLivreService()
+    except Exception:
+        pass
+    # status do envio no ML (em paralelo; estado final fica em cache 24h)
+    def bip_hoje(mid):
+        b = bips.get(mid)
+        return bool(b) and time.strftime("%Y-%m-%d", time.localtime(int(b["em"] or 0))) == hoje
+    consultar = [p.get("ml_shipping_id") for p in peds if p.get("status") == "CONCLUIDO" and p.get("ml_shipping_id")
+                 and _tipo_saida(p) in ("FLEX", "COLETA") and not bip_hoje(p["ml_id"])]
+    if ml and consultar:
+        _status_envio_ml(ml, consultar[0])        # 1ª sozinha: se o token venceu, renova UMA vez antes do paralelo
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(6) as ex:
+            list(ex.map(lambda sh: _status_envio_ml(ml, sh), consultar[1:200]))
+    out = []
+    for p in peds:
+        tipo = _tipo_saida(p)
+        if tipo == "FULL":
+            continue
+        b = bips.get(p["ml_id"])
+        st, sub = (None, None)
+        if tipo in ("FLEX", "COLETA") and p.get("status") == "CONCLUIDO" and ml and p.get("ml_shipping_id"):
+            c = _ship_cache.get(str(p.get("ml_shipping_id")))
+            st, sub = (c[1], c[2]) if c else (None, None)
+        if st in ("cancelled",):
+            continue
+        if bip_hoje(p["ml_id"]):
+            situacao = "carregado"
+        elif st in ("shipped", "delivered", "not_delivered"):
+            situacao = "saiu"
+        elif p.get("status") == "CONCLUIDO":
+            situacao = "pronto"
+        else:
+            situacao = "nao_expedido"
+        out.append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo, "status_wms": p.get("status"),
+                    "envio": st, "envio_sub": sub, "situacao": situacao, "prazo": str(p.get("prazo_envio") or p.get("ship_by_date") or ""),
+                    "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
+                    "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None})
+    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "saiu": 3}
+    out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x["expedido_em"] or "")))
+    return jsonify({"pedidos": out, "hoje": hoje})
+
+
+def _achar_pedido_por_codigo(conn, cod):
+    """Código da etiqueta -> pedido. ML: nº do envio (barras) ou QR do Flex {"id": ...}; Shopee: nº do pedido; ou o próprio id."""
+    import json as _json
+    bruto = str(cod or "").strip()
+    cands = [bruto]
+    if bruto.startswith("{"):
+        try:
+            j = _json.loads(bruto)
+            cands = [str(j.get("id") or j.get("shipment_id") or ""), str(j.get("order_id") or "")]
+        except Exception:
+            pass
+    dig = re.sub(r"\D", "", bruto)
+    if dig and dig not in cands:
+        cands.append(dig)
+    for c in [x for x in cands if x]:
+        r = conn.execute("SELECT * FROM pedidos WHERE ml_shipping_id=? OR ml_id=? OR ml_id=? ORDER BY id DESC",
+                         (c, c, f"SHOPEE_{c}")).fetchone()
+        if r:
+            return dict(r)
+    return None
+
+
+@mapa_routes.post("/saida/bipar")
+@login_required
+def saida_bipar():
+    cod = str((request.get_json(silent=True) or {}).get("codigo") or "").strip()
+    if not cod:
+        return jsonify({"error": "bipe a etiqueta"}), 400
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        p = _achar_pedido_por_codigo(conn, cod)
+        if not p:
+            return jsonify({"error": f"essa etiqueta ({cod[:40]}) não é de nenhum pedido do WMS: confira se o pedido passou pela separação"}), 404
+        ja = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (p["ml_id"],)).fetchone()
+        conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (p["ml_id"],))
+        conn.execute("INSERT INTO saida_bipes (ml_id, codigo, por, em) VALUES (?,?,?,?)", (p["ml_id"], cod[:120], _quem_saida(), int(time.time())))
+    aviso = None
+    if p.get("status") != "CONCLUIDO" and _tipo_saida(p) != "COMERCIAL":
+        aviso = f"ATENÇÃO: esse pedido está {p.get('status')} no WMS — não foi expedido (sem NF/etiqueta pelo sistema)"
+    return jsonify({"success": True, "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": _tipo_saida(p),
+                    "repetido": bool(ja), "aviso": aviso})
+
+
+@mapa_routes.post("/saida/desfazer")
+@login_required
+def saida_desfazer():
+    mid = str((request.get_json(silent=True) or {}).get("ml_id") or "")
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (mid,))
+    return jsonify({"success": True})
 
 
 @mapa_routes.get("/mapa/status")
