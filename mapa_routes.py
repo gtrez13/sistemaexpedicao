@@ -607,6 +607,57 @@ def etiqueta_ml(ml_id):
     return jsonify({"success": True, "zpl": zpl, "shipment_id": ship, "status": st, "substatus": sub, "via": "ml"})
 
 
+_com_ok = False
+
+
+def _bling_svc():
+    try:
+        from services.bling_service import BlingService
+        return BlingService()
+    except Exception:
+        return None
+
+
+@mapa_routes.get("/comercial/info")
+@login_required
+def comercial_info():
+    """Pedidos do Comercial em aberto no WMS -> nº do PV e TRANSPORTADORA do pedido de venda no Bling.
+    Guarda em comercial_info (só pergunta ao Bling o que ainda não sabe; sem transportadora, pergunta de novo a cada 15 min)."""
+    global _com_ok
+    with db_session() as conn:
+        if not _com_ok:
+            conn.execute("CREATE TABLE IF NOT EXISTS comercial_info (ml_id TEXT PRIMARY KEY, pv_numero TEXT, "
+                         "transportadora TEXT, servico TEXT, atualizado_em BIGINT)")
+            _com_ok = True
+        peds = [dict(r) for r in conn.execute(
+            "SELECT * FROM pedidos WHERE origem='COMERCIAL' AND status IN ('PENDENTE','PARCIAL','SEPARADO')").fetchall()]
+        cache = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM comercial_info").fetchall()}
+    agora, out, b = int(time.time()), {}, None
+    for p in peds:
+        c = cache.get(p["ml_id"])
+        if not c or (not c.get("transportadora") and agora - int(c.get("atualizado_em") or 0) > 900):
+            pv = p.get("bling_pedido_venda_id")
+            if pv:
+                b = b or _bling_svc()
+                try:
+                    d = (b._get_json(f"/pedidos/vendas/{int(pv)}").get("data") or {}) if b else {}
+                    t = d.get("transporte") or {}
+                    vol = (t.get("volumes") or [{}])[0] or {}
+                    c = {"ml_id": p["ml_id"], "pv_numero": str(d.get("numero") or p.get("bling_numero") or ""),
+                         "transportadora": ((t.get("contato") or {}).get("nome") or "").strip() or None,
+                         "servico": (vol.get("servico") or "").strip() or None, "atualizado_em": agora}
+                    with db_session() as conn:
+                        conn.execute("DELETE FROM comercial_info WHERE ml_id=?", (p["ml_id"],))
+                        conn.execute("INSERT INTO comercial_info (ml_id, pv_numero, transportadora, servico, atualizado_em) VALUES (?,?,?,?,?)",
+                                     (c["ml_id"], c["pv_numero"], c["transportadora"], c["servico"], agora))
+                except Exception as e:
+                    _slowlog.warning("comercial_info %s: %s", p["ml_id"], e)
+        c = c or {}
+        out[p["ml_id"]] = {"bling_numero": c.get("pv_numero") or p.get("bling_numero"),
+                           "transportadora": c.get("transportadora"), "servico": c.get("servico")}
+    return jsonify({"pedidos": out})
+
+
 @mapa_routes.get("/comercial/pv/<ml_id>")
 @login_required
 def comercial_pv(ml_id):
