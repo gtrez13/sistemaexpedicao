@@ -934,7 +934,10 @@ def _venda_bling(numero_venda):
 # Fluxo: _plano_nf_dev monta TUDO sem gravar nada (é a "prévia"/teste); nf_dev_gerar usa o mesmo plano e cria.
 DEPOSITO_LOCAL = os.environ.get("BLING_DEPOSITO_LOCAL", "Local")
 DEPOSITO_DEFEITOS = os.environ.get("BLING_DEPOSITO_DEFEITOS", "Defeitos / Garantia")
-NATUREZA_DEVOLUCAO = os.environ.get("BLING_NATUREZA_DEVOLUCAO", "Devolução de mercadorias")
+NATUREZA_DEVOLUCAO = os.environ.get("BLING_NATUREZA_DEVOLUCAO", "Devolução de mercadorias")          # cliente com IE (contribuinte)
+# cliente CPF ou sem IE = não contribuinte / consumidor final -> naturezas próprias do Bling da LHVMED (dentro / fora de SP)
+NATUREZA_DEV_NC_SP = os.environ.get("BLING_NATUREZA_DEV_NC_SP", "15101723921")
+NATUREZA_DEV_NC_FORA = os.environ.get("BLING_NATUREZA_DEV_NC_FORA", "15101723906")
 NF_DEV_EMAIL_PADRAO = os.environ.get("NF_DEV_EMAIL_PADRAO", "").strip()        # usado só se nem o Bling nem o ML tiverem
 NF_DEV_TELEFONE_PADRAO = os.environ.get("NF_DEV_TELEFONE_PADRAO", "").strip()
 NOME_DEP = {"LOCAL": "Local", "DEFEITOS": "Defeitos / Garantia"}
@@ -1118,12 +1121,6 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
     ponto(True if cfop else False, "CFOP", f"venda {item.get('cfop')} -> devolução {cfop}" if cfop else f"não sei o CFOP de devolução para {item.get('cfop')}")
 
     b = BlingService()
-    try:
-        nat = _id_por_nome(b, "/naturezas-operacoes", NATUREZA_DEVOLUCAO)
-    except Exception as e:
-        nat = None
-        print(f"[NF-DEV] naturezas: {e}", flush=True)
-    ponto(True if nat else False, "Natureza de operação", f"{NATUREZA_DEVOLUCAO} ({nat})" if nat else f"não achei '{NATUREZA_DEVOLUCAO}' no Bling")
     if dep in NOME_DEP:
         try:
             plano["dep_id"] = _id_por_nome(b, "/depositos", DEPOSITO_LOCAL if dep == "LOCAL" else DEPOSITO_DEFEITOS)
@@ -1179,6 +1176,28 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
                   + ": complete no Bling antes de enviar, ou configure um padrão")
     plano["contato"] = cont
 
+    # natureza pelo tipo de cliente: CPF / sem IE = não contribuinte (consumidor final); dentro ou fora de SP pelo CFOP da venda
+    nao_contrib = len(doc) == 11 or not str(cont.get("ie") or "").strip()
+    cf_venda = _so_dig(item.get("cfop"))
+    dentro_sp = cf_venda.startswith("5") if cf_venda else str(end.get("uf") or "").upper() == "SP"
+    if nao_contrib:
+        cont["contribuinte"] = 9
+        nat_alvo = NATUREZA_DEV_NC_SP if dentro_sp else NATUREZA_DEV_NC_FORA
+        por_que = f"cliente {'CPF' if len(doc) == 11 else 'sem IE'} = não contribuinte / consumidor final, {'dentro de SP' if dentro_sp else 'fora de SP'}"
+    else:
+        nat_alvo = NATUREZA_DEVOLUCAO
+        por_que = "cliente com IE = contribuinte"
+    nat, nat_desc = None, nat_alvo
+    try:
+        for x in (b._get_json("/naturezas-operacoes", params={"limite": 100}).get("data") or []):
+            if str(x.get("id")) == str(nat_alvo) or _norm_txt(x.get("descricao")) == _norm_txt(nat_alvo):
+                nat, nat_desc = int(x["id"]), str(x.get("descricao") or "").strip()
+                break
+    except Exception as e:
+        print(f"[NF-DEV] naturezas: {e}", flush=True)
+    plano["natureza"] = nat_desc
+    ponto(True if nat else False, "Natureza de operação", f"{nat_desc} ({nat}) · {por_que}" if nat else f"não achei a natureza '{nat_alvo}' no Bling ({por_que})")
+
     # nota duplicada? (nota de entrada do mesmo cliente com esse item, depois da venda)
     if checar_duplicata:
         try:
@@ -1231,7 +1250,20 @@ def _conferir_criada(det, plano):
         {"ok": True if c.get("email") else None, "item": "E-mail na nota", "detalhe": c.get("email") or "vazio: complete antes de enviar"},
         {"ok": True if c.get("telefone") else None, "item": "Telefone na nota", "detalhe": c.get("telefone") or "vazio: complete antes de enviar"},
         {"ok": True if itens else False, "item": "Item / CFOP na nota", "detalhe": ", ".join(f"{i.get('codigo')} x{i.get('quantidade')} CFOP {i.get('cfop')}" for i in itens) or "sem itens"},
+        {"ok": True, "item": "Natureza", "detalhe": plano.get("natureza") or str((det.get("naturezaOperacao") or {}).get("id") or "-")},
+        {"ok": True, "item": "ICMS na nota", "detalhe": _icms_txt(itens)},
     ]
+
+
+def _icms_txt(itens):
+    tot, partes = 0.0, []
+    for i in itens:
+        ic = (i.get("impostos") or {}).get("icms") or {}
+        v = float(ic.get("valor") or 0)
+        tot += v
+        partes.append(f"{i.get('codigo')}: alíquota {ic.get('aliquota', '-')}% = R$ {v:.2f}".replace(".", ","))
+    return (f"total R$ {tot:.2f}".replace(".", ",") + (f" ({'; '.join(partes)})" if partes else "")
+            + (" — sem ICMS" if not tot else " — crédito do ICMS da venda (confira com o contador)"))
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>/nf-devolucao")
