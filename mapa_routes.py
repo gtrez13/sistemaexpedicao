@@ -379,6 +379,167 @@ def _servir(arq):
     return resp
 
 
+# ───────────────────────── giro (vendas) x posição ─────────────────────────
+# Picking: quem sai mais tem que ficar mais perto do INÍCIO da rota. Mesma ordem da rota do celular (utils/rota.js).
+def _rank(pp, p):
+    pp, p = int(pp), int(p or 0)
+    if pp in (51, 52):
+        return 8000 + (pp - 51)                       # refrigerador: sempre o último
+    if 101 <= pp <= 111:
+        return 10 + (pp - 101) * 2 + p / 10           # cestas
+    if pp in (31, 32):
+        return 50 + (pp - 31) * 10 + p                # veterinário
+    if 1 <= pp <= 5:
+        return pp * 100 + p
+    if 6 <= pp <= 10:
+        return (pp - 5) * 100 + 20 + p
+    return 9000
+
+
+def _zona(pp):
+    pp = int(pp)
+    return "cesta" if pp > 100 else "vet" if pp in (31, 32) else "refri" if pp in (51, 52) else "pp"
+
+
+def _rotulo(pp, p):
+    pp = int(pp)
+    if pp > 100:
+        return f"Cesta {pp - 100} · F{p}"
+    if pp in (31, 32):
+        return f"Vet {pp - 30} · P{p}"
+    if pp in (51, 52):
+        return "Refrigerador"
+    return f"PP{pp} · P{p}"
+
+
+def _vendas_por_sku(dias):
+    """{sku_key: {sku, nome, pedidos, unidades}} dos pedidos que passaram pelo WMS no período (kits já abertos)."""
+    desde = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - dias * 86400))
+    sql = ("SELECT LOWER(TRIM(pr.sku)) AS k, MAX(pr.sku) AS sku, MAX(pr.nome) AS nome, "
+           "COUNT(DISTINCT pp.pedido_id) AS pedidos, COALESCE(SUM(pp.quantidade),0) AS unidades "
+           "FROM pedido_produtos pp JOIN produtos pr ON pr.id = pp.produto_id JOIN pedidos pe ON pe.id = pp.pedido_id "
+           "WHERE pe.criado_em >= ? GROUP BY LOWER(TRIM(pr.sku))")
+    try:
+        with db_session() as conn:
+            rows = conn.execute(sql, (desde,)).fetchall()
+            tot = conn.execute("SELECT COUNT(*) AS n FROM pedidos WHERE criado_em >= ?", (desde,)).fetchone()["n"]
+    except Exception as e:                    # criado_em em formato estranho: usa tudo, avisando
+        _slowlog.warning("giro: filtro por data falhou (%s); usando todo o histórico", e)
+        with db_session() as conn:
+            rows = conn.execute(sql.replace("WHERE pe.criado_em >= ? ", ""), ()).fetchall()
+            tot = conn.execute("SELECT COUNT(*) AS n FROM pedidos").fetchone()["n"]
+        dias = None
+    return {r["k"]: {"sku": r["sku"], "nome": r["nome"], "pedidos": int(r["pedidos"] or 0),
+                     "unidades": int(r["unidades"] or 0)} for r in rows if r["k"]}, int(tot or 0), dias
+
+
+@mapa_routes.get("/mapa/giro")
+@login_required
+def giro():
+    """Mais vendidos x onde estão; trocas sugeridas (só dentro da mesma zona: porta palet com porta palet,
+    cesta com cesta; refrigerador e veterinário ficam onde estão); o que vende e não está no mapa."""
+    _garantir_tabelas()
+    dias = max(7, min(365, request.args.get("dias", default=90, type=int)))
+    vendas, total_pedidos, dias_ok = _vendas_por_sku(dias)
+    with db_session() as conn:
+        locs = conn.execute("SELECT sku_key, sku, nome, porta_palet, posicao FROM mapa_localizacao").fetchall()
+
+    pos_do = {}                                   # sku_key -> [loc...]
+    for l in locs:
+        pos_do.setdefault(l["sku_key"], []).append(
+            {"pp": int(l["porta_palet"]), "p": int(l["posicao"]), "rank": _rank(l["porta_palet"], l["posicao"]),
+             "label": _rotulo(l["porta_palet"], l["posicao"]), "zona": _zona(l["porta_palet"]),
+             "sku": l["sku"], "nome": l["nome"]})
+
+    # curva ABC por número de pedidos (A = 80% das saídas, B = 15%, C = resto)
+    ordem = sorted(vendas.items(), key=lambda kv: (-kv[1]["pedidos"], -kv[1]["unidades"]))
+    soma = sum(v["pedidos"] for _, v in ordem) or 1
+    acum, classe = 0, {}
+    for k, v in ordem:
+        acum += v["pedidos"]
+        classe[k] = "A" if acum <= soma * 0.80 or not classe else "B" if acum <= soma * 0.95 else "C"
+
+    def info(k):
+        v = vendas.get(k) or {}
+        ps = sorted(pos_do.get(k, []), key=lambda x: x["rank"])
+        nome = v.get("nome") or (ps[0]["nome"] if ps else None)
+        return {"sku": v.get("sku") or (ps[0]["sku"] if ps else k), "nome": nome,
+                "pedidos": v.get("pedidos", 0), "unidades": v.get("unidades", 0), "classe": classe.get(k, "C"),
+                "posicoes": [{"pp": x["pp"], "p": x["p"], "label": x["label"]} for x in ps]}
+
+    # trocas: o que sai muito e está longe  <->  o que quase não sai e está perto (mesma zona)
+    trocas = []
+    for zona in ("pp", "cesta"):
+        itens = []
+        for k, ps in pos_do.items():
+            pz = [x for x in ps if x["zona"] == zona]
+            if pz:
+                best = min(pz, key=lambda x: x["rank"])
+                itens.append((k, (vendas.get(k) or {}).get("pedidos", 0), best))
+        usados = set()
+        for k, ped, loc in sorted(itens, key=lambda t: -t[1]):
+            if ped < 3 or k in usados:
+                continue
+            minimo = 50 if zona == "pp" else 4           # pp: outra coluna; cesta: 2 cestas mais perto
+            cand = [(k2, ped2, loc2) for k2, ped2, loc2 in itens
+                    if k2 not in usados and k2 != k and loc2["rank"] < loc["rank"] - minimo and ped2 * 3 <= ped]
+            if not cand:
+                continue
+            k2, ped2, loc2 = min(cand, key=lambda t: (t[2]["rank"], t[1]))
+            usados.update({k, k2})
+            dif = loc["rank"] - loc2["rank"]
+            perto = round(dif / 100) if zona == "pp" else round(dif / 2)
+            perto_txt = (f"{perto} coluna{'s' if perto != 1 else ''}" if zona == "pp" else f"{perto} cesta{'s' if perto != 1 else ''}") + " mais perto do início"
+            trocas.append({
+                "zona": zona, "perto": perto_txt, "ganho": round((ped - ped2) * max(perto, 1)),
+                "a": {**info(k), "de": {"pp": loc["pp"], "p": loc["p"], "label": loc["label"]},
+                      "para": {"pp": loc2["pp"], "p": loc2["p"], "label": loc2["label"]}},
+                "b": {**info(k2), "de": {"pp": loc2["pp"], "p": loc2["p"], "label": loc2["label"]},
+                      "para": {"pp": loc["pp"], "p": loc["p"], "label": loc["label"]}},
+            })
+    trocas = sorted((t for t in trocas if t["ganho"] >= 10), key=lambda t: -t["ganho"])   # troca que vale o trabalho
+
+    sem_lugar = [info(k) for k, v in ordem if v["pedidos"] >= 2 and k not in pos_do][:40]
+    top = [info(k) for k, _ in ordem[:40]]
+    parados = sorted((info(k) for k in pos_do if not (vendas.get(k) or {}).get("pedidos")),
+                     key=lambda x: _rank(x["posicoes"][0]["pp"], x["posicoes"][0]["p"]))
+    return jsonify({
+        "dias": dias_ok, "pedidos": total_pedidos, "skus_vendidos": len(vendas), "skus_no_mapa": len(pos_do),
+        "fonte": "pedidos que passaram pelo WMS (Mercado Livre, Shopee e Comercial), contando cada pedido uma vez por produto; kits contam pelos componentes",
+        "trocas": trocas[:20], "sem_lugar": sem_lugar, "top": top, "parados": parados[:60],
+    })
+
+
+@mapa_routes.post("/mapa/trocar")
+@login_required
+def trocar():
+    """Depois de trocar fisicamente: A vai para a posição de B e B para a de A (só essas duas linhas do mapa)."""
+    d = request.get_json(silent=True) or {}
+    try:
+        a, b = d["a"], d["b"]
+        ka, kb = _key(a["sku"]), _key(b["sku"])
+        pa, qa, pb, qb = int(a["pp"]), int(a["p"]), int(b["pp"]), int(b["p"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "mande a:{sku,pp,p} e b:{sku,pp,p}"}), 400
+    _garantir_tabelas()
+    agora = int(time.time())
+    with db_session() as conn:
+        ra = conn.execute("SELECT * FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?", (ka, pa, qa)).fetchone()
+        rb = conn.execute("SELECT * FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?", (kb, pb, qb)).fetchone()
+        if not ra or not rb:
+            return jsonify({"error": "o mapa mudou desde a sugestão; atualize a lista"}), 409
+        conn.execute("DELETE FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?", (ka, pa, qa))
+        conn.execute("DELETE FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?", (kb, pb, qb))
+        for r, pp, pos in ((ra, pb, qb), (rb, pa, qa)):
+            conn.execute("""
+                INSERT INTO mapa_localizacao (sku_key, sku, nome, foto, porta_palet, posicao, atualizado_em)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT (sku_key, porta_palet, posicao) DO UPDATE SET atualizado_em=EXCLUDED.atualizado_em
+            """, (r["sku_key"], r["sku"], r["nome"], r["foto"], pp, pos, agora))
+    _slowlog.info("mapa: troca %s %s-%s <-> %s %s-%s", ka, pa, qa, kb, pb, qb)
+    return jsonify({"success": True})
+
+
 @mapa_routes.get("/mapa/status")
 @login_required
 def status():
