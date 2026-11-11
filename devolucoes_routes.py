@@ -1147,6 +1147,11 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
     if not cont.get("ie"):
         cont.setdefault("contribuinte", 9)
     ponto(True if cont.get("nome") else False, "Cliente", f"{cont.get('nome') or 'sem nome'} · doc {doc or 'FALTA'}")
+    t_wms = {w for w in _norm_txt(r["cliente"]).split() if len(w) > 2}
+    t_nf = {w for w in _norm_txt(cont.get("nome")).split() if len(w) > 2}
+    if t_wms and t_nf and not (t_wms & t_nf):
+        ponto(None, "Nome diferente", f"na devolução está '{r['cliente']}', na NF de venda '{cont.get('nome')}' (quem recebeu x quem comprou). "
+                                      "A nota sai no nome da NF de venda, que é o certo; só confira se é a venda certa")
     ponto(True if len(doc) in (11, 14) else False, "CPF/CNPJ do cliente",
           (doc + (" (veio do ML)" if doc_veio_ml else " (cadastro do Bling)")) if doc else "falta (nem o Bling nem o ML têm)")
     falta_end = [c for c in principais if not str(end.get(c) or "").strip()]
@@ -1154,7 +1159,8 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
           (f"falta: {', '.join(falta_end)} (nem o Bling nem o ML têm completo)" if falta_end
            else f"{end.get('endereco')}, {end.get('numero')} · {end.get('municipio')}/{end.get('uf')}")
           + (" (veio do ML: o cadastro do Bling estava incompleto)" if end_veio_ml else ""))
-    for campo, nome, padrao in (("email", "E-mail do cliente", NF_DEV_EMAIL_PADRAO), ("telefone", "Telefone do cliente", NF_DEV_TELEFONE_PADRAO)):
+    for campo, nome, padrao in (("email", "E-mail do cliente", os.environ.get("NF_DEV_EMAIL_PADRAO", NF_DEV_EMAIL_PADRAO).strip()),
+                                ("telefone", "Telefone do cliente", os.environ.get("NF_DEV_TELEFONE_PADRAO", NF_DEV_TELEFONE_PADRAO).strip())):
         v = str(cont.get(campo) or "").strip()
         if v:
             ponto(True, nome, f"{v} (cadastro do Bling)")
@@ -1200,7 +1206,11 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
                 for n in lst:
                     if str((n.get("contato") or {}).get("id")) != str((venda.get("contato") or {}).get("id")):
                         continue
+                    if str(n.get("id")) == str(venda.get("id")):
+                        continue
                     dn = b._get_json(f"/nfe/{n['id']}").get("data") or {}
+                    if str(dn.get("tipo")) != "0" or int(dn.get("situacao") or 0) in (2, 9):   # só ENTRADA válida (não cancelada/denegada)
+                        continue
                     if any(str(i.get("codigo") or "").strip().upper() == sku for i in dn.get("itens") or []):
                         plano["duplicada"] = dn
                         break
@@ -1208,7 +1218,11 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
                     break
             if plano["duplicada"]:
                 dn = plano["duplicada"]
-                ponto(False, "Nota duplicada", f"já existe nota de entrada desse cliente com esse produto: NF {dn.get('numero')} ({SIT_NF.get(int(dn.get('situacao') or 0), '')})")
+                sit = int(dn.get("situacao") or 0)
+                quem = "importada / feita fora do Bling (ex.: o ML)" if sit == 7 else "feita no Bling"
+                ponto(False, "Nota de devolução já existe",
+                      f"NF {str(dn.get('numero') or '').lstrip('0')}/{dn.get('serie')} de {str(dn.get('dataEmissao') or '')[:10]} "
+                      f"({SIT_NF.get(sit, sit)}, {quem}): não precisa gerar, só ligar à devolução")
             else:
                 ponto(True, "Nota duplicada", "nenhuma nota de devolução desse cliente com esse produto no Bling")
         except Exception as e:
@@ -1286,7 +1300,10 @@ def nf_dev_previa(did):
     except Exception as e:
         print(f"[NF-DEV] prévia {did}: {e}", flush=True)
         return jsonify({"error": f"Falhou ao montar a prévia: {e}"}), 422
+    dn = p["duplicada"]
     return jsonify({"pode_gerar": not p["bloqueio"] and p["dep"] in NOME_DEP, "bloqueio": p["bloqueio"], "pontos": p["pontos"],
+                    "duplicada": {"numero": str(dn.get("numero") or "").lstrip("0"), "serie": dn.get("serie"),
+                                  "situacao": SIT_NF.get(int(dn.get("situacao") or 0))} if dn else None,
                     "sugerido": p["sugerido"], "deposito": p["dep"], "venda_nf": p["venda_nf"],
                     "payload": p["payloads"][0] if p["payloads"] else None})
 
@@ -1309,11 +1326,12 @@ def nf_dev_gerar(did):
         return jsonify({"error": f"Falhou ao montar a nota: {e}"}), 422
     if p["duplicada"]:
         dn = p["duplicada"]
+        num = str(dn.get("numero") or "").lstrip("0")
+        msg = f"Ligada à NF {num}/{dn.get('serie')} que já existia no Bling ({SIT_NF.get(int(dn.get('situacao') or 0), '')}). O WMS não criou outra nem mexeu no estoque."
         with db_session() as conn:
-            conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_msg=?, nf_dev_em=? WHERE id=?",
-                         (str(dn.get("id")), str(dn.get("numero")), "já existia no Bling (o WMS não criou outra)", int(time.time()), did))
-        return jsonify({"error": f"Já existe nota de devolução desse cliente com esse produto no Bling: NF {dn.get('numero')}. Não criei outra.",
-                        "ja": True, "pontos": p["pontos"]}), 409
+            conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_msg=?, nf_dev_em=?, nf_dev_por=NULL WHERE id=?",
+                         (str(dn.get("id")), num, msg, int(time.time()), did))
+        return jsonify({"success": True, "ligada": True, "numero": num, "msg": msg, "pontos": p["pontos"]})
     if p["bloqueio"]:
         return jsonify({"error": p["bloqueio"], "pontos": p["pontos"]}), 409
     if p["dep"] not in NOME_DEP or not p["dep_id"]:

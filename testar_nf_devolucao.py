@@ -9,6 +9,9 @@ Uso:
 """
 import json
 import sys
+import warnings
+
+warnings.filterwarnings("ignore")
 from collections import Counter
 
 try:
@@ -44,9 +47,13 @@ for r in rows:
         continue
     for pt in p["pontos"]:
         print(f"   {MARCA[pt['ok']]} {pt['item']}: {pt['detalhe']}")
-        if pt["ok"] is not True:
+        if pt["item"] == "Nota de devolução já existe":
+            mapa["já tem nota de devolução (não precisa gerar, só ligar)"] += 1
+        elif pt["ok"] is not True:
             mapa[f"{'TRAVA' if pt['ok'] is False else 'aviso'} · {pt['item']}"] += 1
-    if p["bloqueio"]:
+    if p["duplicada"]:
+        print("   => JÁ TEM NOTA: na prancheta o botão só liga essa nota à devolução (não cria outra)")
+    elif p["bloqueio"]:
         print(f"   => NÃO gera: {p['bloqueio']}")
     elif p["dep"] not in d.NOME_DEP:
         print("   => gera depois que o operador escolher o depósito")
