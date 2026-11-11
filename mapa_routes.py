@@ -725,21 +725,25 @@ def _tipo_saida(p):
 
 
 def _status_envio_ml(ml, ship):
+    """-> (status, substatus, data limite de despacho 'AAAA-MM-DD' ou None)"""
     if not ship:
-        return None, None
+        return None, None, None
     agora = time.time()
     c = _ship_cache.get(str(ship))
     if c and (agora - c[0] < 180 or (c[1] in ("shipped", "delivered", "cancelled", "not_delivered") and agora - c[0] < 86400)):
-        return c[1], c[2]
+        return c[1], c[2], c[3]
     try:
         r = ml._request("GET", f"/shipments/{ship}")
         if r is not None and r.status_code == 200:
             j = r.json()
-            _ship_cache[str(ship)] = (agora, j.get("status"), j.get("substatus"))
-            return j.get("status"), j.get("substatus")
+            lt = j.get("lead_time") or {}
+            lim = ((lt.get("estimated_schedule_limit") or {}).get("date") or (lt.get("buffering") or {}).get("date")
+                   or ((j.get("shipping_option") or {}).get("estimated_schedule_limit") or {}).get("date") or "")[:10] or None
+            _ship_cache[str(ship)] = (agora, j.get("status"), j.get("substatus"), lim)
+            return j.get("status"), j.get("substatus"), lim
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
 def _quem_saida():
@@ -785,25 +789,34 @@ def saida_lista():
         if tipo == "FULL":
             continue
         b = bips.get(p["ml_id"])
-        st, sub = (None, None)
+        st, sub, lim = (None, None, None)
         if tipo in ("FLEX", "COLETA") and p.get("status") == "CONCLUIDO" and ml and p.get("ml_shipping_id"):
             c = _ship_cache.get(str(p.get("ml_shipping_id")))
-            st, sub = (c[1], c[2]) if c else (None, None)
+            st, sub, lim = (c[1], c[2], c[3]) if c else (None, None, None)
         if st in ("cancelled",):
             continue
+        # dia em que TEM que sair: limite do ML > prazo gravado no WMS > (sem data) dia em que foi expedido
+        exp_dia = str(p.get("atualizado_em") or "")[:10] if p.get("status") == "CONCLUIDO" else ""
+        dia_saida = lim or str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10] or exp_dia or None
+        if dia_saida and not re.match(r"\d{4}-\d{2}-\d{2}$", dia_saida):
+            dia_saida = None
         if bip_hoje(p["ml_id"]):
             situacao = "carregado"
         elif st in ("shipped", "delivered", "not_delivered"):
             situacao = "saiu"
+        elif dia_saida and dia_saida > hoje:
+            situacao = "outro_dia"
+        elif tipo in ("SHOPEE", "COMERCIAL") and p.get("status") == "CONCLUIDO" and dia_saida and dia_saida < hoje:
+            continue        # sem como confirmar a coleta: expedido em dia anterior conta como já saído
         elif p.get("status") == "CONCLUIDO":
             situacao = "pronto"
         else:
             situacao = "nao_expedido"
         out.append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo, "status_wms": p.get("status"),
-                    "envio": st, "envio_sub": sub, "situacao": situacao, "prazo": str(p.get("prazo_envio") or p.get("ship_by_date") or ""),
+                    "envio": st, "envio_sub": sub, "situacao": situacao, "dia_saida": dia_saida, "prazo": str(p.get("prazo_envio") or p.get("ship_by_date") or ""),
                     "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
                     "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None})
-    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "saiu": 3}
+    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "outro_dia": 3, "saiu": 4}
     out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x["expedido_em"] or "")))
     return jsonify({"pedidos": out, "hoje": hoje})
 
