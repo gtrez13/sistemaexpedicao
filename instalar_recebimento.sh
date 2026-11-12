@@ -35,6 +35,7 @@ Só LÊ o Bling (pedidos de compra / contatos). Nunca lança nota.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -129,6 +130,7 @@ def _garantir_tabelas():
                     c.execute(f"ALTER TABLE {tb} ADD COLUMN {col} TEXT")
                 except Exception:
                     pass
+        c.execute("CREATE TABLE IF NOT EXISTS receb_pc_cache (cnpj TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
@@ -218,36 +220,146 @@ def _bling():
         return None
 
 
-def pedidos_compra_do_fornecedor(cnpj: str) -> list:
-    """Pedidos de compra abertos/em andamento do fornecedor (Bling), com itens. Cache 10 min."""
-    cnpj = _dig(cnpj)
-    agora = time.time()
-    if cnpj in _pc_cache and agora - _pc_cache[cnpj][0] < 600:
-        return _pc_cache[cnpj][1]
-    out = []
+# ── pedidos de compra do fornecedor: cache rápido (memória + banco), atualiza em segundo plano ──
+PC_FRESCO_S = int(os.environ.get("RECEB_PC_FRESCO_S", "120"))      # até 2 min: usa direto
+PC_VELHO_MAX_S = 6 * 3600                                          # até 6 h: usa e atualiza em segundo plano
+PC_DET_TTL_S = 30 * 60                                             # detalhe de cada pedido (itens) vale 30 min
+_pc_det_cache: dict = {}        # pc_id -> (ts, total, dict pronto)
+_pc_atualizando: set = set()
+_pc_lock = threading.Lock()
+_rl_lock = threading.Lock()
+_rl_ultimo = [0.0]
+
+
+def _ritmo():
+    """No máximo ~3 chamadas/s ao Bling somando todas as threads (limite da API)."""
+    with _rl_lock:
+        espera = _rl_ultimo[0] + 0.34 - time.time()
+        if espera > 0:
+            time.sleep(espera)
+        _rl_ultimo[0] = time.time()
+
+
+def _pc_formatar(pc, det):
+    return {"id": pc["id"], "numero": pc.get("numero"), "data": pc.get("data"), "prevista": pc.get("dataPrevista"),
+            "total": pc.get("total"), "situacao": (pc.get("situacao") or {}).get("valor"),
+            "itens": [{"sku": (i.get("produto") or {}).get("codigo"), "cprod": i.get("codigoFornecedor"),
+                       "descricao": i.get("descricao"), "qtd": i.get("quantidade"),
+                       "atendido": (i.get("notaFiscal") or {}).get("quantidade") or 0, "valor": i.get("valor")}
+                      for i in det.get("itens") or []]}
+
+
+def _buscar_pcs(cnpj: str) -> list | None:
+    """Vai ao Bling: lista os pedidos em aberto/em andamento e só detalha os que mudaram (3 em paralelo, no ritmo da API)."""
+    from concurrent.futures import ThreadPoolExecutor
     b = _bling()
-    if b and cnpj:
-        try:
-            ct = b._get_json("/contatos", {"numeroDocumento": cnpj, "limite": 5}).get("data") or []
-            ids = [x["id"] for x in ct if _dig(x.get("numeroDocumento")) == cnpj]
-            for fid in ids[:2]:
-                for sit in (0, 3):      # em aberto, em andamento
-                    lst = b._get_json("/pedidos/compras", {"idFornecedor": fid, "idsSituacoes[]": sit, "limite": 50}).get("data") or []
-                    for pc in lst:
-                        det = (b._get_json(f"/pedidos/compras/{pc['id']}") or {}).get("data") or {}
-                        out.append({
-                            "id": pc["id"], "numero": pc.get("numero"), "data": pc.get("data"), "prevista": pc.get("dataPrevista"),
-                            "total": pc.get("total"), "situacao": (pc.get("situacao") or {}).get("valor"),
-                            "itens": [{"sku": (i.get("produto") or {}).get("codigo"), "cprod": i.get("codigoFornecedor"),
-                                       "descricao": i.get("descricao"), "qtd": i.get("quantidade"),
-                                       "atendido": (i.get("notaFiscal") or {}).get("quantidade") or 0, "valor": i.get("valor")}
-                                      for i in det.get("itens") or []],
-                        })
-                        time.sleep(0.35)
-        except Exception as e:
-            print(f"⚠️ recebimento: pedidos de compra do Bling falharam: {e}", flush=True)
-    _pc_cache[cnpj] = (agora, out)
+    if not (b and cnpj):
+        return None
+    t0 = time.time()
+    try:
+        _ritmo()
+        ct = b._get_json("/contatos", {"numeroDocumento": cnpj, "limite": 5}).get("data") or []
+        ids = [x["id"] for x in ct if _dig(x.get("numeroDocumento")) == cnpj]
+        lista = []
+        for fid in ids[:2]:
+            for sit in (0, 3):      # em aberto, em andamento
+                _ritmo()
+                lista += b._get_json("/pedidos/compras", {"idFornecedor": fid, "idsSituacoes[]": sit, "limite": 50}).get("data") or []
+    except Exception as e:
+        print(f"⚠️ recebimento: pedidos de compra do Bling falharam: {e}", flush=True)
+        return None
+    agora = time.time()
+
+    def detalhe(pc):
+        c0 = _pc_det_cache.get(pc["id"])
+        if c0 and agora - c0[0] < PC_DET_TTL_S and str(c0[1]) == str(pc.get("total")):
+            return c0[2]
+        bb = _bling()
+        _ritmo()
+        det = (bb._get_json(f"/pedidos/compras/{pc['id']}") or {}).get("data") or {}
+        f = _pc_formatar(pc, det)
+        _pc_det_cache[pc["id"]] = (time.time(), pc.get("total"), f)
+        return f
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            out = list(ex.map(detalhe, lista))
+    except Exception as e:
+        print(f"⚠️ recebimento: detalhe dos pedidos de compra falhou: {e}", flush=True)
+        return None
+    print(f"[RECEB] pedidos de compra {cnpj}: {len(out)} em {time.time() - t0:.1f}s", flush=True)
     return out
+
+
+def _pc_guardar(cnpj, out):
+    _pc_cache[cnpj] = (time.time(), out)
+    try:
+        with db_session() as c:
+            c.execute("DELETE FROM receb_pc_cache WHERE cnpj=?", (cnpj,))
+            c.execute("INSERT INTO receb_pc_cache (cnpj, dados, em) VALUES (?,?,?)", (cnpj, json.dumps(out, ensure_ascii=False), _agora()))
+    except Exception as e:
+        print(f"⚠️ recebimento: cache de pedidos no banco: {e}", flush=True)
+
+
+def _pc_do_banco(cnpj):
+    try:
+        with db_session() as c:
+            r = c.execute("SELECT dados, em FROM receb_pc_cache WHERE cnpj=?", (cnpj,)).fetchone()
+        if r:
+            return (float(r["em"]), json.loads(r["dados"]))
+    except Exception:
+        pass
+    return None
+
+
+def _atualizar_em_segundo_plano(cnpj):
+    with _pc_lock:
+        if cnpj in _pc_atualizando:
+            return
+        _pc_atualizando.add(cnpj)
+
+    def rodar():
+        try:
+            out = _buscar_pcs(cnpj)
+            if out is not None:
+                _pc_guardar(cnpj, out)
+        finally:
+            with _pc_lock:
+                _pc_atualizando.discard(cnpj)
+    threading.Thread(target=rodar, daemon=True).start()
+
+
+def pedidos_compra_do_fornecedor(cnpj: str, fresco: bool = False) -> list:
+    """Pedidos de compra abertos/em andamento do fornecedor (Bling), com itens.
+    Rápido: até 2 min usa o que já tem; até 6 h usa o que tem e atualiza em segundo plano; fresco=True vai ao Bling na hora."""
+    cnpj = _dig(cnpj)
+    if not cnpj:
+        return []
+    ent = _pc_cache.get(cnpj)
+    if not ent:
+        ent = _pc_do_banco(cnpj)
+        if ent:
+            _pc_cache[cnpj] = ent
+    if ent and not fresco:
+        idade = time.time() - ent[0]
+        if idade < PC_FRESCO_S:
+            return ent[1]
+        if idade < PC_VELHO_MAX_S:
+            _atualizar_em_segundo_plano(cnpj)
+            return ent[1]
+    out = _buscar_pcs(cnpj)
+    if out is None:
+        return ent[1] if ent else []
+    _pc_guardar(cnpj, out)
+    return out
+
+
+def preaquecer_pcs(cnpjs):
+    """Abre a lista de notas -> já busca os pedidos dos fornecedores das notas em aberto (a nota abre na hora)."""
+    for cnpj in {_dig(x) for x in cnpjs if x}:
+        ent = _pc_cache.get(cnpj) or _pc_do_banco(cnpj)
+        if not ent or time.time() - ent[0] >= PC_FRESCO_S:
+            _atualizar_em_segundo_plano(cnpj)
 
 
 def _xml_bling_por_chave(chave: str):
@@ -628,13 +740,17 @@ def listar():
     sql += " ORDER BY id DESC LIMIT 300"
     with db_session() as c:
         rows = c.execute(sql, tuple(args)).fetchall()
+        # contagem de itens de todas as notas numa consulta só (antes era 1 consulta por nota)
+        cont = {int(x["nota_id"]): (int(x["n"]), int(x["ok"])) for x in c.execute(
+            "SELECT nota_id, COUNT(*) AS n, COALESCE(SUM(CASE WHEN qtd_conferida>=qtd_nf THEN 1 ELSE 0 END),0) AS ok "
+            "FROM receb_itens GROUP BY nota_id").fetchall()}
         out = []
         for r in rows:
             d = dict(r); d["valor"] = float(d["valor"] or 0)
             d["n_motivos"] = len([m for m in (r["motivos"] or "").split("\n") if m]); d.pop("motivos", None)
-            cnt = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN qtd_conferida>=qtd_nf THEN 1 ELSE 0 END),0) AS ok FROM receb_itens WHERE nota_id=?", (r["id"],)).fetchone()
-            d["n_itens"], d["itens_ok"] = int(cnt["n"]), int(cnt["ok"])
+            d["n_itens"], d["itens_ok"] = cont.get(int(r["id"]), (0, 0))
             out.append(d)
+    preaquecer_pcs([d["fornecedor_cnpj"] for d in out if d["status"] in ("aguardando", "conferindo")])
     return jsonify({"notas": out})
 
 
@@ -651,6 +767,11 @@ def resumo():
 @login_required
 def detalhe(nid):
     garantir_tabelas()
+    if request.args.get("fresco"):
+        with db_session() as c:
+            r0 = c.execute("SELECT fornecedor_cnpj FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        if r0:
+            pedidos_compra_do_fornecedor(r0["fornecedor_cnpj"], fresco=True)
     with db_session() as c:
         d = _nota_dict(c, nid)
         if not d:
@@ -788,6 +909,10 @@ def editar_item(nid, iid):
 @login_required
 def fechar(nid):
     garantir_tabelas()
+    with db_session() as c:
+        r0 = c.execute("SELECT fornecedor_cnpj FROM receb_notas WHERE id=?", (nid,)).fetchone()
+    if r0:
+        pedidos_compra_do_fornecedor(r0["fornecedor_cnpj"], fresco=True)   # decide com o pedido como está AGORA no Bling
     with db_session() as c:
         d = _nota_dict(c, nid)
         if not d:
