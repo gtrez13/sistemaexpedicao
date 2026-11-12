@@ -82,6 +82,10 @@ def garantir_tabelas():
             return
         _garantir_tabelas()
         _tabelas_ok = True
+    try:
+        _vigia_ligar()          # notas esperando ser importadas no Bling (depois de reiniciar o serviço)
+    except Exception:
+        pass
 
 
 def _garantir_tabelas():
@@ -419,6 +423,34 @@ def buscar_xml_por_chave(chave: str):
 
 
 # ───────────────────────── leitura ─────────────────────────
+def _txt_endereco(pp, pos):
+    pp, pos = int(pp), int(pos)
+    if pp > 100:
+        return f"C{pp - 100}-F{pos}", f"Cesta {pp - 100} · Fileira {pos}"
+    if pp in (31, 32):
+        return f"PPV{pp - 30}-P{pos}", f"Porta Palet Vet {pp - 30} · Posição P{pos}"
+    if pp in (51, 52):
+        return f"REF{pp - 50}-P{pos}", "Refrigerador"
+    return f"PP{pp}-P{pos}", f"Porta Palet {pp} · Posição P{pos}"
+
+
+def _enderecos(c, itens):
+    """Onde guardar: posições do SKU no Mapa do galpão (mapa_localizacao)."""
+    skus = sorted({str(it.get("sku") or "").strip().lower() for it in itens if it.get("sku")})
+    por = {}
+    if skus:
+        try:
+            with db_session() as c2:        # sessão própria: se a tabela do mapa não existir, não estraga a transação da nota
+                for r in c2.execute(f"SELECT sku_key, porta_palet, posicao FROM mapa_localizacao WHERE sku_key IN ({','.join('?' * len(skus))}) "
+                                    "ORDER BY porta_palet, posicao", tuple(skus)).fetchall():
+                    cod, txt = _txt_endereco(r["porta_palet"], r["posicao"])
+                    por.setdefault(r["sku_key"], []).append({"codigo": cod, "texto": txt})
+        except Exception:
+            pass
+    for it in itens:
+        it["enderecos"] = por.get(str(it.get("sku") or "").strip().lower(), [])
+
+
 def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
     r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
     if not r:
@@ -436,6 +468,7 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
                 it["lote_xml"], it["validade_xml"], it["lote_origem"] = lt, it.get("validade_xml") or vl, "descricao"
         it["pc_qtd"] = float(it["pc_qtd"]) if it["pc_qtd"] is not None else None
     d["itens"] = itens
+    _enderecos(c, itens)
     d["motivos"] = [m for m in (r["motivos"] or "").split("\n") if m]
     if com_pc:
         pcs = pedidos_compra_do_fornecedor(r["fornecedor_cnpj"])
@@ -1087,7 +1120,10 @@ def produtos():
 # então se parar no meio, rodar de novo continua de onde parou e nunca lança 2 vezes.
 ENTRADA_AUTO = lambda: os.environ.get("RECEB_ENTRADA_AUTO", "0") == "1"     # 1 = já dispara ao conferir
 DEP_LOCAL_ID = int(os.environ.get("BLING_DEPOSITO_LOCAL_ID", "10488672491"))
-ETAPAS_ENT = {"preparando": "Conferindo pedido, produtos e lotes no Bling", "pedido": "Mudando o pedido de compra para Atendido",
+ETAPAS_ENT = {"preparando": "Conferindo pedido, produtos e lotes no Bling", "nota": "Procurando a nota no Bling",
+              "robo": "Robô manifestando e importando a nota no Bling",
+              "aguardando_nota": "Esperando a nota ser manifestada e importada no Bling",
+              "vinculo": "Vinculando a nota ao pedido de compra", "pedido": "Mudando o pedido de compra para Atendido",
               "estoque": "Lançando o estoque no Local", "lotes": "Lançando os lotes", "contas": "Lançando as contas a pagar",
               "ok": "Entrada concluída", "erro": "Parou com erro", "desfazendo": "Desfazendo a entrada"}
 _ent_ativos: set = set()
@@ -1152,8 +1188,9 @@ def _ent_resumo(r):
 
 def _ent_rodando(r):
     try:
-        return r["entrada_etapa"] in ("preparando", "pedido", "estoque", "lotes", "contas", "desfazendo") and \
-            _agora() - int(float(r["entrada_em"] or 0)) < 300
+        lim = 900 if r["entrada_etapa"] == "robo" else 300
+        return r["entrada_etapa"] in ("preparando", "nota", "robo", "vinculo", "pedido", "estoque", "lotes", "contas", "desfazendo") and \
+            _agora() - int(float(r["entrada_em"] or 0)) < lim
     except Exception:
         return False
 
@@ -1222,6 +1259,122 @@ def _forma_pagamento(id_fornecedor):
     return None, None
 
 
+VIGIA_S = int(os.environ.get("RECEB_VIGIA_S", "180"))          # de quanto em quanto tempo procura a nota no Bling
+ROBO_ENTRADA = lambda: os.environ.get("RECEB_ROBO_ENTRADA", "1") == "1"   # robô manifesta (Confirmo) e importa a nota
+_vigia = {"on": False}
+
+
+def _nf_bling(chave):
+    """Nota do fornecedor já manifestada e importada no Bling (pela chave). -> (detalhe | None, erro | None)"""
+    chave = _dig(chave)
+    if len(chave) != 44:
+        return None, "chave inválida"
+    for params in ({"chaveAcesso": chave, "limite": 5}, {"tipo": 0, "chaveAcesso": chave, "limite": 5}):
+        st, txt, js = _bling_raw("GET", "/nfe", params=params)
+        if st == 429:
+            time.sleep(2)
+            st, txt, js = _bling_raw("GET", "/nfe", params=params)
+        if st != 200:
+            return None, _msg_bl(txt) or f"HTTP {st}"
+        for n in (js or {}).get("data") or []:
+            if _dig(n.get("chaveAcesso")) == chave and int(n.get("situacao") or 0) != 2:
+                st2, txt2, js2 = _bling_raw("GET", f"/nfe/{n['id']}")
+                det = (js2 or {}).get("data") or {}
+                return (det or n), None
+    return None, None
+
+
+def _ja_lancado(txt):
+    """O Bling recusou porque JÁ estava lançado (ex.: lançaram ao importar a nota)."""
+    t = _txt_norm(_msg_bl(txt) or txt or "")
+    return bool(re.search(r"ja (foi |esta |estao |foram )?(lancad|estornad)|ja possui (lancament|conta)|already", t))
+
+
+def _vincular_pc(nid, pc, nf_id, plano, quem):
+    """Concilia no Bling: marca nos itens do pedido de compra a nota de entrada (itens[].notaFiscal {id, quantidade}).
+    Lê o pedido inteiro e devolve inteiro (PUT); guarda o original para desfazer."""
+    import copy
+    st, txt, js = _bling_raw("GET", f"/pedidos/compras/{pc['id']}")
+    d = (js or {}).get("data") or {}
+    if st != 200 or not d:
+        return {"ok": False, "msg": f"não consegui ler o pedido {pc['numero']}: {_msg_bl(txt) or st}"}
+    orig = copy.deepcopy(d)
+    resta = {}
+    for x in plano["itens"]:
+        if x["pid"]:
+            resta[int(x["pid"])] = resta.get(int(x["pid"]), 0.0) + float(x["qtd"] or 0)
+    n = 0
+    for it in d.get("itens") or []:
+        pid = int((it.get("produto") or {}).get("id") or 0)
+        if resta.get(pid, 0) > 0:
+            q = min(float(it.get("quantidade") or 0), resta[pid])
+            resta[pid] -= q
+            it["notaFiscal"] = {"id": int(nf_id), "quantidade": q}
+            n += 1
+    if not n:
+        return {"ok": False, "msg": "nenhum item do pedido casou com a nota"}
+    st, txt, js = _bling_raw("PUT", f"/pedidos/compras/{pc['id']}", d)
+    ok = st in (200, 201, 204)
+    msg = f"{n} item(ns) do pedido {pc['numero']} vinculados à nota" if ok else (_msg_bl(txt) or f"HTTP {st}")
+    _ent_log(nid, f"vincular a nota ao pedido {pc['numero']}", ok, st, msg, txt, d, por=quem)
+    return {"ok": ok, "msg": msg, "original": orig if ok else None}
+
+
+def _contas_existentes(forn, contas):
+    """Contas a pagar do fornecedor com o mesmo vencimento e valor das duplicatas (ex.: lançadas ao importar a nota)."""
+    if not forn or not contas:
+        return {}
+    vs = sorted(str(c["vencimento"])[:10] for c in contas if c.get("vencimento"))
+    if not vs:
+        return {}
+    st, txt, js = _bling_raw("GET", "/contas/pagar", params={"idContato": forn, "dataVencimentoInicial": vs[0],
+                                                            "dataVencimentoFinal": vs[-1], "limite": 100})
+    lst = (js or {}).get("data") or []
+    out, usados = {}, set()
+    for k, ct in enumerate(contas):
+        for x in lst:
+            if x.get("id") in usados or int(x.get("situacao") or 1) in (4, 5):     # 4/5: cancelada/excluída
+                continue
+            if str(x.get("vencimento") or "")[:10] == str(ct["vencimento"])[:10] and abs(float(x.get("valor") or 0) - ct["valor"]) < 0.01:
+                usados.add(x.get("id"))
+                out[str(ct["numero"] or k + 1)] = {"id": x.get("id"), "valor": ct["valor"], "vencimento": ct["vencimento"], "via": "existente"}
+                break
+    return out
+
+
+def _vigia_ligar():
+    """Liga (uma vez por processo) quem procura no Bling as notas que estão esperando ser importadas."""
+    with _ent_lock:
+        if _vigia["on"]:
+            return
+        _vigia["on"] = True
+    threading.Thread(target=_vigia_loop, daemon=True).start()
+
+
+def _vigia_loop():
+    while True:
+        time.sleep(VIGIA_S)
+        try:
+            with db_session() as c:
+                rows = [dict(x) for x in c.execute("SELECT id, chave, entrada_por FROM receb_notas WHERE entrada_etapa='aguardando_nota'").fetchall()]
+            if not rows:
+                with _ent_lock:
+                    _vigia["on"] = False
+                return
+            for r in rows:
+                nf, _ = _nf_bling(r["chave"])
+                if not nf:
+                    continue
+                with db_session() as c:       # pega para si (outro processo não dispara junto)
+                    pegou = c.execute("UPDATE receb_notas SET entrada_etapa='preparando', entrada_em=? WHERE id=? AND entrada_etapa='aguardando_nota' RETURNING id",
+                                      (str(_agora()), r["id"])).fetchone()
+                if pegou:
+                    print(f"[ENTRADA] nota {r['id']} apareceu no Bling: continuando a entrada", flush=True)
+                    _disparar_entrada(r["id"], f"{r['entrada_por'] or 'automático'} (automático)")
+        except Exception as e:
+            print(f"[ENTRADA] vigia: {e}", flush=True)
+
+
 def plano_entrada(nid, resumo=None):
     """Monta TUDO sem gravar nada. -> dict com pontos (ok/erro/aviso), bloqueio e o que vai ser feito."""
     pontos = []
@@ -1264,6 +1417,17 @@ def plano_entrada(nid, resumo=None):
         plano["pc"]["atendido_id"] = sid
         ponto(True if sid else False, "Pedido de compra", f"pedido {pc.get('numero')} ({nome_sit}) vai para Atendido" if sid
               else "não achei a situação 'Atendido' dos pedidos de compra no Bling")
+
+    # a nota do fornecedor no Bling (manifestada e importada): é dela que sai o estoque e as contas
+    nf, nf_err = ((resumo or {}).get("nota"), None) if (resumo or {}).get("nota") else _nf_bling(r["chave"])
+    plano["nf"] = nf
+    if nf:
+        ponto(True, "Nota no Bling", f"NF {r['numero']} está no Bling (id {nf.get('id')}): o WMS vincula ao pedido e lança estoque e contas DA NOTA")
+    elif nf_err:
+        ponto(None, "Nota no Bling", f"não consegui procurar a nota no Bling ({nf_err})")
+    else:
+        ponto(None, "Nota no Bling", f"a NF {r['numero']} ainda não está no Bling: manifeste e importe SEM lançar estoque nem contas. "
+                                     "O WMS continua sozinho quando ela aparecer")
 
     # itens: produto do Bling pelo item do pedido (SKU / código do fornecedor)
     pc_itens = [{"sku": (i.get("produto") or {}).get("codigo"), "cprod": i.get("codigoFornecedor"), "pid": (i.get("produto") or {}).get("id"),
@@ -1333,6 +1497,58 @@ def _job_entrada(nid, quem):
         pc = p["pc"]
         ids = [int(x["pid"]) for x in p["itens"] if x["pid"]]
 
+        # foto do estoque ANTES de qualquer coisa (antes do robô/alguém importar): se o Bling lançar o estoque ao importar,
+        # o WMS percebe pelo salto e não lança de novo
+        if "saldo_inicio" not in res and ids:
+            res["saldo_inicio"] = {str(k): v for k, v in _saldos_local(ids).items()}
+            salvar()
+
+        # 0) a nota do fornecedor no Bling. A API não manifesta nem importa: se não estiver lá, o ROBÔ faz isso
+        #    (Confirmo a operação + importar). Se o robô não conseguir, fica esperando alguém fazer e continua sozinho.
+        if not res.get("nota"):
+            res["_etapa"] = "nota"; _ent_estado(nid, "nota")
+            nf, err = _nf_bling(r["chave"])
+            if not nf and not err and ROBO_ENTRADA():
+                res["_etapa"] = "robo"; _ent_estado(nid, "robo")
+                try:
+                    from services.bling_entrada_robo import manifestar_e_importar
+                    rb = manifestar_e_importar(r["numero"], r["chave"], float(r["valor"] or 0) or None)
+                    _ent_log(nid, "robô: manifestar e importar", True, None, " · ".join(rb.get("passos") or []), por=quem)
+                    for _ in range(12):                # a API pode levar alguns segundos para enxergar
+                        nf, err = _nf_bling(r["chave"])
+                        if nf:
+                            break
+                        time.sleep(5)
+                except Exception as e:
+                    _ent_log(nid, "robô: manifestar e importar", False, None, str(e)[:900], por=quem)
+                    res["robo_erro"] = str(e)[:400]
+            if not nf:
+                if err:
+                    raise RuntimeError(f"BLING|Não consegui procurar a nota no Bling: {err}")
+                msg = (f"Esperando a NF {r['numero']} no Bling" + (f" (o robô não conseguiu: {res['robo_erro'][:160]})" if res.get("robo_erro") else "")
+                       + ". Manifeste (Confirmo a operação) e importe a nota no Bling, SEM lançar estoque nem contas. "
+                       f"O WMS confere a cada {max(1, VIGIA_S // 60)} min e continua sozinho.")
+                _ent_log(nid, "nota no Bling", True, None, msg, por=quem)
+                _ent_estado(nid, "aguardando_nota", entrada_resumo=res, entrada_msg=msg[:500])
+                _vigia_ligar()
+                return
+            if int(nf.get("tipo") if nf.get("tipo") is not None else 0) != 0:
+                raise RuntimeError(f"CONF|A nota achada no Bling com essa chave não é de entrada (id {nf.get('id')})")
+            res.pop("robo_erro", None)
+            res["nota"] = {"id": nf.get("id"), "numero": nf.get("numero"), "situacao": nf.get("situacao"),
+                           "parcelas": len(nf.get("parcelas") or []),
+                           "itens": [{"codigo": it.get("codigo"), "qtd": float(it.get("quantidade") or 0)} for it in nf.get("itens") or []]}
+            _ent_log(nid, "nota no Bling", True, None, f"NF {r['numero']} está no Bling (id {nf.get('id')}, "
+                     f"{len(nf.get('itens') or [])} itens, {len(nf.get('parcelas') or [])} parcelas)", por=quem)
+            salvar()
+        nf_id = res["nota"]["id"]
+
+        # 0b) conciliar no Bling: a nota vinculada ao pedido de compra (não trava a entrada se o Bling recusar)
+        if not res.get("vinculo"):
+            res["_etapa"] = "vinculo"; _ent_estado(nid, "vinculo")
+            res["vinculo"] = _vincular_pc(nid, pc, nf_id, p, quem)
+            salvar()
+
         # 1) pedido -> Atendido (medindo o estoque antes/depois: o Bling pode lançar sozinho ao atender)
         if not res.get("pedido"):
             res["_etapa"] = "pedido"; _ent_estado(nid, "pedido")
@@ -1348,9 +1564,73 @@ def _job_entrada(nid, quem):
                              "depois": {str(k): v for k, v in depois.items()}, "mudou": pc["situacao_valor"] != 1}
             salvar()
 
-        # 2) estoque: o que o Bling não lançou sozinho, o WMS lança (entrada no Local, custo da NF)
+        # 2) estoque: o que o Bling não lançou sozinho ao atender, entra pela NOTA (POST /nfe/{id}/lancar-estoque/Local),
+        #    medindo o saldo antes/depois. Se a nota não puder (itens da nota diferentes, lote, recusa), produto a produto.
         est = res.setdefault("estoque", {})
         res["_etapa"] = "estoque"; _ent_estado(nid, "estoque")
+        pend = [x for x in p["itens"] if str(x["item_id"]) not in est and x["pid"] and x["qtd"] > 0]
+        ini = res.get("saldo_inicio") or {}
+        for x in pend:                       # entrou estoque entre o começo e o pedido (ex.: lançado ao importar a nota)
+            if str(x["pid"]) not in ini:
+                continue
+            qtd_prod = sum(y["qtd"] for y in p["itens"] if y["pid"] == x["pid"])
+            ext = float(res["pedido"]["antes"].get(str(x["pid"]), 0)) - float(ini[str(x["pid"])])
+            if abs(ext - qtd_prod) < 0.001:
+                est[str(x["item_id"])] = {"via": "importacao", "qtd": x["qtd"], "pid": x["pid"]}
+                _ent_log(nid, f"estoque item {x['n_item']}", True, None, f"já entrou {qtd_prod:g} no Bling ao importar a nota: não lanço de novo", por=quem)
+        pend = [x for x in pend if str(x["item_id"]) not in est]
+        delta_at = {}
+        for x in pend:
+            a = float(res["pedido"]["antes"].get(str(x["pid"]), 0)); d = float(res["pedido"]["depois"].get(str(x["pid"]), 0))
+            delta_at[int(x["pid"])] = d - a
+        if pend and not res.get("nf_estoque") and all(abs(v) < 0.001 for v in delta_at.values()):  # noqa: E501
+            codigos_nf = {}
+            for it in res["nota"].get("itens") or []:
+                k = str(it.get("codigo") or "").strip().upper()
+                codigos_nf[k] = codigos_nf.get(k, 0.0) + float(it.get("qtd") or 0)
+            precisa = {}
+            for x in p["itens"]:
+                k = str(x["sku"] or "").strip().upper()
+                precisa[k] = precisa.get(k, 0.0) + float(x["qtd"] or 0)
+            bate = all(abs(codigos_nf.get(k, -1) - q) < 0.001 for k, q in precisa.items()) and len(codigos_nf) == len(precisa)
+            if not bate:
+                res["nf_estoque"] = {"via": "produto", "motivo": "os itens da nota no Bling não batem com os SKUs/quantidades conferidos"}
+                _ent_log(nid, "estoque pela nota", True, None, "itens da nota no Bling diferentes dos conferidos: lanço produto a produto", por=quem)
+            else:
+                antes2 = _saldos_local(ids)
+                st, txt, _ = _bling_raw("POST", f"/nfe/{nf_id}/lancar-estoque/{DEP_LOCAL_ID}")
+                ok = st in (200, 201, 204)
+                depois2 = _saldos_local(ids)
+                for _ in range(3):
+                    if not ok or all(abs(depois2.get(k, 0) - antes2.get(k, 0)) >= 0.001 for k in ids):
+                        break
+                    time.sleep(3)
+                    depois2 = _saldos_local(ids)
+                ja = (not ok) and _ja_lancado(txt)
+                res["nf_estoque"] = {"http": st, "ok": ok, "ja": ja, "antes": {str(k): v for k, v in antes2.items()},
+                                     "depois": {str(k): v for k, v in depois2.items()}}
+                _ent_log(nid, f"estoque da nota no Local", ok or ja, st,
+                         "estoque da nota lançado no Local" if ok else ("o estoque da nota já estava lançado" if ja else _msg_bl(txt)), txt, por=quem)
+            salvar()
+        nfe = res.get("nf_estoque") or {}
+        for x in pend:
+            chave = str(x["item_id"])
+            if chave in est or abs(delta_at.get(int(x["pid"]), 0)) >= 0.001:
+                continue
+            qtd_prod = sum(y["qtd"] for y in p["itens"] if y["pid"] == x["pid"])
+            if nfe.get("ok"):
+                d2 = float(nfe["depois"].get(str(x["pid"]), 0)) - float(nfe["antes"].get(str(x["pid"]), 0))
+                if abs(d2 - qtd_prod) < 0.001:
+                    est[chave] = {"via": "nota", "qtd": x["qtd"], "pid": x["pid"]}
+                    continue
+                if abs(d2) >= 0.001:
+                    salvar()
+                    raise RuntimeError(f"CONF|Estoque do item {x['n_item']} mudou {d2:+g} ao lançar a nota (esperado {qtd_prod:g}). "
+                                       "Confira o estoque desse produto no Bling antes de continuar.")
+            elif nfe.get("ja"):
+                est[chave] = {"via": "importacao", "qtd": x["qtd"], "pid": x["pid"]}
+                continue
+        salvar()
         for x in p["itens"]:
             chave = str(x["item_id"])
             if chave in est or not x["pid"] or x["qtd"] <= 0:
@@ -1408,10 +1688,32 @@ def _job_entrada(nid, quem):
             lts[chave] = {"id_lote": idl, "qtd": x["qtd"], "lote": x["lote"]}
             salvar()
 
-        # 4) contas a pagar (uma por duplicata)
+        # 4) contas a pagar: primeiro confere se já existem (mesmo fornecedor, vencimento e valor); senão lança as DA NOTA
+        #    (POST /nfe/{id}/lancar-contas); se a nota não tiver parcelas ou o Bling recusar, uma por duplicata do XML
         cts = res.setdefault("contas", {})
         res["_etapa"] = "contas"; _ent_estado(nid, "contas")
+        if not cts and p["contas"] and not res.get("contas_via"):
+            forn = pc.get("fornecedor_id")
+            exist = _contas_existentes(forn, p["contas"])
+            if len(exist) == len(p["contas"]):
+                cts.update(exist); res["contas_via"] = "existentes"
+                _ent_log(nid, "contas a pagar", True, None, f"as {len(exist)} contas já existiam no Bling: não lancei de novo", por=quem)
+            elif not exist and res["nota"].get("parcelas"):
+                st, txt, _ = _bling_raw("POST", f"/nfe/{nf_id}/lancar-contas")
+                ok = st in (200, 201, 204)
+                ja = (not ok) and _ja_lancado(txt)
+                _ent_log(nid, "contas da nota", ok or ja, st, "contas da nota lançadas" if ok else ("as contas da nota já estavam lançadas" if ja else _msg_bl(txt)), txt, por=quem)
+                if ok or ja:
+                    time.sleep(2)
+                    achou = _contas_existentes(forn, p["contas"])
+                    cts.update({k: dict(v, via="nota") for k, v in achou.items()})
+                    res["contas_via"] = "nota" if ok else "existentes"
+                    if not achou:
+                        cts["nota"] = {"via": "nota", "valor": round(sum(c["valor"] for c in p["contas"]), 2)}
+            salvar()
         for k, ct in enumerate(p["contas"]):
+            if res.get("contas_via") in ("nota", "existentes"):
+                break
             chave = str(ct["numero"] or k + 1)
             if chave in cts:
                 continue
@@ -1428,9 +1730,13 @@ def _job_entrada(nid, quem):
 
         res["_etapa"] = "ok"
         n_est = sum(1 for v in est.values() if v.get("via") == "wms")
-        msg = (f"Entrada lançada no Bling: pedido {pc['numero']} Atendido · estoque de {len(est)} item(ns) "
-               f"({n_est} pelo WMS, {len(est) - n_est} pelo Bling) · {len(lts)} lote(s) · {len(cts)} conta(s) a pagar. "
-               "Falta só importar o XML no Bling como registro fiscal, SEM lançar estoque nem contas.")
+        n_nota = sum(1 for v in est.values() if v.get("via") in ("nota", "importacao"))
+        vin = res.get("vinculo") or {}
+        msg = (f"Entrada lançada no Bling: NF {r['numero']} vinculada ao pedido {pc['numero']}" if vin.get("ok")
+               else f"Entrada lançada no Bling (o vínculo da nota com o pedido {pc['numero']} ficou para fazer no Bling: {str(vin.get('msg') or '')[:120]})")
+        msg += (f" · pedido Atendido · estoque de {len(est)} item(ns) ({n_nota} pela nota, {n_est} produto a produto, "
+                f"{len(est) - n_nota - n_est} pelo pedido) · {len(lts)} lote(s) · {len([c for c in cts if c != 'nota']) or len(cts)} conta(s) a pagar"
+                + (" (da nota)" if res.get("contas_via") == "nota" else " (já existiam)" if res.get("contas_via") == "existentes" else "") + ".")
         _ent_estado(nid, "ok", entrada_resumo=res, entrada_msg=msg[:500], entrada_erro=None)
         with db_session() as c:
             c.execute("UPDATE receb_notas SET status='lancada', atualizado_em=? WHERE id=?", (_agora(), nid))
@@ -1521,6 +1827,17 @@ def entrada_desfazer(nid):
         return jsonify({"error": "A entrada ainda está rodando. Espere terminar.", "origem": "conferencia"}), 409
     res, quem, falhas = _ent_resumo(r), _quem(), []
     _ent_estado(nid, "desfazendo")
+    nf_id = (res.get("nota") or {}).get("id")
+    if res.get("contas_via") == "nota" and nf_id:
+        st, txt, _ = _bling_raw("POST", f"/nfe/{nf_id}/estornar-contas")
+        ok = st in (200, 201, 204)
+        _ent_log(nid, "desfazer contas da nota", ok, st, "contas da nota estornadas" if ok else _msg_bl(txt), txt, por=quem)
+        if ok:
+            res["contas"] = {}; res.pop("contas_via", None)
+        else:
+            falhas.append(f"contas da nota: {_msg_bl(txt) or st}")
+    elif res.get("contas_via") == "existentes":
+        res["contas"] = {}; res.pop("contas_via", None)       # não foram lançadas pelo WMS: ficam
     for k, ct in list((res.get("contas") or {}).items()):
         st, txt, _ = _bling_raw("DELETE", f"/contas/pagar/{ct['id']}")
         ok = st in (200, 204)
@@ -1538,6 +1855,15 @@ def entrada_desfazer(nid):
             res["lotes"].pop(k)
         else:
             falhas.append(f"lote {lt['lote']}: {_msg_bl(txt) or st}")
+    if nf_id and any(e.get("via") == "nota" for e in (res.get("estoque") or {}).values()):
+        st, txt, _ = _bling_raw("POST", f"/nfe/{nf_id}/estornar-estoque")
+        ok = st in (200, 201, 204)
+        _ent_log(nid, "desfazer estoque da nota", ok, st, "estoque da nota estornado" if ok else _msg_bl(txt), txt, por=quem)
+        if ok:
+            res["estoque"] = {k: e for k, e in res["estoque"].items() if e.get("via") != "nota"}
+            res.pop("nf_estoque", None)
+        else:
+            falhas.append(f"estoque da nota: {_msg_bl(txt) or st}")
     for k, e in list((res.get("estoque") or {}).items()):
         if e.get("via") != "wms":
             continue
@@ -1563,8 +1889,21 @@ def entrada_desfazer(nid):
                               + ", ".join(pendente_bling) + ")")
         else:
             falhas.append(f"pedido: {_msg_bl(txt) or st}")
+    vin = res.get("vinculo") or {}
+    if vin.get("ok") and vin.get("original") and r["pedido_compra_id"] and not res.get("pedido"):
+        st, txt, _ = _bling_raw("PUT", f"/pedidos/compras/{r['pedido_compra_id']}", vin["original"])
+        ok = st in (200, 201, 204)
+        _ent_log(nid, "desfazer vínculo nota x pedido", ok, st, "pedido voltou como estava" if ok else _msg_bl(txt), txt, por=quem)
+        if ok:
+            res.pop("vinculo", None)
+        else:
+            falhas.append(f"vínculo: {_msg_bl(txt) or st}")
+    if not falhas:
+        for k in ("nf_estoque", "saldo_inicio", "contas_via"):
+            res.pop(k, None)
     res["_etapa"] = "desfeito" if not falhas else "erro"
-    msg = "Entrada desfeita no Bling." if not falhas else "Desfeito em parte. Falta: " + "; ".join(falhas)
+    msg = ("Entrada desfeita no Bling (a nota continua importada lá, sem estoque nem contas)." if not falhas
+           else "Desfeito em parte. Falta: " + "; ".join(falhas))
     _ent_estado(nid, "desfeito" if not falhas else "erro", entrada_resumo=res, entrada_msg=msg[:500],
                 entrada_erro=None if not falhas else json.dumps({"origem": "bling", "error": msg}, ensure_ascii=False))
     if not falhas:

@@ -8,6 +8,12 @@ BK="recebimento_routes.py.bak_$(date +%Y%m%d%H%M%S)"
 cp recebimento_routes.py "$BK"
 curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF/recebimento_routes.py" -o recebimento_routes.py.novo
 venv/bin/python -m py_compile recebimento_routes.py.novo
+# robô da entrada (manifestar + importar a nota no Bling): arquivo novo, com backup se já existir
+ROBO=services/bling_entrada_robo.py
+[ -f "$ROBO" ] && cp "$ROBO" "$ROBO.bak_$(date +%Y%m%d%H%M%S)"
+curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF/$ROBO" -o "$ROBO.novo"
+venv/bin/python -m py_compile "$ROBO.novo"
+mv "$ROBO.novo" "$ROBO"
 mv recebimento_routes.py.novo recebimento_routes.py
 grep -q "^MEUDANFE_TOKEN=" .env && echo "Meu Danfe: token ok no .env" || echo "ATENÇÃO: falta MEUDANFE_TOKEN no .env"
 sudo systemctl restart wms-russia.service
