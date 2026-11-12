@@ -929,11 +929,18 @@ def saida_historico():
         _saida_tabelas(conn)
         rows = [dict(r) for r in conn.execute("SELECT * FROM saida_log WHERE em >= ? AND em < ? ORDER BY em DESC, id DESC",
                                               (ini, ini + 86400)).fetchall()]
+        _fech_tabela(conn)
+        fech = [dict(r) for r in conn.execute("SELECT id, carro, total, carregados, faltando, nao_expedidos, justificativa, foto, por, em, "
+                                              "discord_ok, discord_msg FROM saida_fechamentos WHERE em >= ? AND em < ? ORDER BY em DESC",
+                                              (ini, ini + 86400)).fetchall()]
     por = {}
     for r in rows:
         if r["acao"] == "carregou":
             por[r["por"] or "?"] = por.get(r["por"] or "?", 0) + 1
-    return jsonify({"dia": dia, "eventos": rows[:500], "carregados_por": por})
+    for x in fech:
+        x["foto_url"] = f"/api/saida/fotos/{x['id']}" if x.get("foto") else None
+        x["faltando"] = [m for m in str(x.get("faltando") or "").split(",") if m]
+    return jsonify({"dia": dia, "eventos": rows[:500], "carregados_por": por, "fechamentos": fech})
 
 
 @mapa_routes.post("/saida/liberar")
@@ -954,6 +961,152 @@ def saida_liberar():
         _log_saida(conn, "liberou_com_falta", carro=str(b.get("tipo") or ""), detalhe=f"{motivo[:300]} | faltando: {', '.join(str(x) for x in (b.get('faltando') or []))[:300]}")
     _slowlog.warning("SAIDA liberada com pendência: %s por %s — %s", b.get("tipo"), _quem_saida(), motivo)
     return jsonify({"success": True})
+
+
+# ── Fechar a lista do carro: com pacote faltando, quem fecha JUSTIFICA e tira FOTO DO ROSTO; o alerta sobe no Discord ──
+SAIDA_FOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saida_fotos")
+SAIDA_JUST_MIN = 15
+SAIDA_FOTO_MAX = 6 * 1024 * 1024
+_NOME_CARRO = {"FLEX": "FLEX", "COLETA": "COLETA ML", "SHOPEE": "SHOPEE", "COMERCIAL": "COMERCIAL"}
+
+
+def _fech_tabela(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS saida_fechamentos (id BIGSERIAL PRIMARY KEY, carro TEXT, total INTEGER, carregados INTEGER, "
+                 "faltando TEXT, nao_expedidos INTEGER, justificativa TEXT, foto TEXT, por TEXT, em BIGINT, "
+                 "discord_ok INTEGER, discord_msg TEXT)")
+
+
+def _tipo_img(b):
+    if b[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, foto_ext):
+    """Manda o alerta no canal do Discord (webhook). Roda em segundo plano; o resultado fica gravado no fechamento."""
+    url = os.environ.get("DISCORD_WEBHOOK_SAIDA", "").strip()
+    if not url:
+        res = (0, "Discord não configurado (DISCORD_WEBHOOK_SAIDA)")
+    else:
+        import json as _json
+        nomes = []
+        try:
+            with db_session() as conn:
+                for mid in faltando[:25]:
+                    r = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
+                    nomes.append(f"• #{str(mid).replace('SHOPEE_', '')} — {(r['cliente_nome'] if r else '') or '?'}")
+        except Exception:
+            nomes = [f"• #{m}" for m in faltando[:25]]
+        if len(faltando) > 25:
+            nomes.append(f"… e mais {len(faltando) - 25}")
+        mencao = os.environ.get("DISCORD_MENCAO_SAIDA", "@here").strip()
+        embed = {
+            "title": f"Lista {_NOME_CARRO.get(carro, carro)} fechada com {len(faltando)} pedido(s) faltando",
+            "color": 0xE53935,
+            "fields": [
+                {"name": "Quem fechou", "value": por or "?", "inline": True},
+                {"name": "Carregados", "value": f"{carregados} de {total}", "inline": True},
+                {"name": "Justificativa", "value": (just or "-")[:1000]},
+                {"name": "Pedidos que ficaram", "value": ("\n".join(nomes) or "-")[:1000]},
+            ],
+            "footer": {"text": f"NexusWMS LHVMed · Saída · fechamento #{fid}"},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if nao_exp:
+            embed["fields"].append({"name": "Atenção", "value": f"+ {nao_exp} pedido(s) desse carro nem foram expedidos no WMS"})
+        payload = {"content": f"{mencao} Pedido ficando para trás na saída".strip(), "embeds": [embed],
+                   "allowed_mentions": {"parse": ["everyone", "roles"]}}
+        try:
+            if foto_bytes:
+                nome = f"rosto.{foto_ext}"
+                embed["image"] = {"url": f"attachment://{nome}"}
+                r = requests.post(url, data={"payload_json": _json.dumps(payload)},
+                                  files={"files[0]": (nome, foto_bytes, f"image/{'jpeg' if foto_ext == 'jpg' else foto_ext}")}, timeout=20)
+            else:
+                r = requests.post(url, json=payload, timeout=20)
+            res = (1 if r.status_code in (200, 204) else 0, f"HTTP {r.status_code} {r.text[:300]}")
+        except Exception as e:
+            res = (0, f"falhou: {e}")
+    try:
+        with db_session() as conn:
+            conn.execute("UPDATE saida_fechamentos SET discord_ok=?, discord_msg=? WHERE id=?", (res[0], res[1][:400], fid))
+    except Exception as e:
+        _slowlog.warning("saida discord grava: %s", e)
+    _slowlog.warning("SAIDA fechamento #%s Discord: %s", fid, res[1][:200])
+
+
+@mapa_routes.post("/saida/fechar")
+@login_required
+def saida_fechar():
+    """Fecha a lista do carro. Sem falta: só registra. Com falta: justificativa + foto do rosto obrigatórias, e avisa no Discord."""
+    f = request.form if request.form else (request.get_json(silent=True) or {})
+    carro = str(f.get("carro") or "").upper()
+    try:
+        import json as _json
+        faltando = [str(x) for x in _json.loads(f.get("faltando") or "[]")] if isinstance(f.get("faltando"), str) else [str(x) for x in (f.get("faltando") or [])]
+    except Exception:
+        faltando = []
+    total = int(f.get("total") or 0)
+    carregados = int(f.get("carregados") or 0)
+    nao_exp = int(f.get("nao_expedidos") or 0)
+    just = str(f.get("justificativa") or "").strip()
+    por = _quem_saida()
+    foto_bytes, ext, arq = None, None, None
+    if faltando:
+        if len(just) < SAIDA_JUST_MIN:
+            return jsonify({"error": f"Escreva a justificativa (pelo menos {SAIDA_JUST_MIN} letras): por que o carro vai sem {len(faltando)} pedido(s)?",
+                            "origem": "conferencia"}), 400
+        up = request.files.get("foto")
+        if not up:
+            return jsonify({"error": "Tire a foto do rosto de quem está fechando a lista.", "origem": "conferencia"}), 400
+        foto_bytes = up.read(SAIDA_FOTO_MAX + 1)
+        if len(foto_bytes) > SAIDA_FOTO_MAX:
+            return jsonify({"error": "Foto grande demais (máx. 6 MB).", "origem": "conferencia"}), 400
+        ext = _tipo_img(foto_bytes)
+        if not ext:
+            return jsonify({"error": "O arquivo da foto não é uma imagem (JPG/PNG/WEBP).", "origem": "conferencia"}), 400
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        _fech_tabela(conn)
+        row = conn.execute("INSERT INTO saida_fechamentos (carro, total, carregados, faltando, nao_expedidos, justificativa, por, em) "
+                           "VALUES (?,?,?,?,?,?,?,?) RETURNING id",
+                           (carro, total, carregados, ",".join(faltando)[:4000], nao_exp, just[:1000], por, int(time.time()))).fetchone()
+        fid = row["id"] if hasattr(row, "keys") else row[0]
+        if foto_bytes:
+            os.makedirs(SAIDA_FOTO_DIR, exist_ok=True)
+            arq = f"fech_{fid}_{int(time.time())}.{ext}"
+            with open(os.path.join(SAIDA_FOTO_DIR, arq), "wb") as fh:
+                fh.write(foto_bytes)
+            conn.execute("UPDATE saida_fechamentos SET foto=? WHERE id=?", (arq, fid))
+        if faltando:
+            _log_saida(conn, "fechou_com_falta", carro=carro,
+                       detalhe=f"{carregados} de {total} · faltando: {', '.join(faltando)[:200]} · justificativa: {just[:150]}")
+        else:
+            _log_saida(conn, "fechou_completo", carro=carro, detalhe=f"{carregados} de {total}")
+    if faltando:
+        _slowlog.warning("SAIDA fechada com falta: %s %s/%s por %s — %s", carro, carregados, total, por, just)
+        threading.Thread(target=_discord_saida, args=(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, ext),
+                         daemon=True).start()
+    return jsonify({"success": True, "id": fid, "alerta": bool(faltando),
+                    "discord": bool(os.environ.get("DISCORD_WEBHOOK_SAIDA", "").strip())})
+
+
+@mapa_routes.get("/saida/fotos/<int:fid>")
+@login_required
+def saida_foto(fid):
+    with db_session() as conn:
+        _fech_tabela(conn)
+        r = conn.execute("SELECT foto FROM saida_fechamentos WHERE id=?", (fid,)).fetchone()
+    if not r or not r["foto"]:
+        return jsonify({"error": "Sem foto."}), 404
+    caminho = os.path.join(SAIDA_FOTO_DIR, os.path.basename(r["foto"]))
+    if not os.path.exists(caminho):
+        return jsonify({"error": "Arquivo da foto não encontrado."}), 404
+    return send_file(caminho, max_age=3600)
 
 
 @mapa_routes.post("/saida/desfazer")
