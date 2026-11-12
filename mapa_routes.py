@@ -986,40 +986,79 @@ def _tipo_img(b):
     return None
 
 
-def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, foto_ext):
-    """Manda o alerta no canal do Discord (webhook). Roda em segundo plano; o resultado fica gravado no fechamento."""
+def _lista_pedidos(ids, lim=25):
+    """'• #123 — Cliente' para o Discord."""
+    linhas = []
+    try:
+        with db_session() as conn:
+            for mid in ids[:lim]:
+                r = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
+                linhas.append(f"• #{str(mid).replace('SHOPEE_', '')} — {(r['cliente_nome'] if r else '') or '?'}")
+    except Exception:
+        linhas = [f"• #{m}" for m in ids[:lim]]
+    if len(ids) > lim:
+        linhas.append(f"… e mais {len(ids) - lim}")
+    return "\n".join(linhas)
+
+
+def _quem_bipou(ids):
+    """'joao (7), maria (3)' — quem bipou os pacotes carregados."""
+    cont = {}
+    try:
+        with db_session() as conn:
+            for mid in ids:
+                r = conn.execute("SELECT por FROM saida_bipes WHERE ml_id=?", (mid,)).fetchone()
+                q = (r["por"] if r else None) or "?"
+                cont[q] = cont.get(q, 0) + 1
+    except Exception:
+        return ""
+    return ", ".join(f"{q} ({n})" for q, n in sorted(cont.items(), key=lambda x: -x[1]))
+
+
+def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, foto_ext, carregados_ids=None):
+    """Manda no canal do Discord (webhook) TODO fechamento: completo (verde) ou com falta (vermelho, @here, foto).
+    Roda em segundo plano; o resultado fica gravado no fechamento."""
     url = os.environ.get("DISCORD_WEBHOOK_SAIDA", "").strip()
+    carregados_ids = carregados_ids or []
     if not url:
         res = (0, "Discord não configurado (DISCORD_WEBHOOK_SAIDA)")
     else:
         import json as _json
-        nomes = []
-        try:
-            with db_session() as conn:
-                for mid in faltando[:25]:
-                    r = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
-                    nomes.append(f"• #{str(mid).replace('SHOPEE_', '')} — {(r['cliente_nome'] if r else '') or '?'}")
-        except Exception:
-            nomes = [f"• #{m}" for m in faltando[:25]]
-        if len(faltando) > 25:
-            nomes.append(f"… e mais {len(faltando) - 25}")
-        mencao = os.environ.get("DISCORD_MENCAO_SAIDA", "@here").strip()
-        embed = {
-            "title": f"Lista {_NOME_CARRO.get(carro, carro)} fechada com {len(faltando)} pedido(s) faltando",
-            "color": 0xE53935,
-            "fields": [
-                {"name": "Quem fechou", "value": por or "?", "inline": True},
-                {"name": "Carregados", "value": f"{carregados} de {total}", "inline": True},
-                {"name": "Justificativa", "value": (just or "-")[:1000]},
-                {"name": "Pedidos que ficaram", "value": ("\n".join(nomes) or "-")[:1000]},
-            ],
-            "footer": {"text": f"NexusWMS LHVMed · Saída · fechamento #{fid}"},
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
+        nome_carro = _NOME_CARRO.get(carro, carro)
+        quem_bip = _quem_bipou(carregados_ids) if carregados_ids else ""
+        if faltando:
+            embed = {
+                "title": f"Lista {nome_carro} fechada com {len(faltando)} pedido(s) faltando",
+                "color": 0xE53935,
+                "fields": [
+                    {"name": "Quem fechou", "value": por or "?", "inline": True},
+                    {"name": "Carregados", "value": f"{carregados} de {total}", "inline": True},
+                    {"name": "Justificativa", "value": (just or "-")[:1000]},
+                    {"name": "Pedidos que ficaram", "value": (_lista_pedidos(faltando) or "-")[:1000]},
+                ],
+            }
+            mencao = os.environ.get("DISCORD_MENCAO_SAIDA", "@here").strip()
+            conteudo = f"{mencao} Pedido ficando para trás na saída".strip()
+        else:
+            embed = {
+                "title": f"Carro {nome_carro} liberado COMPLETO: {carregados} de {total}" if total else f"Carro {nome_carro} fechado sem pedidos hoje",
+                "color": 0x22C55E,
+                "fields": [
+                    {"name": "Quem fechou", "value": por or "?", "inline": True},
+                    {"name": "Carregados", "value": f"{carregados} de {total}", "inline": True},
+                ],
+            }
+            if carregados_ids:
+                embed["fields"].append({"name": "Pedidos carregados", "value": (_lista_pedidos(carregados_ids) or "-")[:1000]})
+            conteudo = f"Saída {nome_carro}: tudo carregado"
+        if quem_bip:
+            embed["fields"].append({"name": "Bipado por", "value": quem_bip[:1000]})
         if nao_exp:
             embed["fields"].append({"name": "Atenção", "value": f"+ {nao_exp} pedido(s) desse carro nem foram expedidos no WMS"})
-        payload = {"content": f"{mencao} Pedido ficando para trás na saída".strip(), "embeds": [embed],
-                   "allowed_mentions": {"parse": ["everyone", "roles"]}}
+        embed["footer"] = {"text": f"NexusWMS LHVMed · Saída · fechamento #{fid}"}
+        embed["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload = {"content": conteudo, "embeds": [embed],
+                   "allowed_mentions": {"parse": ["everyone", "roles"] if faltando else []}}
         try:
             if foto_bytes:
                 nome = f"rosto.{foto_ext}"
@@ -1042,7 +1081,7 @@ def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, 
 @mapa_routes.post("/saida/fechar")
 @login_required
 def saida_fechar():
-    """Fecha a lista do carro. Sem falta: só registra. Com falta: justificativa + foto do rosto obrigatórias, e avisa no Discord."""
+    """Fecha a lista do carro e avisa no Discord (completo ou com falta). Com falta: justificativa + foto do rosto obrigatórias."""
     f = request.form if request.form else (request.get_json(silent=True) or {})
     carro = str(f.get("carro") or "").upper()
     try:
@@ -1050,6 +1089,11 @@ def saida_fechar():
         faltando = [str(x) for x in _json.loads(f.get("faltando") or "[]")] if isinstance(f.get("faltando"), str) else [str(x) for x in (f.get("faltando") or [])]
     except Exception:
         faltando = []
+    try:
+        cids = f.get("carregados_ids")
+        carregados_ids = [str(x) for x in (_json.loads(cids) if isinstance(cids, str) else (cids or []))]
+    except Exception:
+        carregados_ids = []
     total = int(f.get("total") or 0)
     carregados = int(f.get("carregados") or 0)
     nao_exp = int(f.get("nao_expedidos") or 0)
@@ -1089,8 +1133,8 @@ def saida_fechar():
             _log_saida(conn, "fechou_completo", carro=carro, detalhe=f"{carregados} de {total}")
     if faltando:
         _slowlog.warning("SAIDA fechada com falta: %s %s/%s por %s — %s", carro, carregados, total, por, just)
-        threading.Thread(target=_discord_saida, args=(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, ext),
-                         daemon=True).start()
+    threading.Thread(target=_discord_saida, args=(fid, carro, total, carregados, faltando, nao_exp, just, por, foto_bytes, ext, carregados_ids),
+                     daemon=True).start()
     return jsonify({"success": True, "id": fid, "alerta": bool(faltando),
                     "discord": bool(os.environ.get("DISCORD_WEBHOOK_SAIDA", "").strip())})
 
