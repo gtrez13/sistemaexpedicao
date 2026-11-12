@@ -71,8 +71,20 @@ def rota(metodo, caminho, payload=None, o_que=""):
         linha(NAO, f"{o_que}: {metodo} {caminho} SEM PERMISSÃO no app do Bling (HTTP 403 {msg[:120]}) — liberar o escopo no app")
         return False
     if (st, msg) == assin_c:
-        linha(AV, f"{o_que}: {metodo} {caminho} respondeu igual a uma rota inventada ({st}); a rota está na especificação oficial, "
-                  "mas esse teste não confirma a permissão — me mande essa saída")
+        # o Bling responde igual para "id não existe" e "rota não existe": tenta 2 testes a mais, também sem gravar
+        for m2, c2, ctl in ((metodo, re.sub(r"/0(?=/|$)", "/abc", caminho), (metodo, "/rota-que-nao-existe-wms-teste/abc")),
+                            ("GET", caminho, ("GET", "/rota-que-nao-existe-wms-teste"))):
+            a = rr._bling_raw(m2, c2)
+            b = rr._bling_raw(ctl[0], ctl[1])
+            sa, sb = (a[0], erro_bl(a[2], a[1])), (b[0], erro_bl(b[2], b[1]))
+            if sa != sb and a[0] not in (401, 429) and b[0] not in (401, 429):
+                if a[0] == 403:
+                    linha(NAO, f"{o_que}: {metodo} {caminho} existe, mas o app está SEM PERMISSÃO (403 {sa[1][:90]})")
+                    return False
+                linha(OK, f"{o_que}: {metodo} {caminho} existe (confirmado: {m2} {c2} -> {sa[0]} {sa[1][:70]}; rota inventada -> {sb[0]})")
+                return True
+        linha(AV, f"{o_que}: {metodo} {caminho} — o Bling responde igual a uma rota inventada ({st}) em todos os testes sem gravar. "
+                  "Está na especificação oficial; só a 1ª entrada real confirma")
         return None
     linha(OK, f"{o_que}: {metodo} {caminho} existe e o app tem permissão (teste recusado como esperado: {st} {msg[:90]})")
     return True
