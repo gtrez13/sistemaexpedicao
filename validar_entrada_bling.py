@@ -30,6 +30,23 @@ def linha(marca, texto):
         resumo.append(f"{marca} {texto}")
 
 
+_raw0 = rr._bling_raw
+
+
+def _raw(metodo, caminho, payload=None, params=None):
+    """Igual ao do WMS, mas se o Bling disser 'muitas requisições' (429) espera e tenta de novo (senão o teste engana)."""
+    import time as _t
+    for k in range(4):
+        st, txt, js = _raw0(metodo, caminho, payload=payload, params=params)
+        if st != 429:
+            return st, txt, js
+        _t.sleep(2 + k)
+    return st, txt, js
+
+
+rr._bling_raw = _raw
+
+
 def erro_bl(js, txt):
     e = (js or {}).get("error") or {}
     return f"{e.get('type') or ''} {e.get('message') or ''} {e.get('description') or ''}".strip() or (txt or "")[:160]
