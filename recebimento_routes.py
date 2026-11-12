@@ -130,6 +130,7 @@ def _garantir_tabelas():
         c.execute(f"""CREATE TABLE IF NOT EXISTS receb_entrada_log (id {pk}, nota_id BIGINT NOT NULL, acao TEXT, ok INTEGER, http INTEGER,
                       mensagem TEXT, resposta TEXT, enviado TEXT, por TEXT, em BIGINT)""")
         c.execute("CREATE TABLE IF NOT EXISTS receb_pc_cache (cnpj TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
+        c.execute("CREATE TABLE IF NOT EXISTS receb_kits (sku_key TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
@@ -985,6 +986,80 @@ def bipar(nid):
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return jsonify({"success": True, "item": novo, "falta": falta, "excedeu": falta < 0,
                     "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])})
+
+
+KITS_CACHE_S = 7 * 86400
+
+
+def _kits_do_sku(sku, fresco=False):
+    """Kits do Bling (produto com composição) feitos SÓ desse produto, ex.: KIT com 10 bolsas -> [{sku, nome, qtd}].
+    Serve para a etiqueta: 700 bolsas vendidas em kit de 10 = 70 etiquetas do kit. Cache 7 dias."""
+    key = str(sku or "").strip().lower()
+    if not key:
+        return []
+    with db_session() as c:
+        r = c.execute("SELECT dados, em FROM receb_kits WHERE sku_key=?", (key,)).fetchone()
+    if r and not fresco and _agora() - int(r["em"] or 0) < KITS_CACHE_S:
+        try:
+            return json.loads(r["dados"] or "[]")
+        except Exception:
+            pass
+    falhou = []
+
+    def get(caminho, params=None):
+        for k in range(4):                       # 429 = muitas chamadas seguidas: espera e tenta de novo
+            st, txt, js = _bling_raw("GET", caminho, params=params)
+            if st != 429:
+                break
+            time.sleep(1.5 + k)
+        if st != 200:
+            falhou.append(st)
+        return st, txt, js
+
+    st, txt, js = get("/produtos", {"codigos[]": sku, "limite": 5, "criterio": 5})
+    if st != 200:
+        return json.loads(r["dados"] or "[]") if r else []
+    pid = next((int(x["id"]) for x in (js or {}).get("data") or [] if str(x.get("codigo") or "").strip().lower() == key), None)
+    kits = []
+    if pid:
+        st, txt, js = get("/produtos", {"tipo": "E", "idComponente": pid, "criterio": 2, "limite": 30})
+        for k in ((js or {}).get("data") or [])[:12] if st == 200 else []:
+            st2, _, js2 = get(f"/produtos/estruturas/{k['id']}")
+            comps = (((js2 or {}).get("data") or {}).get("componentes") or []) if st2 == 200 else []
+            if len(comps) == 1 and int((comps[0].get("produto") or {}).get("id") or 0) == pid:
+                q = float(comps[0].get("quantidade") or 0)
+                if q >= 2 and k.get("codigo"):
+                    kits.append({"sku": k["codigo"], "nome": k.get("nome") or k["codigo"], "qtd": q})
+        kits.sort(key=lambda x: x["qtd"])
+    if falhou:                                   # resposta incompleta do Bling: não guarda no cache (tenta de novo na próxima)
+        return kits
+    with db_session() as c:
+        c.execute("DELETE FROM receb_kits WHERE sku_key=?", (key,))
+        c.execute("INSERT INTO receb_kits (sku_key, dados, em) VALUES (?,?,?)", (key, json.dumps(kits, ensure_ascii=False), _agora()))
+    return kits
+
+
+@recebimento_routes.get("/recebimento/notas/<int:nid>/kits")
+@login_required
+def kits_da_nota(nid):
+    """Para as etiquetas: por item, os kits do Bling feitos só daquele produto (ex.: kit de 10)."""
+    garantir_tabelas()
+    with db_session() as c:
+        itens = [dict(x) for x in c.execute("SELECT id, sku FROM receb_itens WHERE nota_id=?", (nid,)).fetchall()]
+    fresco = request.args.get("fresco") == "1"
+    out, feitos = {}, {}
+    for it in itens:
+        sku = str(it.get("sku") or "").strip()
+        if not sku:
+            continue
+        if sku.lower() not in feitos:
+            try:
+                feitos[sku.lower()] = _kits_do_sku(sku, fresco)
+            except Exception as e:
+                print(f"[RECEB] kits de {sku}: {e}", flush=True)
+                feitos[sku.lower()] = []
+        out[str(it["id"])] = feitos[sku.lower()]
+    return jsonify({"kits": out})
 
 
 @recebimento_routes.post("/recebimento/notas/<int:nid>/itens/<int:iid>/confirmar")
