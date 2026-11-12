@@ -72,6 +72,8 @@ if carro in ("FLEX", "COLETA"):
             sem += 1
         elif lim > hoje:
             outro += 1
+        elif lim < hoje:
+            sem += 0
         else:
             pend.append(e)
 

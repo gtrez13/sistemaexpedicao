@@ -892,6 +892,8 @@ def _montar_envios_ml():
         inf = (_ship_info.get(sid) or (0, None))[1]
         if not inf or inf.get("status") != "ready_to_ship":
             continue
+        if inf.get("sub") in ("dropped_off", "picked_up", "in_hub", "authorized_by_carrier", "in_transit"):
+            continue                                 # já entregue na agência / coletado: não é mais da Saída
         lg = inf.get("logistic") or ""
         if "fulfillment" in lg:
             continue
@@ -981,6 +983,11 @@ def saida_lista():
             (desde,)).fetchall()]
         bips = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_bipes").fetchall()}
         adiados = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_adiados WHERE dia > ?", (hoje,)).fetchall()}
+        r0 = conn.execute("SELECT MIN(em) AS m FROM saida_log").fetchone()
+    # Comercial não tem data do marketplace: expedido nos últimos 3 dias (e depois que a Saída começou a ser usada) e
+    # ainda não bipado na Saída = tem que sair
+    inicio_saida = _dia_ts(r0["m"]) if r0 and r0["m"] else hoje
+    desde_com = max(_dia_ts(time.time(), -3), inicio_saida)
     envios, atualizando = _envios_ml_hoje(esperar_s=8)
 
     def adiado(mid):
@@ -990,10 +997,35 @@ def saida_lista():
         b = bips.get(mid)
         return bool(b) and _dia_ts(b["em"]) == hoje
 
-    def linha(ml_id, cliente, tipo, status_wms, situacao, dia_saida=None, sub=None, so_ml=False, atrasado=False, extra=None):
-        b = bips.get(ml_id)
+    # tudo que identifica um pacote bipado HOJE -> id do bipe. Assim o pacote conta como carregado mesmo se o bipe
+    # ficou gravado com outro número (nº do envio, do pacote, de outra venda do mesmo envio, outro pedido do WMS).
+    bip_chave = {}
+    ids_hoje = [m for m in bips if bip_hoje(m)]
+    for m in ids_hoje:
+        cod = str(bips[m].get("codigo") or "")
+        ks = {str(m), cod, re.sub(r"\D", "", cod)}
+        if cod.startswith("{"):
+            try:
+                import json as _j
+                jj = _j.loads(cod)
+                ks |= {str(jj.get("id") or ""), str(jj.get("shipment_id") or ""), str(jj.get("order_id") or "")}
+            except Exception:
+                pass
+        for k in ks:
+            if k and len(k) >= 5:
+                bip_chave.setdefault(k, m)
+    if ids_hoje:
+        with db_session() as conn:
+            for k0 in range(0, len(ids_hoje), 200):
+                lote = ids_hoje[k0:k0 + 200]
+                for r in conn.execute(f"SELECT ml_id, ml_shipping_id FROM pedidos WHERE ml_id IN ({','.join('?' * len(lote))})", tuple(lote)).fetchall():
+                    if r["ml_shipping_id"]:
+                        bip_chave.setdefault(str(r["ml_shipping_id"]), r["ml_id"])
+
+    def linha(ml_id, cliente, tipo, status_wms, situacao, dia_saida=None, sub=None, so_ml=False, atrasado=False, extra=None, bip_id=None):
+        b = bips.get(bip_id or ml_id)
         d = {"ml_id": ml_id, "cliente": cliente, "tipo": tipo, "status_wms": status_wms, "envio_sub": sub, "situacao": situacao,
-             "dia_saida": dia_saida, "so_ml": so_ml, "atrasado": atrasado,
+             "dia_saida": dia_saida, "so_ml": so_ml, "atrasado": atrasado, "bip_id": (bip_id or ml_id) if b else None,
              "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None}
         d.update(extra or {})
         return d
@@ -1014,7 +1046,10 @@ def saida_lista():
             atrasado = bool(lim and lim < hoje)
             ad = adiado(mid) or adiado(e["chave"])
             extra = {"dia_fonte": e.get("lim_fonte"), "envio_id": e["sid"]}
-            if bip_hoje(mid):
+            bmid = next((bip_chave[k] for k in [mid, e["chave"], e["sid"], e["pack"], *e["orders"]] if k and k in bip_chave), None)
+            if bmid:
+                ja.add(bmid)
+            if bmid:
                 sit = "carregado"
                 if (ad and ad["dia"] > hoje) or (lim and lim > hoje):
                     extra["nao_e_hoje"] = True  # bipado antes da correção: é de outro dia, tirar do carro
@@ -1027,12 +1062,14 @@ def saida_lista():
                 sit = "outro_dia"
             elif not lim:
                 sit = "sem_data"                # o ML não disse o dia: NÃO conta como de hoje, fica para conferir
+            elif lim < hoje:
+                sit = "atrasado"                # de dia anterior: fica separado, NÃO conta na lista de hoje
             elif e.get("sub") == "invoice_pending":
                 sit = "nao_expedido"            # "NF-e para gerenciar" no ML: ainda sem nota
             else:
                 sit = "pronto"
             out.append(linha(mid, (p or {}).get("cliente_nome") or e["cliente"], e["tipo"], (p or {}).get("status"), sit,
-                             lim, e.get("sub"), so_ml=not p, atrasado=atrasado and sit != "outro_dia", extra=extra))
+                             lim, e.get("sub"), so_ml=not p, atrasado=atrasado and sit != "outro_dia", extra=extra, bip_id=bmid))
         # já carregados hoje que saíram da lista do ML (foram coletados): continuam aparecendo como carregados
         for p in peds:
             t = _tipo_saida(p)
@@ -1079,6 +1116,25 @@ def saida_lista():
         ad = adiado(p["ml_id"])
         if ad and not bip_hoje(p["ml_id"]):
             dia_saida = ad["dia"]
+        if tipo == "COMERCIAL" and not bip_hoje(p["ml_id"]) and not ad:
+            if b:
+                continue                                    # bipado na Saída em outro dia: já saiu
+            prazo = str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10]
+            prazo = prazo if re.match(r"\d{4}-\d{2}-\d{2}$", prazo) else ""
+            exp = str(p.get("atualizado_em") or "")[:10]
+            if prazo and prazo > hoje:
+                situacao, dia_saida = "outro_dia", prazo
+            elif p.get("status") == "CONCLUIDO" and exp >= desde_com:
+                situacao, dia_saida = "pronto", hoje        # expedido (hoje ou nos últimos dias) e ainda não saiu
+            elif p.get("status") != "CONCLUIDO" and prazo and prazo <= hoje:
+                situacao, dia_saida = "nao_expedido", prazo
+            else:
+                continue
+            out.append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo, "status_wms": p.get("status"),
+                        "envio": None, "envio_sub": None, "situacao": situacao, "dia_saida": dia_saida, "prazo": prazo,
+                        "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
+                        "bipado_em": None, "bipado_por": None, "adiado_por": None, "adiado_motivo": None})
+            continue
         if bip_hoje(p["ml_id"]):
             situacao = "carregado"
         elif ad:
@@ -1098,7 +1154,7 @@ def saida_lista():
                     "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
                     "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None,
                     "adiado_por": ad.get("por") if ad else None, "adiado_motivo": ad.get("motivo") if ad else None})
-    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "sem_data": 3, "outro_dia": 4, "saiu": 5}
+    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "atrasado": 3, "sem_data": 4, "outro_dia": 5, "saiu": 6}
     out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x.get("expedido_em") or "")))
     return jsonify({"pedidos": out, "hoje": hoje, "fonte_ml": envios is not None, "ml_atualizando": atualizando,
                     "ml_erro": _ml_envios.get("erro"), "gestor": _gestor_saida()})
@@ -1190,7 +1246,7 @@ def saida_bipar():
     elif p.get("status") != "CONCLUIDO" and _tipo_saida(p) != "COMERCIAL":
         aviso = f"ATENÇÃO: esse pedido está {p.get('status')} no WMS — não foi expedido (sem NF/etiqueta pelo sistema)"
     return jsonify({"success": True, "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": _tipo_saida(p),
-                    "repetido": bool(ja), "aviso": aviso})
+                    "envio_id": str(p.get("ml_shipping_id") or ""), "repetido": bool(ja), "aviso": aviso})
 
 
 @mapa_routes.get("/saida/historico")
@@ -1341,7 +1397,8 @@ def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, 
         if rml:
             embed["fields"].append({"name": "Mercado Livre agora (prontos para enviar)",
                                     "value": f"de hoje: {rml['hoje']}" + (f" ({rml['sem_nf']} sem NF)" if rml["sem_nf"] else "")
-                                             + f" · outro dia: {rml['outro_dia']}" + (f" · sem data: {rml['sem_data']}" if rml["sem_data"] else "")})
+                                             + f" · outro dia: {rml['outro_dia']}" + (f" · de dias anteriores: {rml['atrasado']}" if rml["atrasado"] else "")
+                                             + (f" · sem data: {rml['sem_data']}" if rml["sem_data"] else "")})
         if quem_bip:
             embed["fields"].append({"name": "Bipado por", "value": quem_bip[:1000]})
         if nao_exp:
@@ -1388,7 +1445,7 @@ def _ml_resumo(carro):
     if carro not in ("FLEX", "COLETA") or d is None:
         return None
     hoje = _hoje()
-    n = {"hoje": 0, "sem_nf": 0, "outro_dia": 0, "sem_data": 0}
+    n = {"hoje": 0, "sem_nf": 0, "outro_dia": 0, "sem_data": 0, "atrasado": 0}
     for e in d.values():
         if e.get("tipo") != carro:
             continue
@@ -1397,6 +1454,8 @@ def _ml_resumo(carro):
             n["sem_data"] += 1
         elif lim > hoje:
             n["outro_dia"] += 1
+        elif lim < hoje:
+            n["atrasado"] += 1
         else:
             n["hoje"] += 1
             n["sem_nf"] += 1 if e.get("sub") == "invoice_pending" else 0
@@ -1519,10 +1578,16 @@ def saida_adiar():
         _saida_tabelas(conn)
         p0 = conn.execute("SELECT cliente_nome, origem, logistic_type FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
         cli = (p0["cliente_nome"] if p0 else None) or str(body.get("cliente") or "")[:120] or None
-        b0 = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (mid,)).fetchone()
-        if b0:
-            conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (mid,))
-            _log_saida(conn, "desfez", mid, cli, detalhe=f"tirado de hoje (tinha sido bipado por {b0['por']})")
+        bid = str(body.get("bip_id") or "").strip()
+        b0 = None
+        for k in dict.fromkeys([mid, bid]):
+            if not k:
+                continue
+            bx = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (k,)).fetchone()
+            if bx:
+                b0 = bx
+                conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (k,))
+                _log_saida(conn, "desfez", k, cli, detalhe=f"tirado de hoje (tinha sido bipado por {bx['por']})")
         conn.execute("DELETE FROM saida_adiados WHERE ml_id=?", (mid,))
         conn.execute("INSERT INTO saida_adiados (ml_id, dia, motivo, por, em) VALUES (?,?,?,?,?)", (mid, dia, motivo, _quem_saida(), int(time.time())))
         _log_saida(conn, "adiou", mid, cli, tipo=str(body.get("tipo") or "")[:20] or None, detalhe=f"sai {dia[8:10]}/{dia[5:7]} · {motivo}")

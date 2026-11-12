@@ -516,7 +516,7 @@ def _conta_grupo(g):
         sit = "quantidade"
     elif abs(dif) > TOL_TOTAL + 1e-9:
         sit = "preco"
-    elif abs(dif) >= 0.005 or any(abs(float(i.get("valor_unit") or 0) - v) > 1e-6 for i in g["nf"] for v in precos_pc[:1]):
+    elif abs(dif) >= 0.005:
         sit = "centavos"          # arredondamento até R$ 0,10: aceito
     else:
         sit = "ok"
