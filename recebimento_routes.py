@@ -29,6 +29,7 @@ import json
 import os
 import re
 import threading
+import datetime
 import time
 import xml.etree.ElementTree as ET
 
@@ -116,7 +117,7 @@ def _garantir_tabelas():
         for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped"),
                         ("receb_notas", "entrada_etapa"), ("receb_notas", "entrada_em"), ("receb_notas", "entrada_por"),
                         ("receb_notas", "entrada_msg"), ("receb_notas", "entrada_erro"), ("receb_notas", "entrada_resumo"),
-                        ("receb_itens", "qtd_bipada"), ("receb_itens", "ajuste_por")):
+                        ("receb_itens", "qtd_bipada"), ("receb_itens", "ajuste_por"), ("receb_itens", "fabricacao")):
             if pg:
                 # só altera se faltar a coluna (ALTER trava a tabela; e um erro engolido aqui estragava a transação inteira)
                 tem = c.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (tb, col)).fetchone()
@@ -1108,7 +1109,7 @@ def editar_item(nid, iid):
                 cnpj = c.execute("SELECT fornecedor_cnpj FROM receb_notas WHERE id=?", (nid,)).fetchone()["fornecedor_cnpj"]
                 c.execute("DELETE FROM receb_vinculos WHERE fornecedor_cnpj=? AND cprod=?", (cnpj, it["cprod"]))
                 c.execute("INSERT INTO receb_vinculos (fornecedor_cnpj, cprod, sku, criado_por, criado_em) VALUES (?,?,?,?,?)", (cnpj, it["cprod"], sku, _quem(), _agora()))
-        for campo in ("lote", "validade", "obs"):
+        for campo in ("lote", "validade", "obs", "fabricacao"):
             if campo in d:
                 sets.append(f"{campo}=?"); args.append((str(d[campo]).strip() or None) if d[campo] is not None else None)
         if "qtd_conferida" in d:
@@ -1425,8 +1426,21 @@ def _vincular_pc(nid, pc, nf_id, plano, quem):
     st, txt, js = _bling_raw("PUT", f"/pedidos/compras/{pc['id']}", d)
     ok = st in (200, 201, 204)
     msg = f"{n} item(ns) do pedido {pc['numero']} vinculados à nota" if ok else (_msg_bl(txt) or f"HTTP {st}")
+    conferido = False
+    if ok:
+        # o Bling responde 200 mesmo quando ignora o campo: lê o pedido de volta e confere item a item
+        st2, txt2, js2 = _bling_raw("GET", f"/pedidos/compras/{pc['id']}")
+        its2 = (((js2 or {}).get("data") or {}).get("itens") or []) if st2 == 200 else []
+        gravados = sum(1 for i in its2 if str((i.get("notaFiscal") or {}).get("id") or "") == str(nf_id))
+        conferido = st2 == 200
+        if st2 == 200 and gravados == 0:
+            ok = False
+            msg = (f"o Bling aceitou o pedido {pc['numero']} mas NÃO gravou o vínculo com a nota (a API não vincula): "
+                   "vincule na tela do Bling. O resto da entrada continua normal")
+        elif st2 == 200 and gravados < n:
+            msg = f"{gravados} de {n} item(ns) do pedido {pc['numero']} vinculados à nota"
     _ent_log(nid, f"vincular a nota ao pedido {pc['numero']}", ok, st, msg, txt, d, por=quem)
-    return {"ok": ok, "msg": msg, "original": orig if ok else None}
+    return {"ok": ok, "msg": msg, "original": orig if (st in (200, 201, 204)) else None, "conferido": conferido}
 
 
 def _contas_existentes(forn, contas):
@@ -1482,6 +1496,45 @@ def _vigia_loop():
                     _disparar_entrada(r["id"], f"{r['entrada_por'] or 'automático'} (automático)")
         except Exception as e:
             print(f"[ENTRADA] vigia: {e}", flush=True)
+
+
+def _rastros_xml(xml_txt):
+    """{n_item: [{lote, fab, val}]} dos <rastro> do XML (dFab = data de fabricação, que o Bling exige para criar o lote)."""
+    out = {}
+    try:
+        root = ET.fromstring(xml_txt.encode("utf-8") if isinstance(xml_txt, str) else xml_txt)
+    except Exception:
+        return out
+    for det in root.iter(f"{{{NS['n']}}}det"):
+        n = int(det.get("nItem") or 0)
+        for ras in det.iter(f"{{{NS['n']}}}rastro"):
+            g = lambda t: (ras.findtext(f"n:{t}", default="", namespaces=NS) or "").strip()
+            out.setdefault(n, []).append({"lote": g("nLote"), "fab": g("dFab")[:10], "val": g("dVal")[:10]})
+    return out
+
+
+def _data_ok(iso):
+    try:
+        d = datetime.date.fromisoformat(str(iso)[:10])
+    except Exception:
+        return None
+    hoje = datetime.date.today()
+    return d.isoformat() if hoje - datetime.timedelta(days=365 * 15) <= d <= hoje else None
+
+
+def _fabricacao_auto(lote, rastros):
+    """Data de fabricação sem perguntar: 1) <rastro><dFab> do XML desse lote; 2) nº do lote que é uma data (AAAAMMDD, ex.: 20250715)."""
+    lote = str(lote or "").strip().upper()
+    rs = rastros or []
+    for r in rs:
+        if r.get("fab") and str(r.get("lote") or "").strip().upper() == lote and _data_ok(r["fab"]):
+            return _data_ok(r["fab"]), "xml"
+    if len(rs) == 1 and rs[0].get("fab") and _data_ok(rs[0]["fab"]) and not rs[0].get("lote"):
+        return _data_ok(rs[0]["fab"]), "xml"
+    m = re.fullmatch(r"(20\d{2})(\d{2})(\d{2})", lote)
+    if m and _data_ok(f"{m.group(1)}-{m.group(2)}-{m.group(3)}"):
+        return _data_ok(f"{m.group(1)}-{m.group(2)}-{m.group(3)}"), "lote"
+    return None, None
 
 
 def plano_entrada(nid, resumo=None):
@@ -1542,13 +1595,21 @@ def plano_entrada(nid, resumo=None):
     pc_itens = [{"sku": (i.get("produto") or {}).get("codigo"), "cprod": i.get("codigoFornecedor"), "pid": (i.get("produto") or {}).get("id"),
                  "valor": i.get("valor"), "qtd": i.get("quantidade")} for i in pc.get("itens") or []]
     ids = []
+    rastros = None
     for it in itens:
         x = _item_pc({"itens": pc_itens}, it) if it.get("sku") or it.get("cprod") else None
         pid = (x or {}).get("pid")
         q = float(it["qtd_conferida"] or 0)
+        lote_it = (it.get("lote") or "").strip()
+        fab, fab_origem = ((it.get("fabricacao") or "").strip()[:10], "informada") if (it.get("fabricacao") or "").strip() else (None, None)
+        if not fab and lote_it:
+            if rastros is None:
+                rastros = _rastros_xml(r["xml"] or "")
+            fab, fab_origem = _fabricacao_auto(lote_it, rastros.get(int(it["n_item"] or 0)))
         plano["itens"].append({"item_id": it["id"], "n_item": it["n_item"], "sku": it["sku"], "descricao": it["descricao"], "pid": pid,
-                               "qtd": q, "custo": float(it.get("valor_unit") or 0), "lote": (it.get("lote") or "").strip(),
-                               "validade": (it.get("validade") or "").strip(), "controla_lote": False})
+                               "qtd": q, "custo": float(it.get("valor_unit") or 0), "lote": lote_it,
+                               "validade": (it.get("validade") or "").strip(), "controla_lote": False,
+                               "fabricacao": fab or "", "fabricacao_origem": fab_origem, "lote_existe": False})
         if not pid:
             ponto(False, f"Item {it['n_item']}", f"{(it['descricao'] or '')[:40]}: não achei o produto no pedido (SKU {it['sku'] or '-'})")
         else:
@@ -1561,6 +1622,13 @@ def plano_entrada(nid, resumo=None):
                 p["controla_lote"] = ctl.get(int(p["pid"]), False)
                 if p["controla_lote"] and not (p["lote"] and p["validade"]):
                     ponto(False, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: o Bling controla lote desse produto e falta lote/validade")
+                elif p["controla_lote"] and not p["fabricacao"]:
+                    # o Bling só pede fabricação para CRIAR o lote: se o lote já existe nesse produto, não precisa
+                    st2, _, js2 = _bling_raw("GET", "/produtos/lotes", params={"idsProdutos[]": p["pid"]})
+                    p["lote_existe"] = any(str(l.get("codigoLote") or "").strip().upper() == p["lote"].upper() for l in ((js2 or {}).get("data") or []))
+                    if not p["lote_existe"]:
+                        ponto(False, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: falta a DATA DE FABRICAÇÃO do lote {p['lote']} "
+                                                          "(o Bling exige para criar o lote): informe aqui embaixo")
     n_lote = sum(1 for p in plano["itens"] if p["controla_lote"])
     ponto(True, "Estoque", f"{sum(p['qtd'] for p in plano['itens']):g} unidades em {len(plano['itens'])} produtos no depósito Local"
           + (f" · {n_lote} com lote" if n_lote else ""))
@@ -1653,9 +1721,13 @@ def _job_entrada(nid, quem):
         nf_id = res["nota"]["id"]
 
         # 0b) conciliar no Bling: a nota vinculada ao pedido de compra (não trava a entrada se o Bling recusar)
-        if not res.get("vinculo"):
+        vin0 = res.get("vinculo") or {}
+        if not vin0 or (vin0.get("ok") and not vin0.get("conferido")):     # versão antiga marcava ok sem conferir: confere agora
             res["_etapa"] = "vinculo"; _ent_estado(nid, "vinculo")
-            res["vinculo"] = _vincular_pc(nid, pc, nf_id, p, quem)
+            novo = _vincular_pc(nid, pc, nf_id, p, quem)
+            if vin0.get("original"):
+                novo["original"] = vin0["original"]          # o pedido como estava ANTES do WMS (para desfazer)
+            res["vinculo"] = novo
             salvar()
 
         # 1) pedido -> Atendido (medindo o estoque antes/depois: o Bling pode lançar sozinho ao atender)
@@ -1777,7 +1849,12 @@ def _job_entrada(nid, quem):
             exist = {str(l.get("codigoLote")): l.get("idLote") for l in ((js or {}).get("data") or [])}
             idl = exist.get(x["lote"])
             if not idl:
-                corpo = [{"produto": {"id": int(x["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "codigoLote": x["lote"], "dataValidade": x["validade"]}]
+                if not x.get("fabricacao"):
+                    salvar()
+                    raise RuntimeError(f"CONF|Falta a data de fabricação do lote {x['lote']} (item {x['n_item']}): o Bling exige para criar o lote. "
+                                       "Informe em 'Ver o que vai ser lançado' e clique Continuar a entrada.")
+                corpo = [{"produto": {"id": int(x["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "codigoLote": x["lote"],
+                          "dataFabricacao": x["fabricacao"], "dataValidade": x["validade"]}]
                 st, txt, js = _bling_raw("PUT", "/produtos/lotes", corpo)
                 try:
                     idl = js["data"]["saved"][0]["id"]
@@ -1895,7 +1972,9 @@ def entrada_info(nid):
     if request.args.get("previa") and r["entrada_etapa"] not in ("ok",) and not out["rodando"]:
         try:
             p = plano_entrada(nid)
-            out["previa"] = {"pontos": p["pontos"], "bloqueio": p["bloqueio"], "contas": [{k: v for k, v in x.items() if k != "payload"} for x in p["contas"]]}
+            out["previa"] = {"pontos": p["pontos"], "bloqueio": p["bloqueio"], "contas": [{k: v for k, v in x.items() if k != "payload"} for x in p["contas"]],
+                             "lotes": [{k: x.get(k) for k in ("item_id", "n_item", "sku", "descricao", "qtd", "lote", "validade", "fabricacao",
+                                                              "fabricacao_origem", "lote_existe")} for x in p["itens"] if x.get("controla_lote")]}
         except Exception as e:
             out["previa"] = {"pontos": [], "bloqueio": f"Erro ao montar a prévia: {e}"}
     return jsonify(out)
