@@ -111,7 +111,8 @@ def _garantir_tabelas():
         c.execute("CREATE INDEX IF NOT EXISTS ix_receb_itens_nota ON receb_itens (nota_id)")
         for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped"),
                         ("receb_notas", "entrada_etapa"), ("receb_notas", "entrada_em"), ("receb_notas", "entrada_por"),
-                        ("receb_notas", "entrada_msg"), ("receb_notas", "entrada_erro"), ("receb_notas", "entrada_resumo")):
+                        ("receb_notas", "entrada_msg"), ("receb_notas", "entrada_erro"), ("receb_notas", "entrada_resumo"),
+                        ("receb_itens", "qtd_bipada"), ("receb_itens", "ajuste_por")):
             if pg:
                 # só altera se faltar a coluna (ALTER trava a tabela; e um erro engolido aqui estragava a transação inteira)
                 tem = c.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (tb, col)).fetchone()
@@ -428,6 +429,7 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
     itens = [dict(x) for x in c.execute("SELECT * FROM receb_itens WHERE nota_id=? ORDER BY n_item", (nid,)).fetchall()]
     for it in itens:
         it["qtd_nf"] = float(it["qtd_nf"] or 0); it["qtd_conferida"] = float(it["qtd_conferida"] or 0)
+        _num_bip(it)
         if not it.get("lote_xml"):
             lt, vl = lote_da_descricao(it.get("descricao"))
             if lt:
@@ -450,11 +452,16 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
         d["comparacao"] = _comparacao(d)
     d["permite_liberar"] = PERMITE_LIBERAR
     d["exigir_lote"] = EXIGIR_LOTE
+    d["tol_total"] = TOL_TOTAL
+    d["digitar_so_gestor"] = DIGITAR_SO_GESTOR
     d["eh_gestor"] = eh_gestor()
     return d
 
 
 PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.01"))   # R$ por unidade (só arredondamento)
+# Biel 12/11: diferença de até R$ 0,10 (arredondamento) PASSA — na linha e no total dos produtos; acima disso recusa
+TOL_TOTAL = float(os.environ.get("RECEB_TOL_TOTAL", "0.10"))
+DIGITAR_SO_GESTOR = os.environ.get("RECEB_DIGITAR_SO_GESTOR", "1") == "1"   # operador BIPA; aumentar na mão só supervisor/admin
 PERMITE_LIBERAR = os.environ.get("RECEB_PERMITE_LIBERAR", "0") == "1"   # padrão: divergência NUNCA é liberada
 
 
@@ -464,44 +471,92 @@ def _brl(v, casas=2) -> str:
     return "R$ " + t.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _up(v):
+    return str(v or "").strip().upper()
+
+
+def _mesmo_prod(a, b):
+    return bool((a.get("sku") and b.get("sku") and _up(a["sku"]) == _up(b["sku"])) or
+                (a.get("cprod") and b.get("cprod") and _up(a["cprod"]) == _up(b["cprod"])))
+
+
+def _grupos(itens_nf, pc):
+    """Junta por PRODUTO: o mesmo produto pode vir em várias linhas da nota (um lote por linha) e/ou do pedido.
+    -> (grupos [{nf: [...], pc: [...]}], itens do pedido que não casaram com nenhum produto da nota)"""
+    grupos = []
+    for it in itens_nf:
+        g = next((g for g in grupos if any(_mesmo_prod(it, o) for o in g["nf"])), None)
+        if g:
+            g["nf"].append(it)
+        else:
+            grupos.append({"nf": [it], "pc": []})
+    sobras = []
+    for x in (pc or {}).get("itens") or []:
+        g = (next((g for g in grupos if any(x.get("sku") and o.get("sku") and _up(x["sku"]) == _up(o["sku"]) for o in g["nf"])), None)
+             or next((g for g in grupos if any(x.get("cprod") and o.get("cprod") and _up(x["cprod"]) == _up(o["cprod"]) for o in g["nf"])), None))
+        if g:
+            g["pc"].append(x)
+        else:
+            sobras.append(x)
+    return grupos, sobras
+
+
+def _conta_grupo(g):
+    """Números do grupo: quantidades e totais somados, diferença e a situação (ok / centavos / quantidade / preco)."""
+    q_nf = sum(float(i["qtd_nf"] or 0) for i in g["nf"])
+    t_nf = round(sum(round(float(i["qtd_nf"] or 0) * float(i.get("valor_unit") or 0), 2) for i in g["nf"]), 2)
+    q_pc = sum(float(x.get("qtd") or 0) for x in g["pc"])
+    t_pc = round(sum(round(float(x.get("qtd") or 0) * float(x.get("valor") or 0), 2) for x in g["pc"]), 2)
+    precos_pc = [float(x.get("valor") or 0) for x in g["pc"]]
+    dif = round(t_nf - t_pc, 2)
+    # Biel 12/11: vale o DINHEIRO — até R$ 0,10 de diferença no produto passa (preço com mais casas, arredondamento)
+    preco_ruim = [] if abs(dif) <= TOL_TOTAL + 1e-9 else \
+        [i for i in g["nf"] if not any(abs(float(i.get("valor_unit") or 0) - v) <= PRECO_TOL for v in precos_pc)]
+    if abs(q_nf - q_pc) > 1e-6:
+        sit = "quantidade"
+    elif abs(dif) > TOL_TOTAL + 1e-9:
+        sit = "preco"
+    elif abs(dif) >= 0.005 or any(abs(float(i.get("valor_unit") or 0) - v) > 1e-6 for i in g["nf"] for v in precos_pc[:1]):
+        sit = "centavos"          # arredondamento até R$ 0,10: aceito
+    else:
+        sit = "ok"
+    return {"q_nf": q_nf, "t_nf": t_nf, "q_pc": q_pc, "t_pc": t_pc, "dif": dif, "sit": sit, "preco_ruim": preco_ruim,
+            "vu_pc": (precos_pc[0] if len(set(precos_pc)) == 1 else (t_pc / q_pc if q_pc else None)) if precos_pc else None}
+
+
 def _comparacao(d: dict) -> dict | None:
-    """NF x pedido, linha a linha (qtd, preço unitário, total da linha e diferença) + totais. Mostra DE ONDE vem a diferença."""
+    """NF x pedido por PRODUTO (linhas do mesmo produto somadas: lote em várias linhas) + totais. Mostra DE ONDE vem a diferença."""
     pc = d.get("pedido_compra")
     if not pc:
         return None
-    linhas, usados = [], set()
-    for it in d["itens"]:
-        pi = _item_pc(pc, it)
-        q_nf, vu_nf = float(it["qtd_nf"] or 0), float(it.get("valor_unit") or 0)
-        t_nf = round(q_nf * vu_nf, 2)
-        if not pi:
-            linhas.append({"n_item": it["n_item"], "descricao": it["descricao"], "sku": it.get("sku"), "qtd_nf": q_nf, "qtd_pc": None,
-                           "vu_nf": vu_nf, "vu_pc": None, "tot_nf": t_nf, "tot_pc": 0.0, "dif": t_nf, "situacao": "fora_pedido"})
+    linhas = []
+    grupos, sobras = _grupos(d["itens"], pc)
+    for g in grupos:
+        it0 = g["nf"][0]
+        nums = [i["n_item"] for i in g["nf"]]
+        vus = {float(i.get("valor_unit") or 0) for i in g["nf"]}
+        desc = it0["descricao"] + (f" ({len(g['nf'])} linhas na nota)" if len(g["nf"]) > 1 else "")
+        if not g["pc"]:
+            for i in g["nf"]:
+                q, vu = float(i["qtd_nf"] or 0), float(i.get("valor_unit") or 0)
+                linhas.append({"n_item": i["n_item"], "n_itens": [i["n_item"]], "descricao": i["descricao"], "sku": i.get("sku"), "qtd_nf": q,
+                               "qtd_pc": None, "vu_nf": vu, "vu_pc": None, "tot_nf": round(q * vu, 2), "tot_pc": 0.0, "dif": round(q * vu, 2),
+                               "situacao": "fora_pedido"})
             continue
-        usados.add(id(pi))
+        n = _conta_grupo(g)
+        linhas.append({"n_item": nums[0], "n_itens": nums, "descricao": desc, "sku": it0.get("sku"), "qtd_nf": n["q_nf"], "qtd_pc": n["q_pc"],
+                       "vu_nf": (next(iter(vus)) if len(vus) == 1 else (n["t_nf"] / n["q_nf"] if n["q_nf"] else 0)), "vu_pc": n["vu_pc"],
+                       "tot_nf": n["t_nf"], "tot_pc": n["t_pc"], "dif": n["dif"], "situacao": n["sit"],
+                       "linhas_pc": len(g["pc"])})
+    for pi in sobras:
         q_pc, vu_pc = float(pi.get("qtd") or 0), float(pi.get("valor") or 0)
         t_pc = round(q_pc * vu_pc, 2)
-        dif = round(t_nf - t_pc, 2)
-        if abs(q_nf - q_pc) > 1e-6:
-            sit = "quantidade"
-        elif abs(vu_nf - vu_pc) > PRECO_TOL:
-            sit = "preco"
-        elif abs(dif) >= 0.005:
-            sit = "centavos"          # preço unitário bate (até R$ 0,01), mas a linha difere no arredondamento
-        else:
-            sit = "ok"
-        linhas.append({"n_item": it["n_item"], "descricao": it["descricao"], "sku": it.get("sku"), "qtd_nf": q_nf, "qtd_pc": q_pc,
-                       "vu_nf": vu_nf, "vu_pc": vu_pc, "tot_nf": t_nf, "tot_pc": t_pc, "dif": dif, "situacao": sit})
-    for pi in pc["itens"]:
-        if id(pi) not in usados:
-            q_pc, vu_pc = float(pi.get("qtd") or 0), float(pi.get("valor") or 0)
-            t_pc = round(q_pc * vu_pc, 2)
-            linhas.append({"n_item": None, "descricao": pi.get("descricao") or pi.get("sku") or "", "sku": pi.get("sku"), "qtd_nf": None,
-                           "qtd_pc": q_pc, "vu_nf": None, "vu_pc": vu_pc, "tot_nf": 0.0, "tot_pc": t_pc, "dif": -t_pc, "situacao": "nao_veio"})
+        linhas.append({"n_item": None, "n_itens": [], "descricao": pi.get("descricao") or pi.get("sku") or "", "sku": pi.get("sku"), "qtd_nf": None,
+                       "qtd_pc": q_pc, "vu_nf": None, "vu_pc": vu_pc, "tot_nf": 0.0, "tot_pc": t_pc, "dif": -t_pc, "situacao": "nao_veio"})
     tot_nf = round(sum(x["tot_nf"] for x in linhas), 2)
     tot_pc = round(sum(x["tot_pc"] for x in linhas), 2)
     return {"pedido": pc.get("numero"), "linhas": linhas, "tot_nf": tot_nf, "tot_pc": tot_pc, "dif": round(tot_nf - tot_pc, 2),
-            "tol_total": 0.05, "tol_unit": PRECO_TOL}
+            "tol_total": TOL_TOTAL, "tol_unit": PRECO_TOL}
 
 
 _RX_LOTE = re.compile(r"\b(?:LT|LOTE|LOT)\s*[:.]?\s*([A-Z0-9][A-Z0-9/\-.]{2,24})", re.I)
@@ -564,18 +619,21 @@ def _sim(a, b):
 
 
 def _parear(itens_nf, pc):
-    up = lambda v: str(v or "").strip().upper()
-    livres = list(range(len(pc["itens"])))
-    pares = {}
-    for i, it in enumerate(itens_nf):                         # 1) código: SKU nosso ou código do fornecedor
-        for k in livres:
-            x = pc["itens"][k]
-            if (x.get("sku") and it.get("sku") and up(x["sku"]) == up(it["sku"])) or \
-               (x.get("cprod") and it.get("cprod") and up(x["cprod"]) == up(it["cprod"])):
-                pares[i] = (k, "codigo"); livres.remove(k); break
-    for i, it in enumerate(itens_nf):                         # 2) sem código: mesma quantidade E mesmo preço
-        if i in pares:
-            continue
+    """Casa a nota com UM pedido. 1) por código (SKU/código do fornecedor), juntando o mesmo produto em várias linhas;
+    2) item sem código casado: mesma quantidade E mesmo preço num item livre do pedido."""
+    grupos, sobras = _grupos(itens_nf, pc)
+    idx_pc = {id(x): k for k, x in enumerate(pc["itens"])}
+    idx_nf = {id(it): i for i, it in enumerate(itens_nf)}
+    pares, sem, ok_grupos = {}, [], []
+    for g in grupos:
+        if g["pc"]:
+            for it in g["nf"]:
+                pares[idx_nf[id(it)]] = (idx_pc[id(g["pc"][0])], "codigo")
+            ok_grupos.append(g)
+        else:
+            sem.extend(g["nf"])
+    livres = [idx_pc[id(x)] for x in sobras]
+    for it in sem:                                            # 2) sem código: mesma quantidade E mesmo preço
         cands = [k for k in livres if abs(float(pc["itens"][k].get("qtd") or 0) - float(it["qtd_nf"] or 0)) < 1e-6
                  and abs(float(pc["itens"][k].get("valor") or 0) - float(it.get("valor_unit") or 0)) <= PRECO_TOL]
         if not cands:
@@ -583,26 +641,29 @@ def _parear(itens_nf, pc):
         cands.sort(key=lambda k: -_sim(it.get("descricao"), pc["itens"][k].get("descricao")))
         amb = len(cands) > 1 and _sim(it.get("descricao"), pc["itens"][cands[0]].get("descricao")) == \
             _sim(it.get("descricao"), pc["itens"][cands[1]].get("descricao"))
-        pares[i] = (cands[0], "valores_ambiguo" if amb else "valores"); livres.remove(cands[0])
+        pares[idx_nf[id(it)]] = (cands[0], "valores_ambiguo" if amb else "valores")
+        livres.remove(cands[0])
+        ok_grupos.append({"nf": [it], "pc": [pc["itens"][cands[0]]]})
     batem, problemas = 0, []
-    for i, it in enumerate(itens_nf):
-        nome = (it.get("descricao") or "")[:38]
-        if i not in pares:
-            problemas.append(f"{nome}: não está no pedido"); continue
-        x = pc["itens"][pares[i][0]]
-        q_ok = abs(float(x.get("qtd") or 0) - float(it["qtd_nf"] or 0)) < 1e-6
-        v_ok = abs(float(x.get("valor") or 0) - float(it.get("valor_unit") or 0)) <= PRECO_TOL
-        if q_ok and v_ok:
-            batem += 1
+    casados = {id(it) for g in ok_grupos for it in g["nf"]}
+    for it in itens_nf:
+        if id(it) not in casados:
+            problemas.append(f"{(it.get('descricao') or '')[:38]}: não está no pedido")
+    for g in ok_grupos:
+        n = _conta_grupo(g)
+        nome = (g["nf"][0].get("descricao") or "")[:38]
+        if n["sit"] in ("ok", "centavos"):
+            batem += len(g["nf"])
+        elif n["sit"] == "quantidade":
+            problemas.append(f"{nome}: quantidade NF {n['q_nf']:g} x pedido {n['q_pc']:g}")
         else:
-            problemas.append(f"{nome}: " + ("quantidade NF {:g} x pedido {:g}".format(float(it["qtd_nf"] or 0), float(x.get("qtd") or 0)) if not q_ok
-                                            else "preço NF {} x pedido {}".format(_brl(it.get("valor_unit"), 4), _brl(x.get("valor"), 4))))
+            problemas.append(f"{nome}: preço NF {_brl(g['nf'][0].get('valor_unit'), 4)} x pedido {_brl(n['vu_pc'], 4) if n['vu_pc'] is not None else '-'}")
     for k in livres:
         x = pc["itens"][k]
         problemas.append(f"pedido tem {(x.get('descricao') or x.get('sku') or '')[:38]} ({float(x.get('qtd') or 0):g}) que não veio")
-    tot_nf = round(sum(float(it["qtd_nf"] or 0) * float(it.get("valor_unit") or 0) for it in itens_nf), 2)
-    tot_pc = round(sum(float(x.get("qtd") or 0) * float(x.get("valor") or 0) for x in pc["itens"]), 2)
-    if abs(tot_nf - tot_pc) > 0.05:
+    tot_nf = round(sum(round(float(it["qtd_nf"] or 0) * float(it.get("valor_unit") or 0), 2) for it in itens_nf), 2)
+    tot_pc = round(sum(round(float(x.get("qtd") or 0) * float(x.get("valor") or 0), 2) for x in pc["itens"]), 2)
+    if abs(tot_nf - tot_pc) > TOL_TOTAL + 1e-9:
         problemas.append(f"total NF {_brl(tot_nf)} x pedido {_brl(tot_pc)}")
     ambiguo = any(m == "valores_ambiguo" for _, m in pares.values())
     exato = not problemas and batem == len(itens_nf) and len(itens_nf) > 0
@@ -652,28 +713,30 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
             m.append(f"Item {it['n_item']} ({nome}): SOBROU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
         if conferencia and EXIGIR_LOTE and (not (it["lote"] or "").strip() or not (it["validade"] or "").strip()):
             m.append(f"Item {it['n_item']} ({nome}): sem lote/validade")
-        if pc:
-            pi = _item_pc(pc, it)
-            if not pi:
-                m.append(f"Item {it['n_item']} ({nome}): NÃO está no pedido de compra {pc['numero']}")
-            else:
-                usados.add(id(pi))
-                qpc = float(pi["qtd"] or 0)
-                if abs(it["qtd_nf"] - qpc) > 1e-6:
-                    m.append(f"Item {it['n_item']} ({nome}): QUANTIDADE não bate — NF {it['qtd_nf']:g} x pedido {qpc:g}")
-                vpc, vnf = float(pi.get("valor") or 0), float(it.get("valor_unit") or 0)
-                if abs(vnf - vpc) > PRECO_TOL:
-                    m.append(f"Item {it['n_item']} ({nome}): VALOR não bate — NF {_brl(vnf, 4)} x pedido {_brl(vpc, 4)}")
     if pc:
-        for pi in pc["itens"]:
-            if id(pi) not in usados:
-                m.append(f"Item do pedido {pc['numero']} NÃO veio na nota: {(pi.get('descricao') or pi.get('sku') or '')[:40]} ({float(pi.get('qtd') or 0):g})")
-        tot_nf = round(sum(it["qtd_nf"] * float(it.get("valor_unit") or 0) for it in d["itens"]), 2)
-        tot_pc = round(sum(float(pi.get("qtd") or 0) * float(pi.get("valor") or 0) for pi in pc["itens"]), 2)
-        if abs(tot_nf - tot_pc) > 0.05:
+        grupos, sobras = _grupos(d["itens"], pc)
+        for g in grupos:
+            nomes = "Item " + "+".join(str(i["n_item"]) for i in g["nf"]) + f" ({g['nf'][0]['descricao'][:40]})"
+            if not g["pc"]:
+                for i in g["nf"]:
+                    m.append(f"Item {i['n_item']} ({i['descricao'][:40]}): NÃO está no pedido de compra {pc['numero']}")
+                continue
+            n = _conta_grupo(g)
+            if n["sit"] == "quantidade":
+                m.append(f"{nomes}: QUANTIDADE não bate — NF {n['q_nf']:g} x pedido {n['q_pc']:g}")
+            for i in n["preco_ruim"]:
+                m.append(f"Item {i['n_item']} ({i['descricao'][:40]}): VALOR não bate — NF {_brl(i.get('valor_unit'), 4)} x pedido "
+                         f"{_brl(n['vu_pc'], 4) if n['vu_pc'] is not None else '-'}")
+            if n["sit"] == "preco" and not n["preco_ruim"]:
+                m.append(f"{nomes}: VALOR não bate — diferença {_brl(n['dif'])} (aceito até {_brl(TOL_TOTAL)})")
+        for pi in sobras:
+            m.append(f"Item do pedido {pc['numero']} NÃO veio na nota: {(pi.get('descricao') or pi.get('sku') or '')[:40]} ({float(pi.get('qtd') or 0):g})")
+        tot_nf = round(sum(round(it["qtd_nf"] * float(it.get("valor_unit") or 0), 2) for it in d["itens"]), 2)
+        tot_pc = round(sum(round(float(pi.get("qtd") or 0) * float(pi.get("valor") or 0), 2) for pi in pc["itens"]), 2)
+        if abs(tot_nf - tot_pc) > TOL_TOTAL + 1e-9:
             cmp_ = _comparacao(d) or {}
-            origem = [f"item {x['n_item']}" for x in cmp_.get("linhas", []) if x["situacao"] == "centavos"]
-            m.append(f"TOTAL dos produtos não bate — NF {_brl(tot_nf)} x pedido {_brl(tot_pc)} (diferença {_brl(tot_nf - tot_pc)})"
+            origem = ["item " + "+".join(str(n) for n in x["n_itens"]) for x in cmp_.get("linhas", []) if x["situacao"] in ("centavos", "preco") and abs(x["dif"]) >= 0.005]
+            m.append(f"TOTAL dos produtos não bate — NF {_brl(tot_nf)} x pedido {_brl(tot_pc)} (diferença {_brl(tot_nf - tot_pc)}; aceito até {_brl(TOL_TOTAL)})"
                      + (f"; vem dos centavos em: {', '.join(origem)}" if origem else ""))
     if not pc:
         m.append("Nenhum pedido de compra vinculado"
@@ -822,12 +885,30 @@ def vincular_pedido(nid):
     return jsonify(d)
 
 
+def _num_bip(it):
+    """qtd_bipada (número) e manual = conferido além do que foi bipado (digitado/+ na tela)."""
+    try:
+        it["qtd_bipada"] = float(it.get("qtd_bipada") or 0)
+    except (TypeError, ValueError):
+        it["qtd_bipada"] = 0.0
+    it["qtd_manual"] = max(0.0, float(it.get("qtd_conferida") or 0) - it["qtd_bipada"])
+    return it
+
+
+def _cod_norm(v):
+    """Compara códigos ignorando caixa e zeros à esquerda de código numérico (EAN-13 x GTIN-14)."""
+    k = str(v or "").strip().upper()
+    return k.lstrip("0") or k if k.isdigit() else k
+
+
 def _acha_item(itens, codigo: str):
-    k = str(codigo or "").strip().upper()
+    """Mesmo produto pode vir em mais de uma linha (um lote por linha): vai para a 1ª linha que AINDA FALTA;
+    se todas já estão completas, cai na 1ª (e aparece SOBROU)."""
+    k = _cod_norm(codigo)
     for campo in ("sku", "ean", "cprod"):
-        for it in itens:
-            if it.get(campo) and str(it[campo]).upper() == k:
-                return it
+        achados = [it for it in itens if it.get(campo) and _cod_norm(it[campo]) == k]
+        if achados:
+            return next((it for it in achados if float(it.get("qtd_conferida") or 0) < float(it.get("qtd_nf") or 0)), achados[0])
     return None
 
 
@@ -852,7 +933,8 @@ def bipar(nid):
         it = _acha_item(nota["itens"], codigo)
         if not it:
             return jsonify({"success": False, "error": f"{codigo} não está nesta nota. Confira o produto ou vincule o SKU no item certo.", "nao_na_nota": True}), 404
-        sets, args = ["qtd_conferida = COALESCE(qtd_conferida,0) + ?"], [qtd]
+        sets, args = ["qtd_conferida = COALESCE(qtd_conferida,0) + ?",
+                      "qtd_bipada = CAST(COALESCE(CAST(NULLIF(qtd_bipada,'') AS NUMERIC),0) + ? AS TEXT)"], [qtd, qtd]
         if d.get("lote"):
             sets.append("lote=?"); args.append(str(d["lote"]).strip()[:60])
         if d.get("validade"):
@@ -861,6 +943,7 @@ def bipar(nid):
         c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=? AND status IN ('aguardando','recusada','conferindo')", (_agora(), nid))
         novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (it["id"],)).fetchone())
     novo["qtd_nf"] = float(novo["qtd_nf"] or 0); novo["qtd_conferida"] = float(novo["qtd_conferida"] or 0)
+    _num_bip(novo)
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return jsonify({"success": True, "item": novo, "falta": falta, "excedeu": falta < 0,
                     "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])})
@@ -888,14 +971,25 @@ def editar_item(nid, iid):
                 sets.append(f"{campo}=?"); args.append((str(d[campo]).strip() or None) if d[campo] is not None else None)
         if "qtd_conferida" in d:
             try:
-                sets.append("qtd_conferida=?"); args.append(max(0.0, float(d["qtd_conferida"] or 0)))
+                nova = max(0.0, float(d["qtd_conferida"] or 0))
             except (TypeError, ValueError):
-                pass
+                nova = None
+            if nova is not None:
+                atual, bip = float(it["qtd_conferida"] or 0), float(it["qtd_bipada"] or 0)
+                if nova > atual and nova > bip and DIGITAR_SO_GESTOR and not eh_gestor():
+                    return jsonify({"error": "Bipe cada unidade. Só supervisor/admin aumenta a quantidade na mão (produto sem código de barras).",
+                                    "origem": "conferencia"}), 403
+                sets.append("qtd_conferida=?"); args.append(nova)
+                if nova < bip:
+                    sets.append("qtd_bipada=?"); args.append(str(nova))
+                if nova > bip:
+                    sets.append("ajuste_por=?"); args.append(_quem())
         if sets:
             c.execute(f"UPDATE receb_itens SET {', '.join(sets)} WHERE id=?", tuple(args) + (iid,))
             c.execute("UPDATE receb_notas SET atualizado_em=? WHERE id=?", (_agora(), nid))
         novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (iid,)).fetchone())
     novo["qtd_nf"] = float(novo["qtd_nf"] or 0); novo["qtd_conferida"] = float(novo["qtd_conferida"] or 0)
+    _num_bip(novo)
     return jsonify({"success": True, "item": novo})
 
 
