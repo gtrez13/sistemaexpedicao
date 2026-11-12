@@ -763,6 +763,114 @@ def _status_envio_ml(ml, ship):
     return None, None, None
 
 
+# ── Envios de HOJE direto do Mercado Livre (Flex e Coleta/Agência): a lista bate com a tela do ML ──
+_ship_info: dict = {}                  # shipment_id -> (quando, info)
+_ml_envios = {"ts": 0.0, "dados": None, "rodando": False, "erro": None}
+_ml_envios_lock = threading.Lock()
+ML_ENVIOS_FRESCO_S = 60                # até 1 min: usa direto
+ML_ENVIOS_VELHO_S = 30 * 60            # até 30 min: usa e atualiza em segundo plano
+
+
+def _info_envio(ml, sid):
+    """Envio do ML: status, substatus, limite de despacho, tipo de logística e nome de quem recebe. Cache 3 min."""
+    sid = str(sid)
+    agora = time.time()
+    c = _ship_info.get(sid)
+    if c and agora - c[0] < 180:
+        return c[1]
+    try:
+        r = ml._request("GET", f"/shipments/{sid}")
+        if r is None or r.status_code != 200:
+            return c[1] if c else None
+        j = r.json()
+        lt = j.get("lead_time") or {}
+        lim = ((lt.get("estimated_schedule_limit") or {}).get("date") or (lt.get("buffering") or {}).get("date")
+               or ((j.get("shipping_option") or {}).get("estimated_schedule_limit") or {}).get("date") or "")[:10] or None
+        info = {"status": j.get("status"), "sub": str(j.get("substatus") or "").lower(), "lim": lim,
+                "logistic": str(j.get("logistic_type") or (j.get("logistic") or {}).get("type") or "").lower(),
+                "receiver": (j.get("receiver_address") or {}).get("receiver_name") or ""}
+        _ship_info[sid] = (agora, info)
+        _ship_cache[sid] = (agora, info["status"], info["sub"], lim)
+        return info
+    except Exception:
+        return c[1] if c else None
+
+
+def _montar_envios_ml():
+    """Pedidos pagos com envio 'pronto para enviar' no ML -> {chave: envio}. Chave = 1º nº de venda do envio."""
+    from concurrent.futures import ThreadPoolExecutor
+    from services.ml_service import MercadoLivreService
+    ml = MercadoLivreService()
+    orders = ml._fetch_orders_ready_to_ship(limit_total=600)
+    por_ship = {}
+    for o in orders:
+        sid = str((o.get("shipping") or {}).get("id") or "")
+        if sid:
+            por_ship.setdefault(sid, []).append(o)
+    sids = list(por_ship)
+    if sids:
+        _info_envio(ml, sids[0])                     # 1º sozinho: se o token venceu, renova uma vez só
+        with ThreadPoolExecutor(6) as ex:
+            list(ex.map(lambda x: _info_envio(ml, x), sids[1:]))
+    out = {}
+    for sid, ords in por_ship.items():
+        inf = (_ship_info.get(sid) or (0, None))[1]
+        if not inf or inf.get("status") != "ready_to_ship":
+            continue
+        lg = inf.get("logistic") or ""
+        if "fulfillment" in lg:
+            continue
+        o0 = ords[0]
+        chave = str(o0.get("id"))
+        out[chave] = {"chave": chave, "orders": [str(o.get("id")) for o in ords], "pack": str(o0.get("pack_id") or ""), "sid": sid,
+                      "tipo": "FLEX" if ("self_service" in lg or "flex" in lg) else "COLETA",
+                      "cliente": inf.get("receiver") or (o0.get("buyer") or {}).get("nickname") or "",
+                      "sub": inf.get("sub"), "lim": inf.get("lim")}
+    return out
+
+
+def _envios_ml_hoje(esperar_s=0.0):
+    """-> (envios | None, atualizando). Nunca segura a tela: com dado velho, usa e atualiza por trás."""
+    with _ml_envios_lock:
+        dados, idade, rodando = _ml_envios["dados"], time.time() - _ml_envios["ts"], _ml_envios["rodando"]
+        if dados is not None and idade < ML_ENVIOS_FRESCO_S:
+            return dados, False
+        if not rodando:
+            _ml_envios["rodando"] = True
+
+            def rodar():
+                try:
+                    d = _montar_envios_ml()
+                    with _ml_envios_lock:
+                        _ml_envios.update(ts=time.time(), dados=d, erro=None)
+                except Exception as e:
+                    _slowlog.warning("saida: envios do ML falharam: %s", e)
+                    with _ml_envios_lock:
+                        _ml_envios["erro"] = str(e)[:200]
+                finally:
+                    with _ml_envios_lock:
+                        _ml_envios["rodando"] = False
+            threading.Thread(target=rodar, daemon=True).start()
+    if dados is not None and idade < ML_ENVIOS_VELHO_S:
+        return dados, True
+    fim = time.time() + esperar_s
+    while time.time() < fim:
+        time.sleep(0.5)
+        with _ml_envios_lock:
+            if not _ml_envios["rodando"] and _ml_envios["dados"] is not None:
+                return _ml_envios["dados"], False
+    return dados, True
+
+
+def _envio_por_codigo(cands):
+    """Etiqueta (nº do envio / venda / pacote) -> envio do ML de hoje (pedido que não passou pelo WMS)."""
+    d = _ml_envios.get("dados") or {}
+    for e in d.values():
+        if any(c and (c == e["sid"] or c in e["orders"] or c == e["pack"]) for c in cands):
+            return e
+    return None
+
+
 def _dia_saida(p, lim=None):
     exp_dia = str(p.get("atualizado_em") or "")[:10] if p.get("status") == "CONCLUIDO" else ""
     d = lim or str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10] or exp_dia or None
@@ -797,28 +905,80 @@ def saida_lista():
             "SELECT * FROM pedidos WHERE status IN ('PENDENTE','PARCIAL','SEPARADO') OR (status='CONCLUIDO' AND atualizado_em >= ?)",
             (desde,)).fetchall()]
         bips = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_bipes").fetchall()}
-    ml = None
-    try:
-        from services.ml_service import MercadoLivreService
-        ml = MercadoLivreService()
-    except Exception:
-        pass
-    # status do envio no ML (em paralelo; estado final fica em cache 24h)
+    envios, atualizando = _envios_ml_hoje(esperar_s=8)
+
     def bip_hoje(mid):
         b = bips.get(mid)
         return bool(b) and time.strftime("%Y-%m-%d", time.localtime(int(b["em"] or 0))) == hoje
-    consultar = [p.get("ml_shipping_id") for p in peds if p.get("status") == "CONCLUIDO" and p.get("ml_shipping_id")
+
+    def linha(ml_id, cliente, tipo, status_wms, situacao, dia_saida=None, sub=None, so_ml=False, atrasado=False, extra=None):
+        b = bips.get(ml_id)
+        d = {"ml_id": ml_id, "cliente": cliente, "tipo": tipo, "status_wms": status_wms, "envio_sub": sub, "situacao": situacao,
+             "dia_saida": dia_saida, "so_ml": so_ml, "atrasado": atrasado,
+             "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None}
+        d.update(extra or {})
+        return d
+
+    out, ja = [], set()
+    if envios is not None:
+        # FLEX e COLETA: a fonte é o Mercado Livre ("Envios de hoje"); o WMS só diz se passou por ele
+        wms_por = {}
+        for p in peds:
+            for k in (p.get("ml_id"), str(p.get("ml_shipping_id") or "")):
+                if k:
+                    wms_por[str(k)] = p
+        for e in envios.values():
+            p = next((wms_por[k] for k in [e["sid"], e["pack"], *e["orders"]] if k and k in wms_por), None)
+            mid = p["ml_id"] if p else e["chave"]
+            ja.add(mid)
+            lim = e.get("lim")
+            atrasado = bool(lim and lim < hoje)
+            if bip_hoje(mid):
+                sit = "carregado"
+            elif lim and lim > hoje:
+                if not (p and p.get("status") == "CONCLUIDO") and e.get("sub") != "printed":
+                    continue                    # outro dia e nem foi preparado: não polui a tela
+                sit = "outro_dia"
+            elif e.get("sub") == "invoice_pending":
+                sit = "nao_expedido"            # "NF-e para gerenciar" no ML: ainda sem nota
+            else:
+                sit = "pronto"
+            out.append(linha(mid, (p or {}).get("cliente_nome") or e["cliente"], e["tipo"], (p or {}).get("status"), sit,
+                             lim, e.get("sub"), so_ml=not p, atrasado=atrasado))
+        # já carregados hoje que saíram da lista do ML (foram coletados): continuam aparecendo como carregados
+        for p in peds:
+            t = _tipo_saida(p)
+            if t in ("FLEX", "COLETA") and p["ml_id"] not in ja and bip_hoje(p["ml_id"]):
+                ja.add(p["ml_id"])
+                out.append(linha(p["ml_id"], p.get("cliente_nome"), t, p.get("status"), "carregado"))
+        for mid in bips:
+            if mid not in ja and bip_hoje(mid) and not str(mid).startswith("SHOPEE_"):
+                with db_session() as conn:
+                    lg = conn.execute("SELECT cliente, tipo FROM saida_log WHERE ml_id=? AND acao='carregou' ORDER BY id DESC LIMIT 1", (mid,)).fetchone()
+                if lg and lg["tipo"] in ("FLEX", "COLETA"):
+                    ja.add(mid)
+                    out.append(linha(mid, lg["cliente"], lg["tipo"], None, "carregado", so_ml=True))
+
+    ml = None
+    if envios is None:
+        try:
+            from services.ml_service import MercadoLivreService
+            ml = MercadoLivreService()
+        except Exception:
+            pass
+    consultar = [p.get("ml_shipping_id") for p in peds if envios is None and p.get("status") == "CONCLUIDO" and p.get("ml_shipping_id")
                  and _tipo_saida(p) in ("FLEX", "COLETA") and not bip_hoje(p["ml_id"])]
     if ml and consultar:
         _status_envio_ml(ml, consultar[0])        # 1ª sozinha: se o token venceu, renova UMA vez antes do paralelo
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(6) as ex:
             list(ex.map(lambda sh: _status_envio_ml(ml, sh), consultar[1:200]))
-    out = []
     for p in peds:
         tipo = _tipo_saida(p)
-        if tipo == "FULL":
+        if tipo == "FULL" or p["ml_id"] in ja:
             continue
+        if envios is not None and tipo in ("FLEX", "COLETA"):
+            continue                              # Flex/Coleta já vieram do ML
         b = bips.get(p["ml_id"])
         st, sub, lim = (None, None, None)
         if tipo in ("FLEX", "COLETA") and p.get("status") == "CONCLUIDO" and ml and p.get("ml_shipping_id"):
@@ -845,8 +1005,9 @@ def saida_lista():
                     "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
                     "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None})
     ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "outro_dia": 3, "saiu": 4}
-    out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x["expedido_em"] or "")))
-    return jsonify({"pedidos": out, "hoje": hoje})
+    out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x.get("expedido_em") or "")))
+    return jsonify({"pedidos": out, "hoje": hoje, "fonte_ml": envios is not None, "ml_atualizando": atualizando,
+                    "ml_erro": _ml_envios.get("erro")})
 
 
 def _achar_pedido_por_codigo(conn, cod):
@@ -884,6 +1045,21 @@ def saida_bipar():
         _saida_tabelas(conn)
         p = _achar_pedido_por_codigo(conn, cod)
         if not p:
+            import json as _json
+            bruto = str(cod or "").strip()
+            cands = [bruto, re.sub(r"\D", "", bruto)]
+            if bruto.startswith("{"):
+                try:
+                    j = _json.loads(bruto)
+                    cands += [str(j.get("id") or ""), str(j.get("shipment_id") or ""), str(j.get("order_id") or "")]
+                except Exception:
+                    pass
+            e = _envio_por_codigo([c for c in cands if c])
+            if e:
+                p = {"ml_id": e["chave"], "cliente_nome": e["cliente"], "origem": "ML", "ml_shipping_id": e["sid"], "_so_ml": True,
+                     "logistic_type": "self_service" if e["tipo"] == "FLEX" else "drop_off", "prazo_envio": e.get("lim"),
+                     "status": "PENDENTE" if e.get("sub") == "invoice_pending" else "CONCLUIDO"}
+        if not p:
             _log_saida(conn, "recusado", codigo=cod, carro=carro or None, detalhe="etiqueta desconhecida")
             return jsonify({"error": f"essa etiqueta ({cod[:40]}) não é de nenhum pedido do WMS: NÃO carregue, mostre ao supervisor", "codigo_erro": "desconhecido"}), 404
         tipo = _tipo_saida(p)
@@ -910,7 +1086,9 @@ def saida_bipar():
         _log_saida(conn, "repetido" if ja else "carregou", p["ml_id"], p.get("cliente_nome"), cod, _tipo_saida(p), carro or None,
                    None if p.get("status") == "CONCLUIDO" or _tipo_saida(p) == "COMERCIAL" else f"pedido {p.get('status')} no WMS (não expedido)")
     aviso = None
-    if p.get("status") != "CONCLUIDO" and _tipo_saida(p) != "COMERCIAL":
+    if p.get("_so_ml") and p.get("status") != "CONCLUIDO":
+        aviso = "ATENÇÃO: no Mercado Livre esse pedido ainda está com NF-e para gerenciar (sem nota)"
+    elif p.get("status") != "CONCLUIDO" and _tipo_saida(p) != "COMERCIAL":
         aviso = f"ATENÇÃO: esse pedido está {p.get('status')} no WMS — não foi expedido (sem NF/etiqueta pelo sistema)"
     return jsonify({"success": True, "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": _tipo_saida(p),
                     "repetido": bool(ja), "aviso": aviso})
