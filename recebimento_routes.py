@@ -494,7 +494,9 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
 PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.01"))   # R$ por unidade (só arredondamento)
 # Biel 12/11: diferença de até R$ 0,10 (arredondamento) PASSA — na linha e no total dos produtos; acima disso recusa
 TOL_TOTAL = float(os.environ.get("RECEB_TOL_TOTAL", "0.10"))
-DIGITAR_SO_GESTOR = os.environ.get("RECEB_DIGITAR_SO_GESTOR", "1") == "1"   # operador BIPA; aumentar na mão só supervisor/admin
+# Biel 12/11 (tarde): os produtos não vêm com etiqueta nossa -> etiqueta impressa ao abrir a nota e conferência por botão
+# ("Está tudo certo" / quantidade diferente). Digitar volta a ser de todos (RECEB_DIGITAR_SO_GESTOR=1 trava de novo).
+DIGITAR_SO_GESTOR = os.environ.get("RECEB_DIGITAR_SO_GESTOR", "0") == "1"
 PERMITE_LIBERAR = os.environ.get("RECEB_PERMITE_LIBERAR", "0") == "1"   # padrão: divergência NUNCA é liberada
 
 
@@ -950,6 +952,9 @@ def _acha_item(itens, codigo: str):
 def bipar(nid):
     d = request.get_json(silent=True) or {}
     codigo = str(d.get("codigo") or "").strip()
+    if "*" in codigo:                       # etiqueta do WMS: QR "SKU*LOTE"
+        codigo, lote_etq = codigo.split("*", 1)
+        d.setdefault("lote", lote_etq.strip() or None)
     try:
         qtd = float(d.get("quantidade") or 1)
     except (TypeError, ValueError):
@@ -980,6 +985,35 @@ def bipar(nid):
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return jsonify({"success": True, "item": novo, "falta": falta, "excedeu": falta < 0,
                     "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])})
+
+
+@recebimento_routes.post("/recebimento/notas/<int:nid>/itens/<int:iid>/confirmar")
+@login_required
+def confirmar_item(nid, iid):
+    """Botão "Está tudo certo": o item conferido é a quantidade da nota (ou a informada). Fica registrado quem confirmou."""
+    d = request.get_json(silent=True) or {}
+    garantir_tabelas()
+    with db_session() as c:
+        n = c.execute("SELECT status FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        it = c.execute("SELECT * FROM receb_itens WHERE id=? AND nota_id=?", (iid, nid)).fetchone()
+        if not n or not it:
+            return jsonify({"error": "Item não encontrado."}), 404
+        if n["status"] in ("conferida", "lancada"):
+            return jsonify({"error": "Nota já conferida — reabra para alterar."}), 409
+        try:
+            q = float(d["qtd"]) if d.get("qtd") is not None else float(it["qtd_nf"] or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Quantidade inválida."}), 400
+        sets, args = ["qtd_conferida=?", "ajuste_por=?"], [max(0.0, q), _quem()]
+        for campo in ("lote", "validade"):
+            if d.get(campo):
+                sets.append(f"{campo}=?"); args.append(str(d[campo]).strip()[:60])
+        c.execute(f"UPDATE receb_itens SET {', '.join(sets)} WHERE id=?", tuple(args) + (iid,))
+        c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=? AND status IN ('aguardando','conferindo')", (_agora(), nid))
+        novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (iid,)).fetchone())
+    novo["qtd_nf"] = float(novo["qtd_nf"] or 0); novo["qtd_conferida"] = float(novo["qtd_conferida"] or 0)
+    _num_bip(novo)
+    return jsonify({"success": True, "item": novo, "falta": novo["qtd_nf"] - novo["qtd_conferida"]})
 
 
 @recebimento_routes.post("/recebimento/notas/<int:nid>/itens/<int:iid>")
