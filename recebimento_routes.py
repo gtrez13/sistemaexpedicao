@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -44,6 +45,7 @@ STATUS = ["aguardando", "conferindo", "recusada", "conferida", "lancada"]
 EXIGIR_LOTE = os.environ.get("RECEB_EXIGIR_LOTE", "1").strip() not in ("0", "false", "nao", "não")
 
 _tabelas_ok = False
+_tab_lock = threading.Lock()   # 2 telas abrindo juntas depois de reiniciar = 2 ALTER TABLE ao mesmo tempo = deadlock no Postgres
 _pc_cache: dict = {}      # cnpj -> (ts, lista)
 
 
@@ -74,6 +76,14 @@ def garantir_tabelas():
     global _tabelas_ok
     if _tabelas_ok:
         return
+    with _tab_lock:
+        if _tabelas_ok:
+            return
+        _garantir_tabelas()
+        _tabelas_ok = True
+
+
+def _garantir_tabelas():
     with db_session() as c:
         pg = True
         try:
@@ -99,16 +109,21 @@ def garantir_tabelas():
             )""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_receb_itens_nota ON receb_itens (nota_id)")
         for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped")):
-            try:
-                c.execute(f"ALTER TABLE {tb} ADD COLUMN IF NOT EXISTS {col} TEXT" if pg else f"ALTER TABLE {tb} ADD COLUMN {col} TEXT")
-            except Exception:
-                pass
+            if pg:
+                # só altera se faltar a coluna (ALTER trava a tabela; e um erro engolido aqui estragava a transação inteira)
+                tem = c.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (tb, col)).fetchone()
+                if not tem:
+                    c.execute(f"ALTER TABLE {tb} ADD COLUMN IF NOT EXISTS {col} TEXT")
+            else:
+                try:
+                    c.execute(f"ALTER TABLE {tb} ADD COLUMN {col} TEXT")
+                except Exception:
+                    pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
                 criado_por TEXT, criado_em BIGINT, PRIMARY KEY (fornecedor_cnpj, cprod)
             )""")
-    _tabelas_ok = True
 
 
 # ───────────────────────── XML ─────────────────────────

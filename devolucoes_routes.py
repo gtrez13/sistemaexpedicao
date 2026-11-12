@@ -32,6 +32,7 @@ import io
 import json
 import os
 import re
+import threading
 import time
 import uuid
 
@@ -99,10 +100,21 @@ COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produ
 COLS_BOOL = ["teve_reclamacao", "avaria", "faltou_item", "volta_estoque"]
 
 
+_tab_lock = threading.Lock()   # várias telas abrindo juntas depois de reiniciar = ALTER TABLE ao mesmo tempo = deadlock
+
+
 def garantir_tabelas(conn=None):
     global _tabelas_ok
     if _tabelas_ok:
         return
+    with _tab_lock:
+        if _tabelas_ok:
+            return
+        _garantir_tabelas(conn)
+
+
+def _garantir_tabelas(conn=None):
+    global _tabelas_ok
 
     def _run(c):
         pk = "BIGSERIAL PRIMARY KEY" if os.environ.get("DATABASE_URL") else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -155,13 +167,13 @@ def garantir_tabelas(conn=None):
             )
         """)
         if os.environ.get("DATABASE_URL"):
-            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_claim_id TEXT")
-            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_devolucao DOUBLE PRECISION")
-            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml DOUBLE PRECISION")
-            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS custo_ml_em BIGINT")
-            c.execute("ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS ml_envio TEXT")
-            for col, tp in EXTRAS_V3:
-                c.execute(f"ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS {col} {tp}")
+            # só altera o que falta (cada ALTER trava a tabela inteira até o fim da transação)
+            have = {str(r["column_name"]) for r in c.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='devolucoes'").fetchall()}
+            for col, tp in [("ml_claim_id", "TEXT"), ("custo_devolucao", "DOUBLE PRECISION"), ("custo_ml", "DOUBLE PRECISION"),
+                            ("custo_ml_em", "BIGINT"), ("ml_envio", "TEXT")] + list(EXTRAS_V3):
+                if col not in have:
+                    c.execute(f"ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS {col} {tp}")
         else:
             have = {r[1] for r in c.execute("PRAGMA table_info(devolucoes)").fetchall()}
             if "ml_claim_id" not in have:
