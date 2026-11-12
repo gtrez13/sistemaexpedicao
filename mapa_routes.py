@@ -716,6 +716,8 @@ def _saida_tabelas(conn):
         conn.execute("CREATE TABLE IF NOT EXISTS saida_log (id BIGSERIAL PRIMARY KEY, ml_id TEXT, cliente TEXT, acao TEXT, "
                      "codigo TEXT, tipo TEXT, carro TEXT, por TEXT, em BIGINT, detalhe TEXT)")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_saida_log_em ON saida_log (em)")
+        # pacote que o gestor tirou da saída de hoje (vai para o dia marcado); some sozinho quando o dia chega
+        conn.execute("CREATE TABLE IF NOT EXISTS saida_adiados (ml_id TEXT PRIMARY KEY, dia TEXT, motivo TEXT, por TEXT, em BIGINT)")
         _saida_ok = True
 
 
@@ -741,8 +743,83 @@ def _tipo_saida(p):
     return "COLETA"
 
 
+_desp_cache: dict = {}                  # shipment_id -> (quando, dia, fonte) das consultas extras (lead_time / sla)
+
+
+def _hoje():
+    """Dia de hoje no horário de Brasília (o servidor pode estar em UTC: depois das 21h viraria 'amanhã')."""
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3 * 3600))
+
+
+def _dia_ts(ts, mais_dias=0):
+    return time.strftime("%Y-%m-%d", time.gmtime(int(ts or 0) - 3 * 3600 + mais_dias * 86400))
+
+
+def _dia_br(v, so_data=False):
+    """Data do ML -> 'AAAA-MM-DD' no horário de Brasília. so_data: o ML diz que só a DATA vale (limite de despacho)."""
+    v = str(v or "")
+    if not re.match(r"\d{4}-\d{2}-\d{2}", v):
+        return None
+    if so_data:
+        return v[:10]
+    try:
+        from datetime import datetime, timedelta, timezone
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone(timedelta(hours=-3)))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return v[:10]
+
+
+def _data_despacho(ml, sid, j):
+    """Dia em que o pacote TEM que sair, como o ML diz -> (dia 'AAAA-MM-DD' | None, de onde veio).
+    1º limite de despacho (estimated_handling_limit: "prazo para o vendedor despachar", só a data vale);
+    se o envio não trouxer: /shipments/{id}/lead_time, depois /shipments/{id}/sla; por último agendamento/entrega (Flex).
+    Sem nada disso: None (NÃO entra como hoje)."""
+    def dt(d, k):
+        x = (d or {}).get(k)
+        return x.get("date") if isinstance(x, dict) else None
+    lt, so = j.get("lead_time") or {}, j.get("shipping_option") or {}
+    v = dt(lt, "estimated_handling_limit") or dt(so, "estimated_handling_limit")
+    if v:
+        return _dia_br(v, so_data=True), "limite de despacho"
+    sid = str(sid)
+    c = _desp_cache.get(sid)
+    if c and time.time() - c[0] < 1800:
+        return c[1], c[2]
+    dia, fonte = None, None
+    try:
+        r = ml._request("GET", f"/shipments/{sid}/lead_time")
+        if r is not None and r.status_code == 200:
+            l2 = r.json() or {}
+            v = dt(l2, "estimated_handling_limit")
+            if v:
+                dia, fonte = _dia_br(v, so_data=True), "limite de despacho"
+        if not dia:
+            r = ml._request("GET", f"/shipments/{sid}/sla")
+            if r is not None and r.status_code == 200:
+                v = (r.json() or {}).get("expected_date")
+                if v:
+                    dia, fonte = _dia_br(v), "SLA do ML"
+    except Exception:
+        pass
+    if not dia:
+        v = (dt(lt, "estimated_schedule_limit") or dt(so, "estimated_schedule_limit") or dt(lt, "buffering") or dt(so, "buffering"))
+        if v:
+            dia, fonte = _dia_br(v), "agendamento"
+    if not dia:
+        lg = str(j.get("logistic_type") or (j.get("logistic") or {}).get("type") or "").lower()
+        if "self_service" in lg:                # Flex: entrega no mesmo dia em que sai
+            v = dt(lt, "estimated_delivery_time") or dt(so, "estimated_delivery_time")
+            if v:
+                dia, fonte = _dia_br(v), "entrega (Flex)"
+    _desp_cache[sid] = (time.time(), dia, fonte)
+    return dia, fonte
+
+
 def _status_envio_ml(ml, ship):
-    """-> (status, substatus, data limite de despacho 'AAAA-MM-DD' ou None)"""
+    """-> (status, substatus, dia em que tem que sair 'AAAA-MM-DD' ou None)"""
     if not ship:
         return None, None, None
     agora = time.time()
@@ -753,9 +830,7 @@ def _status_envio_ml(ml, ship):
         r = ml._request("GET", f"/shipments/{ship}")
         if r is not None and r.status_code == 200:
             j = r.json()
-            lt = j.get("lead_time") or {}
-            lim = ((lt.get("estimated_schedule_limit") or {}).get("date") or (lt.get("buffering") or {}).get("date")
-                   or ((j.get("shipping_option") or {}).get("estimated_schedule_limit") or {}).get("date") or "")[:10] or None
+            lim, _ = _data_despacho(ml, ship, j)
             _ship_cache[str(ship)] = (agora, j.get("status"), j.get("substatus"), lim)
             return j.get("status"), j.get("substatus"), lim
     except Exception:
@@ -783,10 +858,8 @@ def _info_envio(ml, sid):
         if r is None or r.status_code != 200:
             return c[1] if c else None
         j = r.json()
-        lt = j.get("lead_time") or {}
-        lim = ((lt.get("estimated_schedule_limit") or {}).get("date") or (lt.get("buffering") or {}).get("date")
-               or ((j.get("shipping_option") or {}).get("estimated_schedule_limit") or {}).get("date") or "")[:10] or None
-        info = {"status": j.get("status"), "sub": str(j.get("substatus") or "").lower(), "lim": lim,
+        lim, fonte = _data_despacho(ml, sid, j)
+        info = {"status": j.get("status"), "sub": str(j.get("substatus") or "").lower(), "lim": lim, "lim_fonte": fonte,
                 "logistic": str(j.get("logistic_type") or (j.get("logistic") or {}).get("type") or "").lower(),
                 "receiver": (j.get("receiver_address") or {}).get("receiver_name") or ""}
         _ship_info[sid] = (agora, info)
@@ -825,7 +898,7 @@ def _montar_envios_ml():
         out[chave] = {"chave": chave, "orders": [str(o.get("id")) for o in ords], "pack": str(o0.get("pack_id") or ""), "sid": sid,
                       "tipo": "FLEX" if ("self_service" in lg or "flex" in lg) else "COLETA",
                       "cliente": inf.get("receiver") or (o0.get("buyer") or {}).get("nickname") or "",
-                      "sub": inf.get("sub"), "lim": inf.get("lim")}
+                      "sub": inf.get("sub"), "lim": inf.get("lim"), "lim_fonte": inf.get("lim_fonte")}
     return out
 
 
@@ -898,18 +971,22 @@ def _quem_saida():
 def saida_lista():
     """O que sai HOJE (limite de despacho do ML / prazo do WMS / dia em que foi expedido): faltam, não expedidos, carregados."""
     desde = time.strftime("%Y-%m-%d 00:00:00", time.localtime(time.time() - 5 * 86400))
-    hoje = time.strftime("%Y-%m-%d", time.localtime())
+    hoje = _hoje()
     with db_session() as conn:
         _saida_tabelas(conn)
         peds = [dict(r) for r in conn.execute(
             "SELECT * FROM pedidos WHERE status IN ('PENDENTE','PARCIAL','SEPARADO') OR (status='CONCLUIDO' AND atualizado_em >= ?)",
             (desde,)).fetchall()]
         bips = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_bipes").fetchall()}
+        adiados = {r["ml_id"]: dict(r) for r in conn.execute("SELECT * FROM saida_adiados WHERE dia > ?", (hoje,)).fetchall()}
     envios, atualizando = _envios_ml_hoje(esperar_s=8)
+
+    def adiado(mid):
+        return adiados.get(str(mid))
 
     def bip_hoje(mid):
         b = bips.get(mid)
-        return bool(b) and time.strftime("%Y-%m-%d", time.localtime(int(b["em"] or 0))) == hoje
+        return bool(b) and _dia_ts(b["em"]) == hoje
 
     def linha(ml_id, cliente, tipo, status_wms, situacao, dia_saida=None, sub=None, so_ml=False, atrasado=False, extra=None):
         b = bips.get(ml_id)
@@ -933,18 +1010,27 @@ def saida_lista():
             ja.add(mid)
             lim = e.get("lim")
             atrasado = bool(lim and lim < hoje)
+            ad = adiado(mid) or adiado(e["chave"])
+            extra = {"dia_fonte": e.get("lim_fonte"), "envio_id": e["sid"]}
             if bip_hoje(mid):
                 sit = "carregado"
+                if (ad and ad["dia"] > hoje) or (lim and lim > hoje):
+                    extra["nao_e_hoje"] = True  # bipado antes da correção: é de outro dia, tirar do carro
+            elif ad:
+                sit, lim = "outro_dia", ad["dia"]      # o gestor tirou de hoje
+                extra.update(adiado_por=ad.get("por"), adiado_motivo=ad.get("motivo"))
             elif lim and lim > hoje:
                 if not (p and p.get("status") == "CONCLUIDO") and e.get("sub") != "printed":
                     continue                    # outro dia e nem foi preparado: não polui a tela
                 sit = "outro_dia"
+            elif not lim:
+                sit = "sem_data"                # o ML não disse o dia: NÃO conta como de hoje, fica para conferir
             elif e.get("sub") == "invoice_pending":
                 sit = "nao_expedido"            # "NF-e para gerenciar" no ML: ainda sem nota
             else:
                 sit = "pronto"
             out.append(linha(mid, (p or {}).get("cliente_nome") or e["cliente"], e["tipo"], (p or {}).get("status"), sit,
-                             lim, e.get("sub"), so_ml=not p, atrasado=atrasado))
+                             lim, e.get("sub"), so_ml=not p, atrasado=atrasado and sit != "outro_dia", extra=extra))
         # já carregados hoje que saíram da lista do ML (foram coletados): continuam aparecendo como carregados
         for p in peds:
             t = _tipo_saida(p)
@@ -988,8 +1074,13 @@ def saida_lista():
             continue
         # dia em que TEM que sair: limite do ML > prazo gravado no WMS > (sem data) dia em que foi expedido
         dia_saida = _dia_saida(p, lim)
+        ad = adiado(p["ml_id"])
+        if ad and not bip_hoje(p["ml_id"]):
+            dia_saida = ad["dia"]
         if bip_hoje(p["ml_id"]):
             situacao = "carregado"
+        elif ad:
+            situacao = "outro_dia"
         elif not dia_saida or dia_saida < hoje:
             continue        # SÓ o que sai HOJE (pedido sem data ou de dia anterior não entra na Saída)
         elif dia_saida > hoje:
@@ -1003,11 +1094,12 @@ def saida_lista():
         out.append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo, "status_wms": p.get("status"),
                     "envio": st, "envio_sub": sub, "situacao": situacao, "dia_saida": dia_saida, "prazo": str(p.get("prazo_envio") or p.get("ship_by_date") or ""),
                     "expedido_em": str(p.get("atualizado_em") or "") if p.get("status") == "CONCLUIDO" else None,
-                    "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None})
-    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "outro_dia": 3, "saiu": 4}
+                    "bipado_em": int(b["em"]) if b else None, "bipado_por": b.get("por") if b else None,
+                    "adiado_por": ad.get("por") if ad else None, "adiado_motivo": ad.get("motivo") if ad else None})
+    ordem = {"pronto": 0, "nao_expedido": 1, "carregado": 2, "sem_data": 3, "outro_dia": 4, "saiu": 5}
     out.sort(key=lambda x: (ordem.get(x["situacao"], 9), x["tipo"], str(x.get("expedido_em") or "")))
     return jsonify({"pedidos": out, "hoje": hoje, "fonte_ml": envios is not None, "ml_atualizando": atualizando,
-                    "ml_erro": _ml_envios.get("erro")})
+                    "ml_erro": _ml_envios.get("erro"), "gestor": _gestor_saida()})
 
 
 def _achar_pedido_por_codigo(conn, cod):
@@ -1040,7 +1132,7 @@ def saida_bipar():
     carro = str(body.get("tipo") or "").upper()           # carregando QUAL carro (FLEX, COLETA, SHOPEE, COMERCIAL)
     if not cod:
         return jsonify({"error": "bipe a etiqueta"}), 400
-    hoje = time.strftime("%Y-%m-%d", time.localtime())
+    hoje = _hoje()
     with db_session() as conn:
         _saida_tabelas(conn)
         p = _achar_pedido_por_codigo(conn, cod)
@@ -1076,6 +1168,11 @@ def saida_bipar():
             except Exception:
                 pass
         dia = _dia_saida(p, lim)
+        ad = conn.execute("SELECT * FROM saida_adiados WHERE ml_id=? AND dia > ?", (p["ml_id"], hoje)).fetchone()
+        if ad:
+            _log_saida(conn, "recusado", p["ml_id"], p.get("cliente_nome"), cod, tipo, carro or None, f"tirado de hoje por {ad['por']} (sai {ad['dia']})")
+            return jsonify({"error": f"esse pacote é para {ad['dia'][8:10]}/{ad['dia'][5:7]} ({ad['por']} tirou de hoje), NÃO é de hoje: não carregue",
+                            "codigo_erro": "outro_dia", "ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo}), 409
         if dia and dia > hoje:
             _log_saida(conn, "recusado", p["ml_id"], p.get("cliente_nome"), cod, tipo, carro or None, f"pacote para {dia}, não é de hoje")
             return jsonify({"error": f"esse pacote é para {dia[8:10]}/{dia[5:7]}, NÃO é de hoje: não carregue",
@@ -1098,9 +1195,10 @@ def saida_bipar():
 @login_required
 def saida_historico():
     """Histórico da Saída de um dia (padrão hoje): quem bipou o quê, recusas, desfeitos e liberações com falta."""
-    dia = request.args.get("dia") or time.strftime("%Y-%m-%d", time.localtime())
+    dia = request.args.get("dia") or _hoje()
     try:
-        ini = int(time.mktime(time.strptime(dia, "%Y-%m-%d")))
+        import calendar
+        ini = calendar.timegm(time.strptime(dia, "%Y-%m-%d")) + 3 * 3600      # 00:00 de Brasília
     except ValueError:
         return jsonify({"error": "dia no formato AAAA-MM-DD"}), 400
     with db_session() as conn:
@@ -1341,6 +1439,55 @@ def saida_desfazer():
         conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (mid,))
         p0 = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
         _log_saida(conn, "desfez", mid, p0["cliente_nome"] if p0 else None, detalhe=f"tinha sido bipado por {b0['por']}" if b0 else None)
+    return jsonify({"success": True})
+
+
+def _amanha():
+    return _dia_ts(time.time(), 1)
+
+
+@mapa_routes.post("/saida/adiar")
+@login_required
+def saida_adiar():
+    """Gestor tira um pacote da saída de hoje (vai para o dia marcado, padrão amanhã). Se já tinha sido bipado hoje, desfaz o bipe."""
+    if not _gestor_saida():
+        return jsonify({"error": "só supervisor/admin pode tirar pacote da saída de hoje"}), 403
+    body = request.get_json(silent=True) or {}
+    mid = str(body.get("ml_id") or "").strip()
+    dia = str(body.get("dia") or "").strip()[:10] or _amanha()
+    motivo = str(body.get("motivo") or "").strip()[:200] or "não é de hoje"
+    hoje = _hoje()
+    if not mid:
+        return jsonify({"error": "qual pacote?"}), 400
+    if not re.match(r"\d{4}-\d{2}-\d{2}$", dia) or dia <= hoje:
+        return jsonify({"error": "escolha um dia depois de hoje"}), 400
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        p0 = conn.execute("SELECT cliente_nome, origem, logistic_type FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
+        cli = (p0["cliente_nome"] if p0 else None) or str(body.get("cliente") or "")[:120] or None
+        b0 = conn.execute("SELECT * FROM saida_bipes WHERE ml_id=?", (mid,)).fetchone()
+        if b0:
+            conn.execute("DELETE FROM saida_bipes WHERE ml_id=?", (mid,))
+            _log_saida(conn, "desfez", mid, cli, detalhe=f"tirado de hoje (tinha sido bipado por {b0['por']})")
+        conn.execute("DELETE FROM saida_adiados WHERE ml_id=?", (mid,))
+        conn.execute("INSERT INTO saida_adiados (ml_id, dia, motivo, por, em) VALUES (?,?,?,?,?)", (mid, dia, motivo, _quem_saida(), int(time.time())))
+        _log_saida(conn, "adiou", mid, cli, tipo=str(body.get("tipo") or "")[:20] or None, detalhe=f"sai {dia[8:10]}/{dia[5:7]} · {motivo}")
+    return jsonify({"success": True, "ml_id": mid, "dia": dia, "desfez_bipe": bool(b0)})
+
+
+@mapa_routes.post("/saida/adiar/desfazer")
+@login_required
+def saida_adiar_desfazer():
+    if not _gestor_saida():
+        return jsonify({"error": "só supervisor/admin pode devolver pacote para hoje"}), 403
+    mid = str((request.get_json(silent=True) or {}).get("ml_id") or "").strip()
+    with db_session() as conn:
+        _saida_tabelas(conn)
+        a0 = conn.execute("SELECT * FROM saida_adiados WHERE ml_id=?", (mid,)).fetchone()
+        conn.execute("DELETE FROM saida_adiados WHERE ml_id=?", (mid,))
+        p0 = conn.execute("SELECT cliente_nome FROM pedidos WHERE ml_id=?", (mid,)).fetchone()
+        if a0:
+            _log_saida(conn, "voltou_hoje", mid, p0["cliente_nome"] if p0 else None, detalhe=f"tinha sido tirado de hoje por {a0['por']}")
     return jsonify({"success": True})
 
 
