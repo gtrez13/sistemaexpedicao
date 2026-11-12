@@ -135,12 +135,12 @@ else:
     linha(NAO, "a API v3 do Bling NÃO tem rota para importar o XML do fornecedor (testei 5 caminhos; a especificação oficial também não tem)")
 print("        (POST /nfe com tipo 0 cria nota de EMISSÃO PRÓPRIA da LHVMED, com numeração nossa: NÃO serve para a nota do fornecedor)")
 nf_bl = None
-for params in ({"tipo": 0, "numero": r["numero"]}, {"numero": r["numero"]}):
+for params in ({"chaveAcesso": r["chave"]}, {"tipo": 0, "chaveAcesso": r["chave"]}, {"tipo": 0, "numero": r["numero"]}, {"numero": r["numero"]}):
     st, txt, js = rr._bling_raw("GET", "/nfe", params={**params, "limite": 50})
     for n in ((js or {}).get("data") or []):
         if re.sub(r"\D", "", str(n.get("chaveAcesso") or "")) == r["chave"]:
             nf_bl = n
-    if nf_bl or ((js or {}).get("data")):
+    if nf_bl:
         break
 if nf_bl:
     linha(OK, f"a nota do fornecedor JÁ ESTÁ no Bling (id {nf_bl.get('id')}, situação {nf_bl.get('situacao')}, tipo {nf_bl.get('tipo')})")
