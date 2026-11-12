@@ -760,8 +760,8 @@ def _dia_br(v, so_data=False):
     v = str(v or "")
     if not re.match(r"\d{4}-\d{2}-\d{2}", v):
         return None
-    if so_data:
-        return v[:10]
+    if so_data and re.match(r"\d{4}-\d{2}-\d{2}(T00:00(:00(\.0+)?)?)?([+-]\d{2}:?\d{2}|Z)?$", v):
+        return v[:10]               # data "pura" (hora 00:00 de enfeite): vale a data escrita
     try:
         from datetime import datetime, timedelta, timezone
         dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
@@ -781,13 +781,21 @@ def _data_despacho(ml, sid, j):
         x = (d or {}).get(k)
         return x.get("date") if isinstance(x, dict) else None
     lt, so = j.get("lead_time") or {}, j.get("shipping_option") or {}
+    lg = str(j.get("logistic_type") or (j.get("logistic") or {}).get("type") or "").lower()
+    flex = "self_service" in lg
+    ent = _dia_br(dt(lt, "estimated_delivery_time") or dt(so, "estimated_delivery_time")) if flex else None
+
+    def com_entrega(dia, fonte):
+        if flex and ent and (not dia or ent < dia):
+            return ent, "entrega prometida (Flex)"     # Flex entrega no dia em que sai
+        return dia, fonte
     v = dt(lt, "estimated_handling_limit") or dt(so, "estimated_handling_limit")
     if v:
-        return _dia_br(v, so_data=True), "limite de despacho"
+        return com_entrega(_dia_br(v, so_data=True), "limite de despacho")
     sid = str(sid)
     c = _desp_cache.get(sid)
     if c and time.time() - c[0] < 1800:
-        return c[1], c[2]
+        return com_entrega(c[1], c[2])
     dia, fonte = None, None
     try:
         r = ml._request("GET", f"/shipments/{sid}/lead_time")
@@ -808,14 +816,8 @@ def _data_despacho(ml, sid, j):
         v = (dt(lt, "estimated_schedule_limit") or dt(so, "estimated_schedule_limit") or dt(lt, "buffering") or dt(so, "buffering"))
         if v:
             dia, fonte = _dia_br(v), "agendamento"
-    if not dia:
-        lg = str(j.get("logistic_type") or (j.get("logistic") or {}).get("type") or "").lower()
-        if "self_service" in lg:                # Flex: entrega no mesmo dia em que sai
-            v = dt(lt, "estimated_delivery_time") or dt(so, "estimated_delivery_time")
-            if v:
-                dia, fonte = _dia_br(v), "entrega (Flex)"
     _desp_cache[sid] = (time.time(), dia, fonte)
-    return dia, fonte
+    return com_entrega(dia, fonte)
 
 
 def _status_envio_ml(ml, ship):
@@ -1315,9 +1317,17 @@ def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, 
             }
             mencao = os.environ.get("DISCORD_MENCAO_SAIDA", "@here").strip()
             conteudo = f"{mencao} Pedido ficando para trás na saída".strip()
+        elif not total:
+            embed = {
+                "title": f"Carro {nome_carro} fechado com NENHUM pacote bipado",
+                "description": "O WMS não tinha nenhum pacote desse carro para hoje e nada foi bipado. Se o carro saiu com pacotes, eles não passaram pela Saída.",
+                "color": 0xF59E0B,
+                "fields": [{"name": "Quem fechou", "value": por or "?", "inline": True}],
+            }
+            conteudo = f"Saída {nome_carro}: fechada sem nenhum pacote bipado"
         else:
             embed = {
-                "title": f"Carro {nome_carro} liberado COMPLETO: {carregados} de {total}" if total else f"Carro {nome_carro} fechado sem pedidos hoje",
+                "title": f"Carro {nome_carro} liberado COMPLETO: {carregados} de {total}",
                 "color": 0x22C55E,
                 "fields": [
                     {"name": "Quem fechou", "value": por or "?", "inline": True},
@@ -1327,6 +1337,11 @@ def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, 
             if carregados_ids:
                 embed["fields"].append({"name": "Pedidos carregados", "value": (_lista_pedidos(carregados_ids) or "-")[:1000]})
             conteudo = f"Saída {nome_carro}: tudo carregado"
+        rml = _ml_resumo(carro)
+        if rml:
+            embed["fields"].append({"name": "Mercado Livre agora (prontos para enviar)",
+                                    "value": f"de hoje: {rml['hoje']}" + (f" ({rml['sem_nf']} sem NF)" if rml["sem_nf"] else "")
+                                             + f" · outro dia: {rml['outro_dia']}" + (f" · sem data: {rml['sem_data']}" if rml["sem_data"] else "")})
         if quem_bip:
             embed["fields"].append({"name": "Bipado por", "value": quem_bip[:1000]})
         if nao_exp:
@@ -1352,6 +1367,40 @@ def _discord_saida(fid, carro, total, carregados, faltando, nao_exp, just, por, 
     except Exception as e:
         _slowlog.warning("saida discord grava: %s", e)
     _slowlog.warning("SAIDA fechamento #%s Discord: %s", fid, res[1][:200])
+
+
+def _bipados_hoje(conn, carro):
+    """ml_ids bipados HOJE (e não desfeitos) cujo pacote é desse carro."""
+    import calendar
+    ini = calendar.timegm(time.strptime(_hoje(), "%Y-%m-%d")) + 3 * 3600
+    ids = []
+    for r in conn.execute("SELECT ml_id FROM saida_bipes WHERE em >= ?", (ini,)).fetchall():
+        lg = conn.execute("SELECT tipo FROM saida_log WHERE ml_id=? AND acao IN ('carregou','repetido') ORDER BY id DESC LIMIT 1",
+                          (r["ml_id"],)).fetchone()
+        if lg and str(lg["tipo"] or "").upper() == carro:
+            ids.append(str(r["ml_id"]))
+    return ids
+
+
+def _ml_resumo(carro):
+    """Envios do ML desse carro agora (prontos para enviar): de hoje / outro dia / sem data. Só Flex e Coleta."""
+    d = _ml_envios.get("dados")
+    if carro not in ("FLEX", "COLETA") or d is None:
+        return None
+    hoje = _hoje()
+    n = {"hoje": 0, "sem_nf": 0, "outro_dia": 0, "sem_data": 0}
+    for e in d.values():
+        if e.get("tipo") != carro:
+            continue
+        lim = e.get("lim")
+        if not lim:
+            n["sem_data"] += 1
+        elif lim > hoje:
+            n["outro_dia"] += 1
+        else:
+            n["hoje"] += 1
+            n["sem_nf"] += 1 if e.get("sub") == "invoice_pending" else 0
+    return n
 
 
 @mapa_routes.post("/saida/fechar")
@@ -1392,6 +1441,11 @@ def saida_fechar():
     with db_session() as conn:
         _saida_tabelas(conn)
         _fech_tabela(conn)
+        srv = _bipados_hoje(conn, carro)
+        if len(srv) > carregados:       # a tela pode ter perdido bipes (lista do ML mudou): vale o que foi bipado
+            carregados_ids = list(dict.fromkeys(carregados_ids + srv))
+            carregados = len(carregados_ids)
+            total = max(total, carregados + len(faltando))
         row = conn.execute("INSERT INTO saida_fechamentos (carro, total, carregados, faltando, nao_expedidos, justificativa, por, em) "
                            "VALUES (?,?,?,?,?,?,?,?) RETURNING id",
                            (carro, total, carregados, ",".join(faltando)[:4000], nao_exp, just[:1000], por, int(time.time()))).fetchone()
