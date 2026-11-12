@@ -97,7 +97,9 @@ EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", 
              ("full_situacao", "TEXT"), ("full_info", "TEXT"), ("full_em", "BIGINT"),
              ("canal", "TEXT"), ("servico", "TEXT"), ("embalagem", "TEXT"), ("estado_produto", "TEXT"),
              ("nf_dev_id", "TEXT"), ("nf_dev_numero", "TEXT"), ("nf_dev_deposito", "TEXT"), ("nf_dev_por", "TEXT"),
-             ("nf_dev_em", "BIGINT"), ("nf_dev_msg", "TEXT")]
+             ("nf_dev_em", "BIGINT"), ("nf_dev_msg", "TEXT"),
+             ("nf_dev_etapa", "TEXT"), ("nf_dev_etapa_em", "BIGINT"), ("nf_dev_situacao", "TEXT"), ("nf_dev_erro", "TEXT"),
+             ("nf_dev_conf", "TEXT")]
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status", "canal", "servico", "embalagem", "estado_produto"]
@@ -491,7 +493,7 @@ def detalhe(did):
         d["videos"] = [{"id": x["id"], "duracao": x["duracao"], "por": x["criado_por"], "em": x["criado_em"]}
                        for x in conn.execute("SELECT id, duracao, criado_por, criado_em FROM devolucao_videos WHERE devolucao_id=? ORDER BY id", (did,)).fetchall()]
     d["nf_dev_sugerido"] = _deposito_sugerido(r)
-    for k in ("nf_dev_id", "nf_dev_numero", "nf_dev_deposito", "nf_dev_por", "nf_dev_em", "nf_dev_msg"):
+    for k in ("nf_dev_id", "nf_dev_numero", "nf_dev_deposito", "nf_dev_por", "nf_dev_em", "nf_dev_msg", "nf_dev_situacao", "nf_dev_etapa"):
         d[k] = r[k] if k in r.keys() else None
     return jsonify(d)
 
@@ -1019,7 +1021,14 @@ def _msg_bling(txt):
         return str(txt or "")[:400]
 
 
-def _nf_log(did, acao, ok, origem=None, http=None, mensagem="", nf_id=None, resposta="", enviado=None):
+def _quem_seguro():
+    try:
+        return _quem()
+    except Exception:
+        return ""
+
+
+def _nf_log(did, acao, ok, origem=None, http=None, mensagem="", nf_id=None, resposta="", enviado=None, por=None):
     """Prova do que aconteceu: cada chamada ao Bling fica gravada (o que foi enviado e o que o Bling respondeu)."""
     try:
         with db_session() as conn:
@@ -1027,7 +1036,7 @@ def _nf_log(did, acao, ok, origem=None, http=None, mensagem="", nf_id=None, resp
                          "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                          (did, acao, 1 if ok else 0, origem, http, str(mensagem or "")[:1000], str(nf_id) if nf_id else None,
                           str(resposta or "")[:4000], json.dumps(enviado, ensure_ascii=False)[:8000] if enviado is not None else None,
-                          _quem(), int(time.time())))
+                          por if por is not None else _quem_seguro(), int(time.time())))
     except Exception as e:
         print(f"[NF-DEV] log falhou ({did}): {e}", flush=True)
 
@@ -1259,7 +1268,9 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
     plano["contato"] = cont
 
     # natureza pelo tipo de cliente: CPF / sem IE = não contribuinte (consumidor final); dentro ou fora de SP pelo CFOP da venda
-    nao_contrib = len(doc) == 11 or not str(cont.get("ie") or "").strip()
+    ie = str(cont.get("ie") or "").strip().upper()
+    tem_ie = bool(_so_dig(ie)) and ie not in ("ISENTO", "ISENTA")
+    nao_contrib = len(doc) == 11 or not tem_ie
     cf_venda = _so_dig(item.get("cfop"))
     dentro_sp = cf_venda.startswith("5") if cf_venda else str(end.get("uf") or "").upper() == "SP"
     if nao_contrib:
@@ -1269,6 +1280,9 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
     else:
         nat_alvo = NATUREZA_DEVOLUCAO
         por_que = "cliente com IE = contribuinte"
+        if os.environ.get("NF_DEV_CONTRIBUINTE_GERAR", "0") != "1":
+            ponto(False, "Cliente contribuinte", f"tem inscrição estadual ({ie}): quem emite a nota de devolução é o CLIENTE. "
+                                                 "Peça a NF de devolução dele; quando ela entrar no Bling, o WMS liga aqui")
     nat, nat_desc, err_nat = None, nat_alvo, None
     try:
         for x in (b._get_json("/naturezas-operacoes", params={"limite": 100}).get("data") or []):
@@ -1297,7 +1311,9 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
                     dn = b._get_json(f"/nfe/{n['id']}").get("data") or {}
                     if str(dn.get("tipo")) != "0" or int(dn.get("situacao") or 0) in (2, 9):   # só ENTRADA válida (não cancelada/denegada)
                         continue
-                    if any(str(i.get("codigo") or "").strip().upper() == sku for i in dn.get("itens") or []):
+                    desc_v, gtin_v = _norm_txt(item.get("descricao")), str(item.get("gtin") or "").strip()
+                    if any(str(i.get("codigo") or "").strip().upper() == sku or (desc_v and _norm_txt(i.get("descricao")) == desc_v)
+                           or (gtin_v and str(i.get("gtin") or "").strip() == gtin_v) for i in dn.get("itens") or []):
                         plano["duplicada"] = dn
                         break
                 if plano["duplicada"] or len(lst) < 100:
@@ -1333,15 +1349,16 @@ def _plano_nf_dev(r, dep_pedido=None, checar_duplicata=True):
     return plano
 
 
-def _conferir_criada(det, plano):
-    """Depois de criar: o que o Bling realmente gravou na nota."""
+def _conferir_criada(det, plano, com_ref=False):
+    """Depois de criar: o que o Bling realmente gravou na nota. Tudo True = pode ir para a SEFAZ sozinha."""
     c = det.get("contato") or {}
     ref = det.get("documentoReferenciado") or det.get("notasReferenciadas") or det.get("documentosReferenciados")
     itens = det.get("itens") or []
     return [
-        {"ok": True if ref else None, "item": "Chave da NF de venda referenciada", "detalhe": "gravada" if ref else "não veio no retorno do Bling: confira na aba de referências antes de enviar"},
-        {"ok": True if c.get("email") else None, "item": "E-mail na nota", "detalhe": c.get("email") or "vazio: complete antes de enviar"},
-        {"ok": True if c.get("telefone") else None, "item": "Telefone na nota", "detalhe": c.get("telefone") or "vazio: complete antes de enviar"},
+        {"ok": True if (ref or com_ref) else None, "item": "Chave da NF de venda referenciada",
+         "detalhe": "gravada (o Bling aceitou a referência)" if (ref or com_ref) else "o Bling não aceitou a referência: confira na aba de referências"},
+        {"ok": True if c.get("email") else None, "item": "E-mail na nota", "detalhe": c.get("email") or "vazio"},
+        {"ok": True if c.get("telefone") else None, "item": "Telefone na nota", "detalhe": c.get("telefone") or "vazio"},
         {"ok": True if itens else False, "item": "Item / CFOP na nota", "detalhe": ", ".join(f"{i.get('codigo')} x{i.get('quantidade')} CFOP {i.get('cfop')}" for i in itens) or "sem itens"},
         {"ok": True, "item": "Natureza", "detalhe": plano.get("natureza") or str((det.get("naturezaOperacao") or {}).get("id") or "-")},
         {"ok": True, "item": "ICMS na nota", "detalhe": _icms_txt(itens)},
@@ -1359,6 +1376,189 @@ def _icms_txt(itens):
             + (" — sem ICMS" if not tot else " — crédito do ICMS da venda (confira com o contador)"))
 
 
+# ── andamento (roda em segundo plano: Bling + SEFAZ podem demorar mais que o limite do servidor) ──
+ETAPAS_RODANDO = ("montando", "criando", "estoque", "conferindo", "sefaz")
+ETAPA_TXT = {"montando": "Conferindo venda, cliente e nota no Bling", "criando": "Criando a nota no Bling",
+             "estoque": "Lançando o estoque", "conferindo": "Lendo a nota criada no Bling",
+             "sefaz": "Enviando para a SEFAZ", "ok": "Concluído", "erro": "Parou com erro"}
+ENVIAR_SEFAZ_AUTO = lambda: os.environ.get("NF_DEV_ENVIAR_AUTO", "1") != "0"   # chave: NF_DEV_ENVIAR_AUTO=0 desliga
+
+
+def _etapa(did, etapa, **campos):
+    sets, vals = ["nf_dev_etapa=?", "nf_dev_etapa_em=?"], [etapa, int(time.time())]
+    for k, v in campos.items():
+        sets.append(f"{k}=?")
+        vals.append(v)
+    with db_session() as conn:
+        conn.execute(f"UPDATE devolucoes SET {', '.join(sets)} WHERE id=?", (*vals, did))
+
+
+def _falhou(did, origem, msg, situacao=None, **extra):
+    campos = {"nf_dev_situacao": situacao} if situacao else {}
+    _etapa(did, "erro", nf_dev_msg=msg[:500], nf_dev_erro=json.dumps({"error": msg, "origem": origem, **extra}, ensure_ascii=False)[:6000], **campos)
+    print(f"[NF-DEV] devolução {did} PAROU ({origem}): {msg}", flush=True)
+
+
+def _rodando(r):
+    return (r["nf_dev_etapa"] in ETAPAS_RODANDO) and (time.time() - float(r["nf_dev_etapa_em"] or 0) < 240)
+
+
+def _enviar_sefaz(b, did, nid, quem):
+    """Transmite pelo Bling e espera a resposta da SEFAZ. -> (situação, mensagem, ok)"""
+    _etapa(did, "sefaz")
+    st, txt, js = _bling_uma_vez(b, "POST", f"/nfe/{nid}/enviar")
+    print(f"[NF-DEV] devolução {did}: enviar SEFAZ HTTP {st} {txt[:400]}", flush=True)
+    _nf_log(did, "enviar para a SEFAZ", st in (200, 201, 202, 204), "sefaz", st,
+            "Bling aceitou o envio" if st in (200, 201, 202, 204) else (_msg_bling(txt) or f"HTTP {st}"), nid, txt, por=quem)
+    sit = 0
+    for _ in range(12):
+        try:
+            sit = int((b._get_json(f"/nfe/{nid}").get("data") or {}).get("situacao") or 0)
+        except Exception as e:
+            print(f"[NF-DEV] devolução {did}: lendo situação: {e}", flush=True)
+        if sit in (2, 4, 5, 6, 7, 9):
+            break
+        time.sleep(3)
+    nome = SIT_NF.get(sit, f"situação {sit}")
+    if sit in (5, 6, 7):
+        msg = f"AUTORIZADA pela SEFAZ ({nome})."
+        ok = True
+    elif sit in (4, 9):
+        msg = f"{nome.upper()} pela SEFAZ: {_msg_bling(txt) if st not in (200, 201, 202, 204) else 'veja o motivo na nota, no Bling'}"
+        ok = False
+    elif st not in (200, 201, 202, 204):
+        msg = f"O envio foi recusado: {_msg_bling(txt) or f'HTTP {st}'}"
+        ok = False
+    else:
+        msg = f"Enviada; a SEFAZ ainda não respondeu ({nome}). Confira no Bling em alguns minutos."
+        ok = None
+    _nf_log(did, "resposta da SEFAZ", bool(ok), "sefaz", st, msg, nid, por=quem)
+    return nome, msg, ok, (st, txt)
+
+
+def _job_nf_dev(did, deposito, quem):
+    """Gera a nota de devolução de ponta a ponta. Cada passo fica no histórico; qualquer erro para e mostra a origem."""
+    from services.bling_service import BlingService
+    try:
+        with db_session() as conn:
+            r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+        try:
+            p = _plano_nf_dev(r, deposito)
+        except Exception as e:
+            import traceback
+            print(f"[NF-DEV] plano {did}: {traceback.format_exc()}", flush=True)
+            org, msg = _erro_exc(e, "montar a nota")
+            _nf_log(did, "montar", False, org, None, msg, por=quem)
+            return _falhou(did, org, msg)
+        if p["duplicada"]:
+            dn = p["duplicada"]
+            num = str(dn.get("numero") or "").lstrip("0")
+            sitd = SIT_NF.get(int(dn.get("situacao") or 0), "")
+            msg = f"Ligada à NF {num}/{dn.get('serie')} que já existia no Bling ({sitd}). O WMS não criou outra nem mexeu no estoque."
+            _etapa(did, "ok", nf_dev_id=str(dn.get("id")), nf_dev_numero=num, nf_dev_msg=msg, nf_dev_em=int(time.time()),
+                   nf_dev_por=None, nf_dev_situacao=sitd, nf_dev_erro=None,
+                   nf_dev_conf=json.dumps(p["pontos"], ensure_ascii=False)[:6000])
+            _nf_log(did, "ligar nota que já existia", True, "bling", 200, msg, dn.get("id"), por=quem)
+            return
+        if p["bloqueio"]:
+            return _falhou(did, p.get("bloqueio_origem") or "conferencia", p["bloqueio"], pontos=p["pontos"])
+        if p["dep"] not in NOME_DEP or not p["dep_id"]:
+            return _falhou(did, "conferencia", "Escolha o depósito: Local (volta para venda) ou Defeitos / Garantia.", escolher=True, pontos=p["pontos"])
+
+        b = BlingService()
+        _etapa(did, "criando")
+        criado, ult, com_ref = None, None, False
+        for k, payload in enumerate(p["payloads"]):
+            st, txt, js = _bling_uma_vez(b, "POST", "/nfe", payload)
+            print(f"[NF-DEV] devolução {did} tentativa {k + 1}: HTTP {st} {txt[:400]}", flush=True)
+            if st in (200, 201):
+                criado = ((js or {}).get("data") or {}).get("id")
+                com_ref = k == 0
+                _nf_log(did, "criar nota", bool(criado), "bling", st, f"o Bling criou a nota (id {criado})" if criado else "o Bling respondeu sem id",
+                        criado, txt, payload, por=quem)
+                break
+            ult = (st, txt)
+            _nf_log(did, f"criar nota (tentativa {k + 1})", False, "bling", st, _msg_bling(txt) or f"sem resposta (HTTP {st})", None, txt, payload, por=quem)
+            if st not in (400, 422):   # timeout/5xx: pode ter criado; não tenta de novo (evita nota dupla)
+                break
+        if not criado:
+            st, txt = ult or (0, "")
+            if st in (400, 422):
+                msg = f"O Bling recusou a nota: {_msg_bling(txt)}"
+            elif st == 0:
+                msg = f"O Bling não respondeu ({txt[:200]}). Confira no Bling se a nota foi criada antes de tentar de novo."
+            else:
+                msg = f"O Bling deu erro (HTTP {st}): {_msg_bling(txt)}. Confira no Bling se a nota foi criada antes de tentar de novo."
+            return _falhou(did, "bling", msg, http=st, campos=_campos_bling(txt), resposta=txt[:1500], pontos=p["pontos"])
+        # grava o id JÁ: se algo falhar daqui pra frente, a devolução não perde a nota
+        _etapa(did, "estoque", nf_dev_id=str(criado), nf_dev_por=quem, nf_dev_em=int(time.time()), nf_dev_situacao="Pendente",
+               nf_dev_msg="nota criada no Bling; lançando estoque…")
+
+        est_st, est_txt, _ = _bling_uma_vez(b, "POST", f"/nfe/{criado}/lancar-estoque/{p['dep_id']}")
+        est_ok = est_st in (200, 201, 204)
+        print(f"[NF-DEV] devolução {did}: lancar-estoque {p['dep_id']} HTTP {est_st} {est_txt[:300]}", flush=True)
+        _nf_log(did, f"lançar estoque em {NOME_DEP[p['dep']]}", est_ok, "bling", est_st,
+                "estoque lançado" if est_ok else (_msg_bling(est_txt) or f"HTTP {est_st}"), criado, est_txt, por=quem)
+
+        _etapa(did, "conferindo", nf_dev_deposito=p["dep"] if est_ok else None)
+        try:
+            det = b._get_json(f"/nfe/{criado}").get("data") or {}
+        except Exception as e:
+            det = {"id": criado}
+            _nf_log(did, "ler a nota criada", False, "bling", None, _erro_exc(e, "ler a nota criada")[1], criado, por=quem)
+        conf = _conferir_criada(det, p, com_ref)
+        conf.append({"ok": est_ok, "item": "Estoque", "detalhe": f"lançado em {NOME_DEP[p['dep']]}" if est_ok
+                     else f"NÃO lançado ({_msg_bling(est_txt) or est_st}): lance no Bling"})
+        pend = [c["item"] for c in conf if c["ok"] is not True]
+        numero = str(det.get("numero") or "").lstrip("0")
+        _nf_log(did, "conferir a nota no Bling", not pend, "bling", 200, "; ".join(f"{c['item']}: {c['detalhe']}" for c in conf),
+                criado, json.dumps(det, ensure_ascii=False)[:4000], por=quem)
+        base = f"NF {numero} criada no Bling. " + (f"Estoque lançado em {NOME_DEP[p['dep']]}. " if est_ok else "ATENÇÃO: estoque NÃO lançado. ")
+
+        if pend or not ENVIAR_SEFAZ_AUTO():
+            motivo = f"confira: {', '.join(pend)}" if pend else "envio automático desligado"
+            _etapa(did, "ok", nf_dev_numero=numero, nf_dev_situacao="Pendente", nf_dev_erro=None,
+                   nf_dev_conf=json.dumps(conf, ensure_ascii=False)[:6000],
+                   nf_dev_msg=(base + f"NÃO enviei para a SEFAZ ({motivo}). Depois de conferir, clique em 'Enviar para a SEFAZ'.")[:500])
+            return
+        _etapa(did, "sefaz", nf_dev_numero=numero, nf_dev_conf=json.dumps(conf, ensure_ascii=False)[:6000])
+        nome, msg_s, ok, (st, txt) = _enviar_sefaz(b, did, criado, quem)
+        if ok is False:
+            return _falhou(did, "sefaz", f"{base}{msg_s}", situacao=nome, http=st, campos=_campos_bling(txt), resposta=txt[:1500])
+        _etapa(did, "ok", nf_dev_situacao=nome, nf_dev_erro=None, nf_dev_msg=(base + msg_s)[:500])
+    except Exception as e:
+        import traceback
+        print(f"[NF-DEV] devolução {did}: {traceback.format_exc()}", flush=True)
+        org, msg = _erro_exc(e, "gerar a nota")
+        _nf_log(did, "erro", False, org, None, msg, por=quem)
+        _falhou(did, org, msg)
+
+
+def _rodar(alvo, *args):
+    import threading
+    threading.Thread(target=alvo, args=args, daemon=True).start()
+
+
+def _info_nf(r):
+    with db_session() as conn:
+        log = [dict(x) for x in conn.execute("SELECT id, acao, ok, origem, http, mensagem, nf_id, resposta, enviado, por, em "
+                                             "FROM devolucao_nf_log WHERE devolucao_id=? ORDER BY id DESC LIMIT 40", (r["id"],)).fetchall()]
+    def _js(x):
+        try:
+            return json.loads(x) if x else None
+        except Exception:
+            return None
+    etapa = r["nf_dev_etapa"]
+    if etapa in ETAPAS_RODANDO and not _rodando(r):
+        etapa = "erro"   # parou no meio (servidor reiniciou?)
+    return {"sugerido": _deposito_sugerido(r), "nf_dev_numero": r["nf_dev_numero"], "nf_dev_id": r["nf_dev_id"],
+            "nf_dev_deposito": r["nf_dev_deposito"], "nf_dev_por": r["nf_dev_por"], "nf_dev_em": r["nf_dev_em"],
+            "nf_dev_msg": r["nf_dev_msg"], "full": r["status"] == "armazem_ml", "historico": log,
+            "etapa": etapa, "etapa_txt": ETAPA_TXT.get(etapa or "", ""), "rodando": _rodando(r),
+            "situacao": r["nf_dev_situacao"], "erro": _js(r["nf_dev_erro"]) if etapa == "erro" else None,
+            "conferencia": _js(r["nf_dev_conf"]), "envio_auto": ENVIAR_SEFAZ_AUTO()}
+
+
 @devolucoes_routes.get("/devolucoes/<int:did>/nf-devolucao")
 @login_required
 def nf_dev_info(did):
@@ -1367,12 +1567,7 @@ def nf_dev_info(did):
         r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
     if not r:
         return jsonify({"error": "Devolução não encontrada."}), 404
-    with db_session() as conn:
-        log = [dict(x) for x in conn.execute("SELECT id, acao, ok, origem, http, mensagem, nf_id, resposta, enviado, por, em "
-                                             "FROM devolucao_nf_log WHERE devolucao_id=? ORDER BY id DESC LIMIT 40", (did,)).fetchall()]
-    return jsonify({"sugerido": _deposito_sugerido(r), "nf_dev_numero": r["nf_dev_numero"], "nf_dev_id": r["nf_dev_id"],
-                    "nf_dev_deposito": r["nf_dev_deposito"], "nf_dev_por": r["nf_dev_por"], "nf_dev_em": r["nf_dev_em"],
-                    "nf_dev_msg": r["nf_dev_msg"], "full": r["status"] == "armazem_ml", "historico": log})
+    return jsonify(_info_nf(r))
 
 
 @devolucoes_routes.get("/devolucoes/<int:did>/nf-devolucao/previa")
@@ -1394,97 +1589,70 @@ def nf_dev_previa(did):
     return jsonify({"pode_gerar": not p["bloqueio"] and p["dep"] in NOME_DEP, "bloqueio": p["bloqueio"], "pontos": p["pontos"],
                     "duplicada": {"numero": str(dn.get("numero") or "").lstrip("0"), "serie": dn.get("serie"),
                                   "situacao": SIT_NF.get(int(dn.get("situacao") or 0))} if dn else None,
-                    "sugerido": p["sugerido"], "deposito": p["dep"], "venda_nf": p["venda_nf"],
+                    "sugerido": p["sugerido"], "deposito": p["dep"], "venda_nf": p["venda_nf"], "envio_auto": ENVIAR_SEFAZ_AUTO(),
                     "payload": p["payloads"][0] if p["payloads"] else None})
 
 
 @devolucoes_routes.post("/devolucoes/<int:did>/nf-devolucao")
 @login_required
 def nf_dev_gerar(did):
-    """Cria no Bling a NF de ENTRADA de devolução (pendente, sem enviar à SEFAZ) e lança o estoque no depósito."""
-    from services.bling_service import BlingService
+    """Começa a nota de devolução (em segundo plano). A tela acompanha por GET .../nf-devolucao."""
     garantir_tabelas()
     body = request.get_json(silent=True) or {}
     with db_session() as conn:
         r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
     if not r:
         return jsonify({"error": "Devolução não encontrada."}), 404
+    if r["nf_dev_id"] or r["nf_dev_numero"]:
+        return _erro("conferencia", f"Essa devolução já tem nota de devolução (NF {r['nf_dev_numero'] or r['nf_dev_id']}).", 409)
+    if r["status"] == "armazem_ml":
+        return _erro("conferencia", "Devolução FULL: volta para o armazém do ML; o WMS não gera nota.", 409)
+    if not r["bipado"] or not r["chegada"]:
+        return _erro("conferencia", "Conclua a conferência na prancheta antes.", 409)
+    if _rodando(r):
+        return jsonify({"success": True, "andamento": True, "msg": "Já está gerando."}), 202
+    quem = _quem()
+    _etapa(did, "montando", nf_dev_erro=None, nf_dev_msg=None)
+    _nf_log(did, "começar", True, "wms", None, f"pedido por {quem}" + (f" · depósito {body.get('deposito')}" if body.get("deposito") else ""), por=quem)
+    _rodar(_job_nf_dev, did, body.get("deposito"), quem)
+    return jsonify({"success": True, "andamento": True}), 202
+
+
+def _job_enviar(did, quem):
+    from services.bling_service import BlingService
     try:
-        p = _plano_nf_dev(r, body.get("deposito"))
+        with db_session() as conn:
+            r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+        b = BlingService()
+        nome, msg, ok, (st, txt) = _enviar_sefaz(b, did, r["nf_dev_id"], quem)
+        if ok is False:
+            return _falhou(did, "sefaz", f"NF {r['nf_dev_numero']}: {msg}", situacao=nome, http=st, campos=_campos_bling(txt), resposta=txt[:1500])
+        _etapa(did, "ok", nf_dev_situacao=nome, nf_dev_erro=None, nf_dev_msg=f"NF {r['nf_dev_numero']}: {msg}"[:500])
     except Exception as e:
         import traceback
-        print(f"[NF-DEV] plano {did}: {traceback.format_exc()}", flush=True)
-        org, msg = _erro_exc(e, "montar a nota")
-        _nf_log(did, "montar", False, org, None, msg)
-        return _erro(org, msg)
-    if p["duplicada"]:
-        dn = p["duplicada"]
-        num = str(dn.get("numero") or "").lstrip("0")
-        msg = f"Ligada à NF {num}/{dn.get('serie')} que já existia no Bling ({SIT_NF.get(int(dn.get('situacao') or 0), '')}). O WMS não criou outra nem mexeu no estoque."
-        with db_session() as conn:
-            conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_msg=?, nf_dev_em=?, nf_dev_por=NULL WHERE id=?",
-                         (str(dn.get("id")), num, msg, int(time.time()), did))
-        _nf_log(did, "ligar", True, "bling", 200, msg, dn.get("id"))
-        return jsonify({"success": True, "ligada": True, "numero": num, "msg": msg, "pontos": p["pontos"]})
-    if p["bloqueio"]:
-        return _erro(p.get("bloqueio_origem") or "conferencia", p["bloqueio"], 409, pontos=p["pontos"])
-    if p["dep"] not in NOME_DEP or not p["dep_id"]:
-        return _erro("conferencia", "Escolha o depósito: Local (volta para venda) ou Defeitos / Garantia.", 400, escolher=True, pontos=p["pontos"])
+        print(f"[NF-DEV] enviar {did}: {traceback.format_exc()}", flush=True)
+        _falhou(did, *_erro_exc(e, "enviar para a SEFAZ"))
 
-    b = BlingService()
-    criado, ult = None, None
-    for k, payload in enumerate(p["payloads"]):
-        st, txt, js = _bling_uma_vez(b, "POST", "/nfe", payload)
-        print(f"[NF-DEV] devolução {did} tentativa {k + 1}: HTTP {st} {txt[:400]}", flush=True)
-        if st in (200, 201):
-            criado = ((js or {}).get("data") or {}).get("id")
-            _nf_log(did, "criar", bool(criado), "bling", st, f"Bling criou a nota (id {criado})" if criado else "Bling respondeu sem id",
-                    criado, txt, payload)
-            break
-        ult = (st, txt)
-        _nf_log(did, f"criar (tentativa {k + 1})", False, "bling", st, _msg_bling(txt) or f"sem resposta (HTTP {st})", None, txt, payload)
-        if st not in (400, 422):   # timeout/5xx: pode ter criado; não tenta de novo (evita nota dupla)
-            break
-    if not criado:
-        st, txt = ult or (0, "")
-        if st in (400, 422):
-            msg = f"O Bling recusou a nota: {_msg_bling(txt)}"
-        elif st == 0:
-            msg = f"O Bling não respondeu ({txt[:200]}). Confira no Bling se a nota foi criada antes de tentar de novo."
-        else:
-            msg = f"O Bling deu erro (HTTP {st}): {_msg_bling(txt)}. Confira no Bling se a nota foi criada antes de tentar de novo."
-        with db_session() as conn:
-            conn.execute("UPDATE devolucoes SET nf_dev_msg=? WHERE id=?", (msg[:500], did))
-        return _erro("bling", msg, 422, http=st, campos=_campos_bling(txt), resposta=txt[:1500], pontos=p["pontos"])
-    # grava o id JÁ (se algo falhar daqui pra frente, a devolução não fica sem saber da nota)
+
+@devolucoes_routes.post("/devolucoes/<int:did>/nf-devolucao/enviar")
+@login_required
+def nf_dev_enviar(did):
+    """Envio manual para a SEFAZ (supervisor/admin), quando o automático não foi (algo para conferir ou chave desligada)."""
+    if not eh_gestor():
+        return _erro("conferencia", "Só supervisor ou admin envia para a SEFAZ por aqui.", 403)
+    garantir_tabelas()
     with db_session() as conn:
-        conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_por=?, nf_dev_em=?, nf_dev_msg=? WHERE id=?",
-                     (str(criado), _quem(), int(time.time()), "nota criada no Bling; conferindo…", did))
-    try:
-        det = b._get_json(f"/nfe/{criado}").get("data") or {}
-    except Exception as e:
-        det = {"id": criado}
-        _nf_log(did, "ler nota criada", False, "bling", None, str(e)[:300], criado)
-    est_st, est_txt, _ = _bling_uma_vez(b, "POST", f"/nfe/{criado}/lancar-estoque/{p['dep_id']}")
-    est_ok = est_st in (200, 201, 204)
-    print(f"[NF-DEV] devolução {did}: lancar-estoque {p['dep_id']} HTTP {est_st} {est_txt[:300]}", flush=True)
-    _nf_log(did, f"lançar estoque em {NOME_DEP[p['dep']]}", est_ok, "bling", est_st,
-            "estoque lançado" if est_ok else (_msg_bling(est_txt) or f"HTTP {est_st}"), criado, est_txt)
-    conf = _conferir_criada(det, p)
-    conf.append({"ok": est_ok, "item": "Estoque", "detalhe": f"lançado em {NOME_DEP[p['dep']]}" if est_ok
-                 else f"NÃO lançado ({_msg_bling(est_txt) or est_st}): lance no Bling"})
-    pend = [c["item"] for c in conf if c["ok"] is not True]
-    msg = (f"NF {det.get('numero')} criada PENDENTE no Bling. "
-           + (f"Estoque lançado em {NOME_DEP[p['dep']]}. " if est_ok else "ATENÇÃO: estoque NÃO lançado. ")
-           + (f"Confira antes de enviar: {', '.join(pend)}." if pend else "Tudo conferido: abra no Bling e clique em Enviar."))
-    with db_session() as conn:
-        conn.execute("UPDATE devolucoes SET nf_dev_id=?, nf_dev_numero=?, nf_dev_deposito=?, nf_dev_por=?, nf_dev_em=?, nf_dev_msg=? WHERE id=?",
-                     (str(criado), str(det.get("numero") or ""), p["dep"] if est_ok else None, _quem(), int(time.time()), msg, did))
-    print(f"[NF-DEV] devolução {did}: {msg}", flush=True)
-    _nf_log(did, "conferir nota no Bling", not pend, "bling", 200,
-            "; ".join(f"{c['item']}: {c['detalhe']}" for c in conf), criado, json.dumps(det, ensure_ascii=False)[:4000])
-    return jsonify({"success": True, "nf_id": criado, "numero": det.get("numero"), "deposito": p["dep"], "estoque_lancado": est_ok,
-                    "msg": msg, "conferencia": conf})
+        r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
+    if not r or not r["nf_dev_id"]:
+        return _erro("conferencia", "Essa devolução não tem nota de devolução.", 404)
+    if not r["nf_dev_por"]:
+        return _erro("conferencia", "Essa nota não foi criada pelo WMS: envie pelo Bling.", 409)
+    if _rodando(r):
+        return jsonify({"success": True, "andamento": True}), 202
+    quem = _quem()
+    _etapa(did, "sefaz", nf_dev_erro=None)
+    _rodar(_job_enviar, did, quem)
+    return jsonify({"success": True, "andamento": True}), 202
 
 
 @devolucoes_routes.post("/devolucoes/<int:did>/nf-devolucao/desfazer")
@@ -1493,24 +1661,32 @@ def nf_dev_desfazer(did):
     """Volta atrás (supervisor/admin): só com a nota ainda PENDENTE ou REJEITADA. Estorna o estoque e exclui a nota no Bling."""
     from services.bling_service import BlingService
     if not eh_gestor():
-        return jsonify({"error": "Só supervisor ou admin desfaz a nota de devolução."}), 403
+        return _erro("conferencia", "Só supervisor ou admin desfaz a nota de devolução.", 403)
     garantir_tabelas()
     with db_session() as conn:
         r = conn.execute("SELECT * FROM devolucoes WHERE id=?", (did,)).fetchone()
     if not r or not r["nf_dev_id"]:
-        return jsonify({"error": "Essa devolução não tem nota de devolução."}), 404
-    limpar = "UPDATE devolucoes SET nf_dev_id=NULL, nf_dev_numero=NULL, nf_dev_deposito=NULL, nf_dev_por=NULL, nf_dev_em=NULL, nf_dev_msg=? WHERE id=?"
+        return _erro("conferencia", "Essa devolução não tem nota de devolução.", 404)
+    if _rodando(r):
+        return _erro("conferencia", "A nota ainda está sendo gerada/enviada. Espere terminar.", 409)
+    limpar = ("UPDATE devolucoes SET nf_dev_id=NULL, nf_dev_numero=NULL, nf_dev_deposito=NULL, nf_dev_por=NULL, nf_dev_em=NULL, "
+              "nf_dev_situacao=NULL, nf_dev_erro=NULL, nf_dev_conf=NULL, nf_dev_etapa=NULL, nf_dev_msg=? WHERE id=?")
     if not r["nf_dev_por"]:          # nota que já existia no Bling: o WMS só tinha ligado; não mexe nela
         with db_session() as conn:
             conn.execute(limpar, (f"desvinculada por {_quem()} (a nota não foi criada pelo WMS: continua no Bling)", did))
+        _nf_log(did, "desvincular", True, "wms", None, "desvinculada (a nota continua no Bling)")
         return jsonify({"success": True, "msg": "Desvinculei. Essa nota não foi criada pelo WMS, então continua no Bling."})
     b = BlingService()
     nid = r["nf_dev_id"]
-    det = b._get_json(f"/nfe/{nid}").get("data") or {}
+    try:
+        det = b._get_json(f"/nfe/{nid}").get("data") or {}
+    except Exception as e:
+        return _erro(*_erro_exc(e, "ler a nota"))
     sit = int(det.get("situacao") or 0)
     if sit not in (1, 4):
-        return jsonify({"error": f"A NF {r['nf_dev_numero']} está '{SIT_NF.get(sit, sit)}' no Bling: não dá para desfazer pelo WMS (cancele no Bling)."}), 409
-    passos = []
+        return _erro("conferencia", f"A NF {r['nf_dev_numero']} está '{SIT_NF.get(sit, sit)}' no Bling: não dá para desfazer pelo WMS. "
+                                    "Se foi autorizada, cancele no Bling (prazo da SEFAZ: 24 h).", 409)
+    passos, st, txt = [], 0, ""
     if r["nf_dev_deposito"]:
         ok = False
         for met, cam in (("DELETE", f"/nfe/{nid}/lancar-estoque"), ("POST", f"/nfe/{nid}/estornar-estoque")):
@@ -1519,7 +1695,7 @@ def nf_dev_desfazer(did):
             if st in (200, 201, 204):
                 ok = True
                 break
-        passos.append("estoque estornado" if ok else "NÃO consegui estornar o estoque (estorne no Bling)")
+        passos.append("estoque estornado" if ok else f"NÃO consegui estornar o estoque ({_msg_bling(txt) or st}): estorne no Bling")
         _nf_log(did, "estornar estoque", ok, "bling", st, passos[-1], nid, txt)
     apagou = False
     for params in (None, {"idsNotas[]": nid}):

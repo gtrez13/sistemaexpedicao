@@ -59,7 +59,8 @@ for r in rows:
         print("   => gera depois que o operador escolher o depósito")
         prontas += 1
     else:
-        print(f"   => GERARIA a nota (pendente) e lançaria em {d.NOME_DEP[p['dep']]}")
+        envio = "e enviaria para a SEFAZ se a nota criada vier toda certa" if d.ENVIAR_SEFAZ_AUTO() else "e deixaria pendente (envio automático desligado)"
+        print(f"   => GERARIA a nota, lançaria em {d.NOME_DEP[p['dep']]} {envio}")
         prontas += 1
     if so_id and p["payloads"]:
         print("\n== JSON que iria para o Bling (POST /nfe) ==")
