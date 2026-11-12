@@ -326,6 +326,7 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
             d["sugestoes_pc"] = []
     if com_pc:
         d["divergencias_pedido"] = _divergencias(d, conferencia=False)
+        d["comparacao"] = _comparacao(d)
     d["permite_liberar"] = PERMITE_LIBERAR
     d["exigir_lote"] = EXIGIR_LOTE
     d["eh_gestor"] = eh_gestor()
@@ -334,6 +335,52 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
 
 PRECO_TOL = float(os.environ.get("RECEB_PRECO_TOL", "0.01"))   # R$ por unidade (só arredondamento)
 PERMITE_LIBERAR = os.environ.get("RECEB_PERMITE_LIBERAR", "0") == "1"   # padrão: divergência NUNCA é liberada
+
+
+def _brl(v, casas=2) -> str:
+    """R$ no formato brasileiro: 8.370,84"""
+    t = f"{float(v or 0):,.{casas}f}"
+    return "R$ " + t.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _comparacao(d: dict) -> dict | None:
+    """NF x pedido, linha a linha (qtd, preço unitário, total da linha e diferença) + totais. Mostra DE ONDE vem a diferença."""
+    pc = d.get("pedido_compra")
+    if not pc:
+        return None
+    linhas, usados = [], set()
+    for it in d["itens"]:
+        pi = _item_pc(pc, it)
+        q_nf, vu_nf = float(it["qtd_nf"] or 0), float(it.get("valor_unit") or 0)
+        t_nf = round(q_nf * vu_nf, 2)
+        if not pi:
+            linhas.append({"n_item": it["n_item"], "descricao": it["descricao"], "sku": it.get("sku"), "qtd_nf": q_nf, "qtd_pc": None,
+                           "vu_nf": vu_nf, "vu_pc": None, "tot_nf": t_nf, "tot_pc": 0.0, "dif": t_nf, "situacao": "fora_pedido"})
+            continue
+        usados.add(id(pi))
+        q_pc, vu_pc = float(pi.get("qtd") or 0), float(pi.get("valor") or 0)
+        t_pc = round(q_pc * vu_pc, 2)
+        dif = round(t_nf - t_pc, 2)
+        if abs(q_nf - q_pc) > 1e-6:
+            sit = "quantidade"
+        elif abs(vu_nf - vu_pc) > PRECO_TOL:
+            sit = "preco"
+        elif abs(dif) >= 0.005:
+            sit = "centavos"          # preço unitário bate (até R$ 0,01), mas a linha difere no arredondamento
+        else:
+            sit = "ok"
+        linhas.append({"n_item": it["n_item"], "descricao": it["descricao"], "sku": it.get("sku"), "qtd_nf": q_nf, "qtd_pc": q_pc,
+                       "vu_nf": vu_nf, "vu_pc": vu_pc, "tot_nf": t_nf, "tot_pc": t_pc, "dif": dif, "situacao": sit})
+    for pi in pc["itens"]:
+        if id(pi) not in usados:
+            q_pc, vu_pc = float(pi.get("qtd") or 0), float(pi.get("valor") or 0)
+            t_pc = round(q_pc * vu_pc, 2)
+            linhas.append({"n_item": None, "descricao": pi.get("descricao") or pi.get("sku") or "", "sku": pi.get("sku"), "qtd_nf": None,
+                           "qtd_pc": q_pc, "vu_nf": None, "vu_pc": vu_pc, "tot_nf": 0.0, "tot_pc": t_pc, "dif": -t_pc, "situacao": "nao_veio"})
+    tot_nf = round(sum(x["tot_nf"] for x in linhas), 2)
+    tot_pc = round(sum(x["tot_pc"] for x in linhas), 2)
+    return {"pedido": pc.get("numero"), "linhas": linhas, "tot_nf": tot_nf, "tot_pc": tot_pc, "dif": round(tot_nf - tot_pc, 2),
+            "tol_total": 0.05, "tol_unit": PRECO_TOL}
 
 
 def _item_pc(pc, it):
@@ -411,14 +458,14 @@ def _parear(itens_nf, pc):
             batem += 1
         else:
             problemas.append(f"{nome}: " + ("quantidade NF {:g} x pedido {:g}".format(float(it["qtd_nf"] or 0), float(x.get("qtd") or 0)) if not q_ok
-                                            else "preço NF R$ {:.2f} x pedido R$ {:.2f}".format(float(it.get("valor_unit") or 0), float(x.get("valor") or 0))))
+                                            else "preço NF {} x pedido {}".format(_brl(it.get("valor_unit"), 4), _brl(x.get("valor"), 4))))
     for k in livres:
         x = pc["itens"][k]
         problemas.append(f"pedido tem {(x.get('descricao') or x.get('sku') or '')[:38]} ({float(x.get('qtd') or 0):g}) que não veio")
     tot_nf = round(sum(float(it["qtd_nf"] or 0) * float(it.get("valor_unit") or 0) for it in itens_nf), 2)
     tot_pc = round(sum(float(x.get("qtd") or 0) * float(x.get("valor") or 0) for x in pc["itens"]), 2)
     if abs(tot_nf - tot_pc) > 0.05:
-        problemas.append(f"total NF R$ {tot_nf:,.2f} x pedido R$ {tot_pc:,.2f}")
+        problemas.append(f"total NF {_brl(tot_nf)} x pedido {_brl(tot_pc)}")
     ambiguo = any(m == "valores_ambiguo" for _, m in pares.values())
     exato = not problemas and batem == len(itens_nf) and len(itens_nf) > 0
     return {"pares": pares, "batem": batem, "exato": exato, "ambiguo": ambiguo, "problemas": problemas,
@@ -478,7 +525,7 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
                     m.append(f"Item {it['n_item']} ({nome}): QUANTIDADE não bate — NF {it['qtd_nf']:g} x pedido {qpc:g}")
                 vpc, vnf = float(pi.get("valor") or 0), float(it.get("valor_unit") or 0)
                 if abs(vnf - vpc) > PRECO_TOL:
-                    m.append(f"Item {it['n_item']} ({nome}): VALOR não bate — NF R$ {vnf:,.4f} x pedido R$ {vpc:,.4f}")
+                    m.append(f"Item {it['n_item']} ({nome}): VALOR não bate — NF {_brl(vnf, 4)} x pedido {_brl(vpc, 4)}")
     if pc:
         for pi in pc["itens"]:
             if id(pi) not in usados:
@@ -486,7 +533,10 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
         tot_nf = round(sum(it["qtd_nf"] * float(it.get("valor_unit") or 0) for it in d["itens"]), 2)
         tot_pc = round(sum(float(pi.get("qtd") or 0) * float(pi.get("valor") or 0) for pi in pc["itens"]), 2)
         if abs(tot_nf - tot_pc) > 0.05:
-            m.append(f"TOTAL dos produtos não bate — NF R$ {tot_nf:,.2f} x pedido R$ {tot_pc:,.2f}")
+            cmp_ = _comparacao(d) or {}
+            origem = [f"item {x['n_item']}" for x in cmp_.get("linhas", []) if x["situacao"] == "centavos"]
+            m.append(f"TOTAL dos produtos não bate — NF {_brl(tot_nf)} x pedido {_brl(tot_pc)} (diferença {_brl(tot_nf - tot_pc)})"
+                     + (f"; vem dos centavos em: {', '.join(origem)}" if origem else ""))
     if not pc:
         m.append("Nenhum pedido de compra vinculado"
                  + (f" (a nota diz pedido {d['pedido_xml']}, que não está em aberto para esse fornecedor no Bling)" if d.get("pedido_xml") else ""))
