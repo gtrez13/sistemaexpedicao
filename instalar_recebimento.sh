@@ -119,7 +119,9 @@ def _garantir_tabelas():
                 pc_qtd NUMERIC, pc_item TEXT
             )""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_receb_itens_nota ON receb_itens (nota_id)")
-        for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped")):
+        for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped"),
+                        ("receb_notas", "entrada_etapa"), ("receb_notas", "entrada_em"), ("receb_notas", "entrada_por"),
+                        ("receb_notas", "entrada_msg"), ("receb_notas", "entrada_erro"), ("receb_notas", "entrada_resumo")):
             if pg:
                 # só altera se faltar a coluna (ALTER trava a tabela; e um erro engolido aqui estragava a transação inteira)
                 tem = c.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (tb, col)).fetchone()
@@ -130,6 +132,8 @@ def _garantir_tabelas():
                     c.execute(f"ALTER TABLE {tb} ADD COLUMN {col} TEXT")
                 except Exception:
                     pass
+        c.execute(f"""CREATE TABLE IF NOT EXISTS receb_entrada_log (id {pk}, nota_id BIGINT NOT NULL, acao TEXT, ok INTEGER, http INTEGER,
+                      mensagem TEXT, resposta TEXT, enviado TEXT, por TEXT, em BIGINT)""")
         c.execute("CREATE TABLE IF NOT EXISTS receb_pc_cache (cnpj TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
@@ -925,7 +929,8 @@ def fechar(nid):
             return jsonify({"success": True, "status": "recusada", "motivos": motivos})
         c.execute("UPDATE receb_notas SET status='conferida', motivos=NULL, conferido_por=?, conferido_em=?, atualizado_em=? WHERE id=?",
                   (_quem(), agora, agora, nid))
-    return jsonify({"success": True, "status": "conferida", "motivos": []})
+    entrada = ENTRADA_AUTO() and _disparar_entrada(nid, _quem())
+    return jsonify({"success": True, "status": "conferida", "motivos": [], "entrada_auto": bool(entrada)})
 
 
 @recebimento_routes.post("/recebimento/notas/<int:nid>/resolver")
@@ -988,6 +993,500 @@ def produtos():
             except Exception:
                 pass
     return jsonify({"produtos": out[:15]})
+
+
+# ═════════════════════════ ENTRADA NO BLING (depois de CONFERIDA) ═════════════════════════
+# Decisão do Biel (12/11): o WMS lança tudo pela API: pedido de compra -> Atendido, estoque no Local, lotes
+# (só produto com controle de lote ligado) e contas a pagar das duplicatas do XML. O XML entra no Bling depois
+# só como registro fiscal (importar SEM lançar estoque/contas). A API do Bling não importa XML de entrada.
+# Roda em segundo plano, passo a passo; cada passo fica gravado (entrada_resumo) e no histórico (receb_entrada_log),
+# então se parar no meio, rodar de novo continua de onde parou e nunca lança 2 vezes.
+ENTRADA_AUTO = lambda: os.environ.get("RECEB_ENTRADA_AUTO", "0") == "1"     # 1 = já dispara ao conferir
+DEP_LOCAL_ID = int(os.environ.get("BLING_DEPOSITO_LOCAL_ID", "10488672491"))
+ETAPAS_ENT = {"preparando": "Conferindo pedido, produtos e lotes no Bling", "pedido": "Mudando o pedido de compra para Atendido",
+              "estoque": "Lançando o estoque no Local", "lotes": "Lançando os lotes", "contas": "Lançando as contas a pagar",
+              "ok": "Entrada concluída", "erro": "Parou com erro", "desfazendo": "Desfazendo a entrada"}
+_ent_ativos: set = set()
+_ent_lock = threading.Lock()
+_sit_atendido_cache = {}
+
+
+def _bling_raw(metodo, caminho, payload=None, params=None):
+    """Chamada ao Bling SEM retry automático (não pode lançar 2 vezes). -> (status, texto, json|None)"""
+    import requests
+    b = _bling()
+    if not b:
+        return 0, "Bling indisponível", None
+    _ritmo()
+    try:
+        r = requests.request(metodo, f"{b.base_url}{caminho}", headers=b._headers(), json=payload, params=params, timeout=(10, 60))
+    except Exception as e:
+        return 0, f"sem resposta do Bling: {e}", None
+    try:
+        js = r.json()
+    except Exception:
+        js = None
+    return r.status_code, (r.text or "")[:2000], js
+
+
+def _msg_bl(txt):
+    try:
+        e = json.loads(txt).get("error") or {}
+        partes = [e.get("description") or e.get("message") or ""]
+        for f in e.get("fields") or []:
+            partes.append(f"{f.get('element') or ''}: {f.get('msg') or ''}".strip(": "))
+        return " | ".join(p for p in partes if p)[:500]
+    except Exception:
+        return str(txt or "")[:500]
+
+
+def _ent_log(nid, acao, ok, http=None, mensagem="", resposta="", enviado=None, por=None):
+    try:
+        with db_session() as c:
+            c.execute("INSERT INTO receb_entrada_log (nota_id, acao, ok, http, mensagem, resposta, enviado, por, em) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (nid, acao, 1 if ok else 0, http, str(mensagem or "")[:1000], str(resposta or "")[:4000],
+                       json.dumps(enviado, ensure_ascii=False)[:6000] if enviado is not None else None, por, _agora()))
+    except Exception as e:
+        print(f"[ENTRADA] log falhou ({nid}): {e}", flush=True)
+
+
+def _ent_estado(nid, etapa, **campos):
+    sets, vals = ["entrada_etapa=?", "entrada_em=?"], [etapa, str(_agora())]
+    for k, v in campos.items():
+        sets.append(f"{k}=?")
+        vals.append(v if not isinstance(v, (dict, list)) else json.dumps(v, ensure_ascii=False))
+    with db_session() as c:
+        c.execute(f"UPDATE receb_notas SET {', '.join(sets)} WHERE id=?", (*vals, nid))
+
+
+def _ent_resumo(r):
+    try:
+        return json.loads(r["entrada_resumo"] or "{}")
+    except Exception:
+        return {}
+
+
+def _ent_rodando(r):
+    try:
+        return r["entrada_etapa"] in ("preparando", "pedido", "estoque", "lotes", "contas", "desfazendo") and \
+            _agora() - int(float(r["entrada_em"] or 0)) < 300
+    except Exception:
+        return False
+
+
+def _situacao_pc(nome_alvo="atendido"):
+    """id da situação (da conta) do módulo de pedidos de compra. Ex.: 'atendido'. Env BLING_SITUACAO_PC_ATENDIDO_ID manda."""
+    if nome_alvo == "atendido" and os.environ.get("BLING_SITUACAO_PC_ATENDIDO_ID"):
+        return int(os.environ["BLING_SITUACAO_PC_ATENDIDO_ID"])
+    if nome_alvo in _sit_atendido_cache:
+        return _sit_atendido_cache[nome_alvo]
+    import unicodedata
+    nz = lambda t: unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower().strip()
+    st, _, js = _bling_raw("GET", "/situacoes/modulos")
+    for m in ((js or {}).get("data") or []):
+        if "compra" in nz(m.get("nome")) or "compra" in nz(m.get("descricao")):
+            st2, _, js2 = _bling_raw("GET", f"/situacoes/modulos/{m['id']}")
+            for s0 in ((js2 or {}).get("data") or []):
+                if nz(s0.get("nome")) == nome_alvo:
+                    _sit_atendido_cache[nome_alvo] = int(s0["id"])
+                    return int(s0["id"])
+    return None
+
+
+def _saldos_local(ids):
+    """{id_produto: saldo físico no depósito Local}"""
+    out = {}
+    ids = [int(i) for i in ids if i]
+    for k in range(0, len(ids), 20):
+        st, txt, js = _bling_raw("GET", "/estoques/saldos", params=[("idsProdutos[]", i) for i in ids[k:k + 20]])
+        for d in ((js or {}).get("data") or []):
+            pid = int((d.get("produto") or {}).get("id") or 0)
+            for dep in d.get("depositos") or []:
+                if int(dep.get("id") or 0) == DEP_LOCAL_ID:
+                    out[pid] = float(dep.get("saldoFisico") or 0)
+            out.setdefault(pid, 0.0)
+    return out
+
+
+def _dups_xml(xml):
+    out = []
+    for d in re.findall(r"<dup>(.*?)</dup>", xml or "", re.S):
+        g = lambda t: (re.search(rf"<{t}>(.*?)</{t}>", d) or [None, ""])[1]
+        try:
+            out.append({"numero": g("nDup"), "vencimento": g("dVenc"), "valor": round(float(g("vDup") or 0), 2)})
+        except ValueError:
+            pass
+    return out
+
+
+def _forma_pagamento(id_fornecedor):
+    """Forma de pagamento das contas: env RECEB_FORMA_PAGAMENTO_ID; senão a mais usada nas contas a pagar desse fornecedor."""
+    if os.environ.get("RECEB_FORMA_PAGAMENTO_ID"):
+        return int(os.environ["RECEB_FORMA_PAGAMENTO_ID"]), "configurada no WMS"
+    cont = {}
+    for pag in (1, 2, 3):
+        st, _, js = _bling_raw("GET", "/contas/pagar", params={"pagina": pag, "limite": 100})
+        lst = (js or {}).get("data") or []
+        for x in lst:
+            if str((x.get("contato") or {}).get("id")) == str(id_fornecedor) and (x.get("formaPagamento") or {}).get("id"):
+                f = int(x["formaPagamento"]["id"])
+                cont[f] = cont.get(f, 0) + 1
+        if len(lst) < 100:
+            break
+    if cont:
+        return max(cont, key=cont.get), "a mesma das últimas contas desse fornecedor"
+    return None, None
+
+
+def plano_entrada(nid, resumo=None):
+    """Monta TUDO sem gravar nada. -> dict com pontos (ok/erro/aviso), bloqueio e o que vai ser feito."""
+    pontos = []
+    plano = {"pontos": pontos, "bloqueio": None, "itens": [], "contas": [], "pc": None}
+
+    def ponto(ok, item, det=""):
+        pontos.append({"ok": ok, "item": item, "detalhe": det})
+        if ok is False and not plano["bloqueio"]:
+            plano["bloqueio"] = f"{item}: {det}"
+
+    with db_session() as c:
+        r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        if not r:
+            ponto(False, "Nota", "não encontrada")
+            return plano
+        itens = [dict(x) for x in c.execute("SELECT * FROM receb_itens WHERE nota_id=? ORDER BY n_item", (nid,)).fetchall()]
+    plano["nota"] = {"numero": r["numero"], "serie": r["serie"], "fornecedor": r["fornecedor_nome"]}
+    ponto(r["status"] == "conferida", "Conferência", "nota conferida" if r["status"] == "conferida" else f"a nota está '{r['status']}': confira antes")
+    if not r["pedido_compra_id"]:
+        ponto(False, "Pedido de compra", "nenhum pedido vinculado")
+        return plano
+    st, txt, js = _bling_raw("GET", f"/pedidos/compras/{r['pedido_compra_id']}")
+    pc = (js or {}).get("data") or {}
+    if st != 200 or not pc:
+        ponto(False, "Pedido de compra", f"não consegui ler o pedido {r['pedido_compra_numero']} no Bling ({_msg_bl(txt) or st})")
+        return plano
+    sit = int((pc.get("situacao") or {}).get("valor") or 0)
+    plano["pc"] = {"id": pc["id"], "numero": pc.get("numero"), "situacao_id": (pc.get("situacao") or {}).get("id"), "situacao_valor": sit,
+                   "fornecedor_id": (pc.get("fornecedor") or {}).get("id"), "categoria_id": (pc.get("categoria") or {}).get("id")}
+    nome_sit = {0: "Em aberto", 1: "Atendido", 2: "Cancelado", 3: "Em andamento"}.get(sit, str(sit))
+    if sit == 2:
+        ponto(False, "Pedido de compra", f"o pedido {pc.get('numero')} está CANCELADO no Bling")
+    elif sit == 1 and (resumo or {}).get("pedido"):
+        ponto(True, "Pedido de compra", f"pedido {pc.get('numero')} já Atendido (feito pelo WMS nesta entrada)")
+    elif sit == 1:
+        ponto(False, "Pedido de compra", f"o pedido {pc.get('numero')} já está Atendido no Bling: o estoque pode já ter entrado. "
+                                         "Confira; se não entrou, volte o pedido para Em andamento e rode de novo")
+    else:
+        sid = _situacao_pc("atendido")
+        plano["pc"]["atendido_id"] = sid
+        ponto(True if sid else False, "Pedido de compra", f"pedido {pc.get('numero')} ({nome_sit}) vai para Atendido" if sid
+              else "não achei a situação 'Atendido' dos pedidos de compra no Bling")
+
+    # itens: produto do Bling pelo item do pedido (SKU / código do fornecedor)
+    pc_itens = [{"sku": (i.get("produto") or {}).get("codigo"), "cprod": i.get("codigoFornecedor"), "pid": (i.get("produto") or {}).get("id"),
+                 "valor": i.get("valor"), "qtd": i.get("quantidade")} for i in pc.get("itens") or []]
+    ids = []
+    for it in itens:
+        x = _item_pc({"itens": pc_itens}, it) if it.get("sku") or it.get("cprod") else None
+        pid = (x or {}).get("pid")
+        q = float(it["qtd_conferida"] or 0)
+        plano["itens"].append({"item_id": it["id"], "n_item": it["n_item"], "sku": it["sku"], "descricao": it["descricao"], "pid": pid,
+                               "qtd": q, "custo": float(it.get("valor_unit") or 0), "lote": (it.get("lote") or "").strip(),
+                               "validade": (it.get("validade") or "").strip(), "controla_lote": False})
+        if not pid:
+            ponto(False, f"Item {it['n_item']}", f"{(it['descricao'] or '')[:40]}: não achei o produto no pedido (SKU {it['sku'] or '-'})")
+        else:
+            ids.append(pid)
+    if ids:
+        st, txt, js = _bling_raw("GET", "/produtos/lotes/controla-lote", params=[("idsProdutos[]", i) for i in ids])
+        ctl = {int(x.get("idProduto")): bool(x.get("controlaLote")) for x in ((js or {}).get("data") or [])}
+        for p in plano["itens"]:
+            if p["pid"]:
+                p["controla_lote"] = ctl.get(int(p["pid"]), False)
+                if p["controla_lote"] and not (p["lote"] and p["validade"]):
+                    ponto(False, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: o Bling controla lote desse produto e falta lote/validade")
+    n_lote = sum(1 for p in plano["itens"] if p["controla_lote"])
+    ponto(True, "Estoque", f"{sum(p['qtd'] for p in plano['itens']):g} unidades em {len(plano['itens'])} produtos no depósito Local"
+          + (f" · {n_lote} com lote" if n_lote else ""))
+
+    # contas a pagar = duplicatas do XML
+    dups = _dups_xml(r["xml"])
+    forn = plano["pc"]["fornecedor_id"]
+    if not dups:
+        ponto(None, "Contas a pagar", "o XML não tem duplicatas: nenhuma conta será lançada")
+    else:
+        fp, origem_fp = _forma_pagamento(forn)
+        if not fp:
+            ponto(False, "Contas a pagar", "não sei a forma de pagamento: configure RECEB_FORMA_PAGAMENTO_ID")
+        tot = round(sum(d["valor"] for d in dups), 2)
+        for k, d in enumerate(dups):
+            plano["contas"].append({"numero": d["numero"], "vencimento": d["vencimento"], "valor": d["valor"],
+                                    "payload": {k2: v2 for k2, v2 in {"vencimento": d["vencimento"], "valor": d["valor"], "contato": {"id": forn},
+                                                "formaPagamento": {"id": fp}, "dataEmissao": str(r["emissao"] or "")[:10] or None,
+                                                "numeroDocumento": f"{r['numero']}/{d['numero'] or k + 1}",
+                                                "historico": f"NF {r['numero']} - {str(r['fornecedor_nome'] or '')[:40]} - parcela {k + 1}/{len(dups)} (pedido {pc.get('numero')}, WMS)",
+                                                **({"categoria": {"id": plano['pc']['categoria_id']}} if plano['pc']['categoria_id'] else {})}.items() if v2 is not None}})
+        if fp:
+            ponto(True, "Contas a pagar", f"{len(dups)} parcela(s), total {_brl(tot)} · forma de pagamento {fp} ({origem_fp})")
+    return plano
+
+
+def _job_entrada(nid, quem):
+    """Executa a entrada. Passos já feitos (entrada_resumo) são pulados: rodar de novo continua de onde parou."""
+    try:
+        _ent_estado(nid, "preparando", entrada_erro=None, entrada_por=quem)
+        with db_session() as c:
+            r0 = c.execute("SELECT entrada_resumo FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        p = plano_entrada(nid, _ent_resumo(r0) if r0 else None)
+        if p["bloqueio"]:
+            _ent_log(nid, "conferir", False, None, p["bloqueio"], por=quem)
+            _ent_estado(nid, "erro", entrada_erro=json.dumps({"origem": "conferencia", "error": p["bloqueio"], "pontos": p["pontos"]}, ensure_ascii=False),
+                        entrada_msg=p["bloqueio"][:500])
+            return
+        with db_session() as c:
+            r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        res = _ent_resumo(r)
+        salvar = lambda: _ent_estado(nid, res.get("_etapa", "preparando"), entrada_resumo=res)
+        pc = p["pc"]
+        ids = [int(x["pid"]) for x in p["itens"] if x["pid"]]
+
+        # 1) pedido -> Atendido (medindo o estoque antes/depois: o Bling pode lançar sozinho ao atender)
+        if not res.get("pedido"):
+            res["_etapa"] = "pedido"; _ent_estado(nid, "pedido")
+            antes = _saldos_local(ids)
+            if pc["situacao_valor"] != 1:
+                st, txt, _ = _bling_raw("PATCH", f"/pedidos/compras/{pc['id']}/situacoes/{pc['atendido_id']}")
+                ok = st in (200, 204)
+                _ent_log(nid, f"pedido {pc['numero']} -> Atendido", ok, st, "situação alterada" if ok else _msg_bl(txt), txt, por=quem)
+                if not ok:
+                    raise RuntimeError(f"BLING|O Bling recusou mudar o pedido para Atendido: {_msg_bl(txt) or st}")
+            depois = _saldos_local(ids)
+            res["pedido"] = {"anterior_id": pc["situacao_id"], "antes": {str(k): v for k, v in antes.items()},
+                             "depois": {str(k): v for k, v in depois.items()}, "mudou": pc["situacao_valor"] != 1}
+            salvar()
+
+        # 2) estoque: o que o Bling não lançou sozinho, o WMS lança (entrada no Local, custo da NF)
+        est = res.setdefault("estoque", {})
+        res["_etapa"] = "estoque"; _ent_estado(nid, "estoque")
+        for x in p["itens"]:
+            chave = str(x["item_id"])
+            if chave in est or not x["pid"] or x["qtd"] <= 0:
+                continue
+            a = float(res["pedido"]["antes"].get(str(x["pid"]), 0)); d = float(res["pedido"]["depois"].get(str(x["pid"]), 0))
+            # produto repetido em 2 itens: a medição é do produto inteiro
+            qtd_prod = sum(y["qtd"] for y in p["itens"] if y["pid"] == x["pid"])
+            if abs((d - a) - qtd_prod) < 0.001:
+                est[chave] = {"via": "bling", "qtd": x["qtd"]}
+                _ent_log(nid, f"estoque item {x['n_item']}", True, None, f"o Bling já lançou {x['qtd']:g} ao atender o pedido", por=quem)
+            elif abs(d - a) < 0.001:
+                corpo = {"produto": {"id": int(x["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "operacao": "E", "quantidade": x["qtd"],
+                         "preco": x["custo"], "custo": x["custo"], "observacoes": f"Entrada NF {r['numero']} (pedido {pc['numero']}) conferida no WMS"}
+                st, txt, js = _bling_raw("POST", "/estoques", corpo)
+                ok = st in (200, 201)
+                _ent_log(nid, f"estoque item {x['n_item']}", ok, st, f"+{x['qtd']:g} no Local" if ok else _msg_bl(txt), txt, corpo, por=quem)
+                if not ok:
+                    salvar()
+                    raise RuntimeError(f"BLING|O Bling recusou lançar o estoque do item {x['n_item']}: {_msg_bl(txt) or st}")
+                est[chave] = {"via": "wms", "qtd": x["qtd"], "id": ((js or {}).get("data") or {}).get("id"), "pid": x["pid"]}
+            else:
+                salvar()
+                raise RuntimeError(f"CONF|Estoque do item {x['n_item']} mudou {d - a:+g} ao atender o pedido (esperado {qtd_prod:g} ou 0). "
+                                   "Pode ter havido venda ao mesmo tempo: confira o estoque desse produto no Bling antes de continuar.")
+            salvar()
+
+        # 3) lotes (só produto com controle de lote ligado; não liga controle de ninguém)
+        lts = res.setdefault("lotes", {})
+        res["_etapa"] = "lotes"; _ent_estado(nid, "lotes")
+        for x in p["itens"]:
+            chave = str(x["item_id"])
+            if chave in lts or not x["controla_lote"]:
+                continue
+            st, txt, js = _bling_raw("GET", "/produtos/lotes", params={"idsProdutos[]": x["pid"]})
+            exist = {str(l.get("codigoLote")): l.get("idLote") for l in ((js or {}).get("data") or [])}
+            idl = exist.get(x["lote"])
+            if not idl:
+                corpo = [{"produto": {"id": int(x["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "codigoLote": x["lote"], "dataValidade": x["validade"]}]
+                st, txt, js = _bling_raw("PUT", "/produtos/lotes", corpo)
+                try:
+                    idl = js["data"]["saved"][0]["id"]
+                except Exception:
+                    idl = None
+                _ent_log(nid, f"lote {x['lote']} (item {x['n_item']})", bool(idl), st, "lote criado" if idl else _msg_bl(txt), txt, corpo, por=quem)
+                if not idl:
+                    salvar()
+                    raise RuntimeError(f"BLING|O Bling recusou criar o lote {x['lote']} do item {x['n_item']}: {_msg_bl(txt) or st}")
+            corpo = {"quantidade": x["qtd"], "tipoLancamento": 1, "observacao": f"Entrada NF {r['numero']} (WMS)"}
+            st, txt, js = _bling_raw("POST", f"/produtos/lotes/{idl}/lancamentos", corpo)
+            ok = st in (200, 201, 204)
+            _ent_log(nid, f"lote {x['lote']} +{x['qtd']:g} (item {x['n_item']})", ok, st, "quantidade lançada no lote" if ok else _msg_bl(txt), txt, corpo, por=quem)
+            if not ok:
+                salvar()
+                raise RuntimeError(f"BLING|O Bling recusou lançar a quantidade no lote {x['lote']}: {_msg_bl(txt) or st}")
+            lts[chave] = {"id_lote": idl, "qtd": x["qtd"], "lote": x["lote"]}
+            salvar()
+
+        # 4) contas a pagar (uma por duplicata)
+        cts = res.setdefault("contas", {})
+        res["_etapa"] = "contas"; _ent_estado(nid, "contas")
+        for k, ct in enumerate(p["contas"]):
+            chave = str(ct["numero"] or k + 1)
+            if chave in cts:
+                continue
+            st, txt, js = _bling_raw("POST", "/contas/pagar", ct["payload"])
+            idc = ((js or {}).get("data") or {}).get("id")
+            ok = st in (200, 201) and idc
+            _ent_log(nid, f"conta a pagar {chave} ({_brl(ct['valor'])}, vence {ct['vencimento']})", bool(ok), st,
+                     "conta lançada" if ok else _msg_bl(txt), txt, ct["payload"], por=quem)
+            if not ok:
+                salvar()
+                raise RuntimeError(f"BLING|O Bling recusou a conta a pagar {chave}: {_msg_bl(txt) or st}")
+            cts[chave] = {"id": idc, "valor": ct["valor"], "vencimento": ct["vencimento"]}
+            salvar()
+
+        res["_etapa"] = "ok"
+        n_est = sum(1 for v in est.values() if v.get("via") == "wms")
+        msg = (f"Entrada lançada no Bling: pedido {pc['numero']} Atendido · estoque de {len(est)} item(ns) "
+               f"({n_est} pelo WMS, {len(est) - n_est} pelo Bling) · {len(lts)} lote(s) · {len(cts)} conta(s) a pagar. "
+               "Falta só importar o XML no Bling como registro fiscal, SEM lançar estoque nem contas.")
+        _ent_estado(nid, "ok", entrada_resumo=res, entrada_msg=msg[:500], entrada_erro=None)
+        with db_session() as c:
+            c.execute("UPDATE receb_notas SET status='lancada', atualizado_em=? WHERE id=?", (_agora(), nid))
+        _ent_log(nid, "concluído", True, None, msg, por=quem)
+    except Exception as e:
+        import traceback
+        t = str(e)
+        if t.startswith("BLING|") or t.startswith("CONF|"):
+            org, msg = ("bling" if t.startswith("BLING|") else "conferencia"), t.split("|", 1)[1]
+        else:
+            print(f"[ENTRADA] {nid}: {traceback.format_exc()}", flush=True)
+            org, msg = "wms", f"Erro interno do WMS ({type(e).__name__}): {t[:300]}"
+        _ent_log(nid, "parou", False, None, msg, por=quem)
+        _ent_estado(nid, "erro", entrada_erro=json.dumps({"origem": org, "error": msg}, ensure_ascii=False), entrada_msg=msg[:500])
+    finally:
+        with _ent_lock:
+            _ent_ativos.discard(nid)
+
+
+def _disparar_entrada(nid, quem):
+    with _ent_lock:
+        if nid in _ent_ativos:
+            return False
+        _ent_ativos.add(nid)
+    threading.Thread(target=_job_entrada, args=(nid, quem), daemon=True).start()
+    return True
+
+
+@recebimento_routes.get("/recebimento/notas/<int:nid>/entrada")
+@login_required
+def entrada_info(nid):
+    garantir_tabelas()
+    with db_session() as c:
+        r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        if not r:
+            return jsonify({"error": "Nota não encontrada."}), 404
+        log = [dict(x) for x in c.execute("SELECT id, acao, ok, http, mensagem, resposta, enviado, por, em FROM receb_entrada_log "
+                                          "WHERE nota_id=? ORDER BY id DESC LIMIT 60", (nid,)).fetchall()]
+    erro = None
+    try:
+        erro = json.loads(r["entrada_erro"]) if r["entrada_erro"] else None
+    except Exception:
+        pass
+    out = {"etapa": r["entrada_etapa"], "etapa_txt": ETAPAS_ENT.get(r["entrada_etapa"] or "", ""), "rodando": _ent_rodando(r),
+           "msg": r["entrada_msg"], "erro": erro if r["entrada_etapa"] == "erro" else None, "por": r["entrada_por"],
+           "resumo": _ent_resumo(r), "historico": log, "auto": ENTRADA_AUTO(), "status": r["status"]}
+    if request.args.get("previa") and r["entrada_etapa"] not in ("ok",) and not out["rodando"]:
+        try:
+            p = plano_entrada(nid)
+            out["previa"] = {"pontos": p["pontos"], "bloqueio": p["bloqueio"], "contas": [{k: v for k, v in x.items() if k != "payload"} for x in p["contas"]]}
+        except Exception as e:
+            out["previa"] = {"pontos": [], "bloqueio": f"Erro ao montar a prévia: {e}"}
+    return jsonify(out)
+
+
+@recebimento_routes.post("/recebimento/notas/<int:nid>/entrada")
+@login_required
+def entrada_lancar(nid):
+    """Dá entrada no Bling (supervisor/admin). Roda em segundo plano; a tela acompanha por GET .../entrada."""
+    if not eh_gestor():
+        return jsonify({"error": "Só supervisor ou admin dá entrada no Bling.", "origem": "conferencia"}), 403
+    garantir_tabelas()
+    with db_session() as c:
+        r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
+    if not r:
+        return jsonify({"error": "Nota não encontrada."}), 404
+    if r["entrada_etapa"] == "ok":
+        return jsonify({"error": "A entrada dessa nota já foi lançada no Bling.", "origem": "conferencia"}), 409
+    if r["status"] != "conferida":
+        return jsonify({"error": "Só nota CONFERIDA entra no Bling.", "origem": "conferencia"}), 409
+    if not _disparar_entrada(nid, _quem()):
+        return jsonify({"success": True, "andamento": True}), 202
+    return jsonify({"success": True, "andamento": True}), 202
+
+
+@recebimento_routes.post("/recebimento/notas/<int:nid>/entrada/desfazer")
+@login_required
+def entrada_desfazer(nid):
+    """Desfaz o que o WMS lançou (supervisor/admin): apaga as contas, tira do lote, tira o estoque que o WMS pôs e volta o pedido."""
+    if not eh_gestor():
+        return jsonify({"error": "Só supervisor ou admin desfaz a entrada.", "origem": "conferencia"}), 403
+    garantir_tabelas()
+    with db_session() as c:
+        r = c.execute("SELECT * FROM receb_notas WHERE id=?", (nid,)).fetchone()
+    if not r:
+        return jsonify({"error": "Nota não encontrada."}), 404
+    if _ent_rodando(r):
+        return jsonify({"error": "A entrada ainda está rodando. Espere terminar.", "origem": "conferencia"}), 409
+    res, quem, falhas = _ent_resumo(r), _quem(), []
+    _ent_estado(nid, "desfazendo")
+    for k, ct in list((res.get("contas") or {}).items()):
+        st, txt, _ = _bling_raw("DELETE", f"/contas/pagar/{ct['id']}")
+        ok = st in (200, 204)
+        _ent_log(nid, f"desfazer conta {k}", ok, st, "conta apagada" if ok else _msg_bl(txt), txt, por=quem)
+        if ok:
+            res["contas"].pop(k)
+        else:
+            falhas.append(f"conta {k}: {_msg_bl(txt) or st}")
+    for k, lt in list((res.get("lotes") or {}).items()):
+        corpo = {"quantidade": lt["qtd"], "tipoLancamento": 2, "observacao": f"Desfeito entrada NF {r['numero']} (WMS)"}
+        st, txt, _ = _bling_raw("POST", f"/produtos/lotes/{lt['id_lote']}/lancamentos", corpo)
+        ok = st in (200, 201, 204)
+        _ent_log(nid, f"desfazer lote {lt['lote']}", ok, st, "tirado do lote" if ok else _msg_bl(txt), txt, corpo, por=quem)
+        if ok:
+            res["lotes"].pop(k)
+        else:
+            falhas.append(f"lote {lt['lote']}: {_msg_bl(txt) or st}")
+    for k, e in list((res.get("estoque") or {}).items()):
+        if e.get("via") != "wms":
+            continue
+        corpo = {"produto": {"id": int(e["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "operacao": "S", "quantidade": e["qtd"],
+                 "observacoes": f"Desfeito entrada NF {r['numero']} (WMS)"}
+        st, txt, _ = _bling_raw("POST", "/estoques", corpo)
+        ok = st in (200, 201)
+        _ent_log(nid, f"desfazer estoque item {k}", ok, st, f"-{e['qtd']:g} no Local" if ok else _msg_bl(txt), txt, corpo, por=quem)
+        if ok:
+            res["estoque"].pop(k)
+        else:
+            falhas.append(f"estoque item {k}: {_msg_bl(txt) or st}")
+    ped = res.get("pedido") or {}
+    if ped.get("mudou") and ped.get("anterior_id") and r["pedido_compra_id"]:
+        st, txt, _ = _bling_raw("PATCH", f"/pedidos/compras/{r['pedido_compra_id']}/situacoes/{ped['anterior_id']}")
+        ok = st in (200, 204)
+        _ent_log(nid, "desfazer pedido (situação anterior)", ok, st, "pedido voltou à situação anterior" if ok else _msg_bl(txt), txt, por=quem)
+        if ok:
+            res.pop("pedido", None)
+            pendente_bling = [k for k, e in (res.get("estoque") or {}).items() if e.get("via") == "bling"]
+            if pendente_bling:
+                falhas.append("o estoque que o Bling lançou ao atender o pedido: confira se saiu ao voltar a situação (itens "
+                              + ", ".join(pendente_bling) + ")")
+        else:
+            falhas.append(f"pedido: {_msg_bl(txt) or st}")
+    res["_etapa"] = "desfeito" if not falhas else "erro"
+    msg = "Entrada desfeita no Bling." if not falhas else "Desfeito em parte. Falta: " + "; ".join(falhas)
+    _ent_estado(nid, "desfeito" if not falhas else "erro", entrada_resumo=res, entrada_msg=msg[:500],
+                entrada_erro=None if not falhas else json.dumps({"origem": "bling", "error": msg}, ensure_ascii=False))
+    if not falhas:
+        with db_session() as c:
+            c.execute("UPDATE receb_notas SET status='conferida', atualizado_em=? WHERE id=? AND status='lancada'", (_agora(), nid))
+    return jsonify({"success": not falhas, "msg": msg}), (200 if not falhas else 422)
 RECEOF
 cat > receb_email_sync.py <<'RECEOF'
 #!/usr/bin/env python3
