@@ -154,7 +154,8 @@ def parse_nfe(xml_txt: str) -> dict:
             "cprod": g(p, "n:cProd"), "ean": _dig(g(p, "n:cEAN")) if g(p, "n:cEAN").upper() != "SEM GTIN" else "",
             "descricao": g(p, "n:xProd"), "ncm": g(p, "n:NCM"), "unidade": g(p, "n:uCom"),
             "qtd_nf": float(g(p, "n:qCom") or 0), "valor_unit": float(g(p, "n:vUnCom") or 0),
-            "lote_xml": g(ras, "n:nLote"), "validade_xml": g(ras, "n:dVal"),
+            "lote_xml": g(ras, "n:nLote") or lote_da_descricao(g(p, "n:xProd"))[0],
+            "validade_xml": g(ras, "n:dVal") or lote_da_descricao(g(p, "n:xProd"))[1],
             "xped": _dig(g(p, "n:xPed")),
         })
     infcpl = g(inf.find("n:infAdic", NS), "n:infCpl")
@@ -321,6 +322,10 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
     itens = [dict(x) for x in c.execute("SELECT * FROM receb_itens WHERE nota_id=? ORDER BY n_item", (nid,)).fetchall()]
     for it in itens:
         it["qtd_nf"] = float(it["qtd_nf"] or 0); it["qtd_conferida"] = float(it["qtd_conferida"] or 0)
+        if not it.get("lote_xml"):
+            lt, vl = lote_da_descricao(it.get("descricao"))
+            if lt:
+                it["lote_xml"], it["validade_xml"], it["lote_origem"] = lt, it.get("validade_xml") or vl, "descricao"
         it["pc_qtd"] = float(it["pc_qtd"]) if it["pc_qtd"] is not None else None
     d["itens"] = itens
     d["motivos"] = [m for m in (r["motivos"] or "").split("\n") if m]
@@ -391,6 +396,23 @@ def _comparacao(d: dict) -> dict | None:
     tot_pc = round(sum(x["tot_pc"] for x in linhas), 2)
     return {"pedido": pc.get("numero"), "linhas": linhas, "tot_nf": tot_nf, "tot_pc": tot_pc, "dif": round(tot_nf - tot_pc, 2),
             "tol_total": 0.05, "tol_unit": PRECO_TOL}
+
+
+_RX_LOTE = re.compile(r"\b(?:LT|LOTE|LOT)\s*[:.]?\s*([A-Z0-9][A-Z0-9/\-.]{2,24})", re.I)
+_RX_VAL = re.compile(r"\b(?:VAL|VALIDADE|VENC|VCTO)\s*[:.]?\s*(\d{2})[/.-](\d{2})[/.-](\d{2,4})", re.I)
+
+
+def lote_da_descricao(desc):
+    """Fornecedor sem <rastro> que escreve 'LT: 20240410 - VAL: 01/01/2040' na descrição -> (lote, 'AAAA-MM-DD')."""
+    t = str(desc or "")
+    m, v = _RX_LOTE.search(t), _RX_VAL.search(t)
+    lote = m.group(1).strip(" -.") if m else ""
+    val = ""
+    if v:
+        d, mth, a = v.groups()
+        a = ("20" + a) if len(a) == 2 else a
+        val = f"{a}-{mth}-{d}"
+    return lote, val
 
 
 def _item_pc(pc, it):
