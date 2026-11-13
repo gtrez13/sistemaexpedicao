@@ -1291,6 +1291,248 @@ def saida_fechados_hoje():
     return jsonify({"hoje": _hoje(), "fechados": {r["carro"]: int(r["em"]) for r in rows}})
 
 
+# ───────────────────────── Separação: só o que sai HOJE ─────────────────────────
+# Mercado Livre: pedido PENDENTE e sem nenhum bip cujo dia de saída (o mesmo que a Saída usa: limite de despacho do ML)
+#   é DEPOIS de hoje sai da Separação (status OUTRO_DIA) e volta sozinho no dia dele.
+# Comercial: só fica na Separação o que está "Em andamento" no Bling. PENDENTE sem bip em outra situação (Atendido,
+#   Faltando produtos, Cancelado...) sai (status FORA_BLING) e volta sozinho se voltar para Em andamento.
+# O status de antes fica guardado em sep_fora: separacao_so_hoje.py --devolver põe tudo de volta.
+SO_HOJE_ML = "OUTRO_DIA"
+SO_HOJE_COM = "FORA_BLING"
+SIT_EM_ANDAMENTO = 15
+SO_HOJE_INTERVALO_S = 300               # sem "forcar": no máximo 1 rodada a cada 5 min
+_sohoje = {"rodando": False, "ts": 0.0, "res": None, "erro": None}
+_sohoje_lock = threading.Lock()
+_sit_nomes = {6: "Em aberto", 9: "Atendido", 12: "Cancelado", 15: "Em andamento"}
+
+
+def _sep_fora_tabela(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS sep_fora (ml_id TEXT PRIMARY KEY, tipo TEXT NOT NULL, status_antes TEXT NOT NULL, "
+                 "motivo TEXT, dia TEXT, em BIGINT)")
+
+
+def _br(dia):
+    return "/".join(reversed(str(dia or "").split("-"))) if dia else ""
+
+
+def _pv_id(p):
+    v = str(p.get("bling_pedido_venda_id") or "").strip()
+    if not v.isdigit():
+        v = re.sub(r"\D", "", str(p.get("ml_id") or ""))
+    return v or None
+
+
+def _nome_sit(b, sid):
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return "situação desconhecida"
+    if sid not in _sit_nomes:
+        try:
+            d = b._get_json(f"/situacoes/{sid}", timeout=(10, 30)) or {}
+            _sit_nomes[sid] = ((d.get("data") or {}).get("nome") or f"situação {sid}").strip()
+        except Exception:
+            return f"situação {sid}"
+    return _sit_nomes[sid]
+
+
+def _esconder(conn, p, novo, motivo, dia):
+    """PENDENTE sem bip -> novo status (só se continua PENDENTE e sem bip na hora de gravar)."""
+    conn.execute("UPDATE pedidos SET status=? WHERE id=? AND status='PENDENTE' AND NOT EXISTS "
+                 "(SELECT 1 FROM pedido_produtos pp WHERE pp.pedido_id=? AND pp.quantidade_bipada > 0)", (novo, p["id"], p["id"]))
+    r = conn.execute("SELECT status FROM pedidos WHERE id=?", (p["id"],)).fetchone()
+    if not r or r["status"] != novo:
+        return False
+    conn.execute("DELETE FROM sep_fora WHERE ml_id=?", (p["ml_id"],))
+    conn.execute("INSERT INTO sep_fora (ml_id, tipo, status_antes, motivo, dia, em) VALUES (?,?,?,?,?,?)",
+                 (p["ml_id"], "COMERCIAL" if novo == SO_HOJE_COM else "ML", "PENDENTE", motivo[:200], dia, int(time.time())))
+    return True
+
+
+def _devolver(conn, f, oculto):
+    conn.execute("UPDATE pedidos SET status=? WHERE ml_id=? AND status=?", (f["status_antes"] or "PENDENTE", f["ml_id"], oculto))
+    conn.execute("DELETE FROM sep_fora WHERE ml_id=?", (f["ml_id"],))
+
+
+def _so_hoje_rodar(aplicar=True, log=None):
+    """Uma rodada. aplicar=False: só diz o que faria (nada muda). -> resumo."""
+    log = log or (lambda m: _slowlog.warning("[so-hoje] %s", m))
+    hoje = _hoje()
+    res = {"hoje": hoje, "aplicado": bool(aplicar),
+           "ml": {"ok": False, "conferidos": 0, "saiu": [], "voltou": [], "erro": None},
+           "comercial": {"ok": False, "conferidos": 0, "saiu": [], "voltou": [], "erro": None}}
+    with db_session() as conn:
+        _sep_fora_tabela(conn)
+        fora = [dict(r) for r in conn.execute(
+            "SELECT f.*, p.status AS st_agora, p.cliente_nome FROM sep_fora f LEFT JOIN pedidos p ON p.ml_id = f.ml_id").fetchall()]
+        pend = [dict(r) for r in conn.execute(
+            "SELECT p.*, COALESCE((SELECT SUM(pp.quantidade_bipada) FROM pedido_produtos pp WHERE pp.pedido_id = p.id), 0) AS _bip "
+            "FROM pedidos p WHERE p.status='PENDENTE'").fetchall()]
+        # sep_fora de pedido que mudou por outro caminho (sync, limpeza, alguém mexeu): esquece
+        for f in fora:
+            oculto = SO_HOJE_COM if f["tipo"] == "COMERCIAL" else SO_HOJE_ML
+            if f.get("st_agora") != oculto and aplicar:
+                conn.execute("DELETE FROM sep_fora WHERE ml_id=?", (f["ml_id"],))
+    fora = [f for f in fora if f.get("st_agora") == (SO_HOJE_COM if f["tipo"] == "COMERCIAL" else SO_HOJE_ML)]
+    origem = lambda p: str(p.get("origem") or "ML").upper()
+
+    # ── Mercado Livre ──
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from services.ml_service import MercadoLivreService
+        ml = MercadoLivreService()
+        cands = [p for p in pend if origem(p) == "ML" and p.get("ml_shipping_id") and not int(p.get("_bip") or 0)]
+        voltar = [f for f in fora if f["tipo"] == "ML" and (f.get("dia") or "") <= hoje]
+        sids = [str(p["ml_shipping_id"]) for p in cands]
+        if sids:
+            _status_envio_ml(ml, sids[0])           # 1º sozinho: se o token venceu, renova uma vez só
+            with ThreadPoolExecutor(6) as ex:
+                envio = dict(zip(sids, ex.map(lambda s: _status_envio_ml(ml, s), sids)))
+        else:
+            envio = {}
+        res["ml"]["conferidos"] = len(cands)
+        if voltar:
+            with db_session() as conn:
+                sid_de = {f["ml_id"]: (conn.execute("SELECT ml_shipping_id FROM pedidos WHERE ml_id=?", (f["ml_id"],)).fetchone() or {})
+                          for f in voltar}
+            lim_de = {}
+            for f in voltar:                        # chegou o dia: volta (se o ML não empurrou para depois)
+                s = sid_de.get(f["ml_id"])
+                s = s["ml_shipping_id"] if s else None
+                lim_de[f["ml_id"]] = _status_envio_ml(ml, s)[2] if s else None
+        with db_session() as conn:
+            for f in voltar:
+                lim = lim_de.get(f["ml_id"])
+                if lim and lim > hoje:
+                    if aplicar:
+                        conn.execute("UPDATE sep_fora SET dia=?, motivo=? WHERE ml_id=?", (lim, f"sai em {_br(lim)} (o ML mudou o dia)", f["ml_id"]))
+                    continue
+                if aplicar:
+                    _devolver(conn, f, SO_HOJE_ML)
+                res["ml"]["voltou"].append({"ml_id": f["ml_id"], "cliente": f.get("cliente_nome"), "dia": f.get("dia")})
+            for p in cands:
+                st, sub, lim = envio.get(str(p["ml_shipping_id"])) or (None, None, None)
+                if not (lim and lim > hoje) or st in ("cancelled", "shipped", "delivered", "not_delivered"):
+                    continue                        # sai hoje, atrasado, ML não disse o dia ou já não é envio: fica
+                motivo = f"sai em {_br(lim)} (dia de saída do Mercado Livre)"
+                if not aplicar or _esconder(conn, p, SO_HOJE_ML, motivo, lim):
+                    res["ml"]["saiu"].append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "dia": lim, "motivo": motivo})
+        res["ml"]["ok"] = True
+    except Exception as e:
+        res["ml"]["erro"] = str(e)[:200]
+        log(f"ML falhou: {e}")
+
+    # ── Comercial (Bling) ──
+    try:
+        b = _bling_svc()
+        if not b:
+            raise RuntimeError("sem cliente Bling")
+        ids15, completo = set(), False
+        for pag in range(1, 21):
+            d = b._get_json("/pedidos/vendas", params={"idsSituacoes[]": SIT_EM_ANDAMENTO, "pagina": pag, "limite": 100}, timeout=(10, 40)) or {}
+            itens = d.get("data") or []
+            for it in itens:
+                if str((it.get("situacao") or {}).get("id")) == str(SIT_EM_ANDAMENTO) and it.get("id"):
+                    ids15.add(str(it["id"]))
+            if len(itens) < 100:
+                completo = True
+                break
+            time.sleep(0.4)
+        if not completo:
+            raise RuntimeError("lista de Em andamento do Bling grande demais")
+        cands = [p for p in pend if origem(p) == "COMERCIAL" and not int(p.get("_bip") or 0) and _pv_id(p)]
+        res["comercial"]["conferidos"] = len(cands)
+        res["comercial"]["em_andamento_bling"] = len(ids15)
+        with db_session() as conn:
+            for f in [f for f in fora if f["tipo"] == "COMERCIAL"]:
+                if re.sub(r"\D", "", f["ml_id"]) in ids15 or f["ml_id"] in ids15:
+                    if aplicar:
+                        _devolver(conn, f, SO_HOJE_COM)
+                    res["comercial"]["voltou"].append({"ml_id": f["ml_id"], "cliente": f.get("cliente_nome")})
+        for p in cands:
+            pv = _pv_id(p)
+            if pv in ids15:
+                continue
+            time.sleep(0.4)
+            try:                                    # confere um por um antes de tirar
+                d = (b._get_json(f"/pedidos/vendas/{int(pv)}", timeout=(10, 30)) or {}).get("data") or {}
+                sid = (d.get("situacao") or {}).get("id")
+                if not sid or str(sid) == str(SIT_EM_ANDAMENTO):
+                    continue
+                motivo = f"no Bling está {_nome_sit(b, sid)}"
+            except Exception as e:
+                if "404" not in str(e):
+                    continue                        # não deu para conferir: fica
+                motivo = "não existe mais no Bling"
+            with db_session() as conn:
+                if not aplicar or _esconder(conn, p, SO_HOJE_COM, motivo, None):
+                    res["comercial"]["saiu"].append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "motivo": motivo})
+        res["comercial"]["ok"] = True
+    except Exception as e:
+        res["comercial"]["erro"] = str(e)[:200]
+        log(f"Comercial falhou: {e}")
+
+    for k in ("ml", "comercial"):
+        for x in res[k]["saiu"]:
+            log(f"{'tirou' if aplicar else 'tiraria'} {x['ml_id']} ({x.get('cliente')}): {x['motivo']}")
+        for x in res[k]["voltou"]:
+            log(f"{'voltou' if aplicar else 'voltaria'} {x['ml_id']} ({x.get('cliente')})")
+    return res
+
+
+def _sep_fora_lista():
+    with db_session() as conn:
+        _sep_fora_tabela(conn)
+        rows = conn.execute("SELECT f.ml_id, f.tipo, f.motivo, f.dia, p.cliente_nome, p.status FROM sep_fora f "
+                            "JOIN pedidos p ON p.ml_id = f.ml_id WHERE p.status IN (?, ?) ORDER BY f.tipo, f.dia, f.ml_id",
+                            (SO_HOJE_ML, SO_HOJE_COM)).fetchall()
+    return [{"ml_id": r["ml_id"], "tipo": r["tipo"], "cliente": r["cliente_nome"], "motivo": r["motivo"], "dia": r["dia"]} for r in rows]
+
+
+def _sohoje_estado():
+    with _sohoje_lock:
+        e = dict(_sohoje)
+    return {"rodando": e["rodando"], "em": int(e["ts"]) or None, "ultimo": e["res"], "erro": e["erro"], "fora": _sep_fora_lista()}
+
+
+@mapa_routes.get("/separacao/so-hoje")
+@login_required
+def separacao_so_hoje_estado():
+    return jsonify(_sohoje_estado())
+
+
+@mapa_routes.post("/separacao/so-hoje")
+@login_required
+def separacao_so_hoje():
+    """Tira da Separação o que não é de hoje e devolve o que voltou a ser. Roda por trás; espera até 20 s."""
+    forcar = bool((request.get_json(silent=True) or {}).get("forcar"))
+    with _sohoje_lock:
+        rodar = not _sohoje["rodando"] and (forcar or time.time() - _sohoje["ts"] > SO_HOJE_INTERVALO_S)
+        if rodar:
+            _sohoje["rodando"] = True
+
+            def bg():
+                try:
+                    r = _so_hoje_rodar(True)
+                    with _sohoje_lock:
+                        _sohoje.update(res=r, erro=None)
+                except Exception as e:
+                    _slowlog.warning("[so-hoje] falhou: %s", e)
+                    with _sohoje_lock:
+                        _sohoje["erro"] = str(e)[:200]
+                finally:
+                    with _sohoje_lock:
+                        _sohoje.update(rodando=False, ts=time.time())
+            threading.Thread(target=bg, daemon=True).start()
+    fim = time.time() + 20
+    while time.time() < fim:
+        with _sohoje_lock:
+            if not _sohoje["rodando"]:
+                break
+        time.sleep(0.5)
+    return jsonify(_sohoje_estado())
+
+
 @mapa_routes.post("/saida/liberar")
 @login_required
 def saida_liberar():
