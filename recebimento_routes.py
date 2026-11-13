@@ -1242,16 +1242,21 @@ _sit_atendido_cache = {}
 
 
 def _bling_raw(metodo, caminho, payload=None, params=None):
-    """Chamada ao Bling SEM retry automático (não pode lançar 2 vezes). -> (status, texto, json|None)"""
+    """Chamada ao Bling. Só repete no 429 ("limite de requisições por segundo"): o Bling recusa ANTES de processar,
+    então repetir não lança 2 vezes. Erro de rede/timeout NÃO repete. -> (status, texto, json|None)"""
     import requests
     b = _bling()
     if not b:
         return 0, "Bling indisponível", None
-    _ritmo()
-    try:
-        r = requests.request(metodo, f"{b.base_url}{caminho}", headers=b._headers(), json=payload, params=params, timeout=(10, 60))
-    except Exception as e:
-        return 0, f"sem resposta do Bling: {e}", None
+    for tentativa in range(4):
+        _ritmo()
+        try:
+            r = requests.request(metodo, f"{b.base_url}{caminho}", headers=b._headers(), json=payload, params=params, timeout=(10, 60))
+        except Exception as e:
+            return 0, f"sem resposta do Bling: {e}", None
+        if r.status_code != 429 or tentativa == 3:
+            break
+        time.sleep(1.2 * (tentativa + 1))
     try:
         js = r.json()
     except Exception:
