@@ -1864,6 +1864,18 @@ def _job_entrada(nid, quem):
             lts[chave] = {"id_lote": idl, "qtd": x["qtd"], "lote": x["lote"]}
             salvar()
 
+        # FEFO da separação: atualiza já a cópia local dos lotes desses SKUs (senão espera a sync de hora em hora)
+        skus_lote = sorted({str(x["sku"]) for x in p["itens"] if x.get("controla_lote") and x.get("sku")})
+        if skus_lote and os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fefo_sync.py")):
+            try:
+                import subprocess
+                import sys as _sys
+                subprocess.Popen([_sys.executable, "fefo_sync.py", "--skus", ",".join(skus_lote), "--forcar"],
+                                 cwd=os.path.dirname(os.path.abspath(__file__)),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except Exception as e:
+                print(f"[RECEB] fefo_sync não rodou: {e}", flush=True)
+
         # 4) contas a pagar: primeiro confere se já existem (mesmo fornecedor, vencimento e valor); senão lança as DA NOTA
         #    (POST /nfe/{id}/lancar-contas); se a nota não tiver parcelas ou o Bling recusar, uma por duplicata do XML
         cts = res.setdefault("contas", {})

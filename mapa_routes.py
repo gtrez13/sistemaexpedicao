@@ -1122,12 +1122,14 @@ def saida_lista():
             prazo = str(p.get("prazo_envio") or p.get("ship_by_date") or "")[:10]
             prazo = prazo if re.match(r"\d{4}-\d{2}-\d{2}$", prazo) else ""
             exp = str(p.get("atualizado_em") or "")[:10]
+            cri = str(p.get("criado_em") or p.get("data_pedido") or "")[:10]
             if prazo and prazo > hoje:
                 situacao, dia_saida = "outro_dia", prazo
             elif p.get("status") == "CONCLUIDO" and exp >= desde_com:
                 situacao, dia_saida = "pronto", hoje        # expedido (hoje ou nos últimos dias) e ainda não saiu
-            elif p.get("status") != "CONCLUIDO" and prazo and prazo <= hoje:
-                situacao, dia_saida = "nao_expedido", prazo
+            elif p.get("status") != "CONCLUIDO" and (not cri or cri >= _dia_ts(time.time(), -10)):
+                # Comercial no WMS e ainda não expedido: sai hoje (Biel 13/11: "comercial tem que aparecer para dar saída")
+                situacao, dia_saida = "nao_expedido", (prazo or hoje)
             else:
                 continue
             out.append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "tipo": tipo, "status_wms": p.get("status"),
@@ -1275,6 +1277,18 @@ def saida_historico():
         x["foto_url"] = f"/api/saida/fotos/{x['id']}" if x.get("foto") else None
         x["faltando"] = [m for m in str(x.get("faltando") or "").split(",") if m]
     return jsonify({"dia": dia, "eventos": rows[:500], "carregados_por": por, "fechamentos": fech})
+
+
+@mapa_routes.get("/saida/fechados-hoje")
+@login_required
+def saida_fechados_hoje():
+    """Carros já fechados hoje (para o aviso do horário de corte: Flex 12:00, Coleta 15:30)."""
+    import calendar
+    ini = calendar.timegm(time.strptime(_hoje(), "%Y-%m-%d")) + 3 * 3600
+    with db_session() as conn:
+        _fech_tabela(conn)
+        rows = conn.execute("SELECT carro, MAX(em) AS em FROM saida_fechamentos WHERE em >= ? GROUP BY carro", (ini,)).fetchall()
+    return jsonify({"hoje": _hoje(), "fechados": {r["carro"]: int(r["em"]) for r in rows}})
 
 
 @mapa_routes.post("/saida/liberar")

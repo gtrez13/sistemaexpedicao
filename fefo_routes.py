@@ -118,6 +118,15 @@ def _eh_postgres() -> bool:
     return bool(os.environ.get("DATABASE_URL"))
 
 
+def modo() -> str:
+    """FEFO_MODO (padrão "lote", Biel 13/11):
+    lote    = só trava quando o operador bipa um LOTE (etiqueta SKU*LOTE do WMS ou do fabricante) e existe lote mais
+              antigo em estoque; bip só do SKU passa e a tela mostra o lote mais antigo para pegar (assume esse lote).
+    estrito = todo bip de SKU com lote exige a etiqueta do lote certo (comportamento antigo)."""
+    m = os.environ.get("FEFO_MODO", "lote").strip().lower()
+    return m if m in ("lote", "estrito") else "lote"
+
+
 def pode_liberar() -> bool:
     """Quem pode liberar o bip sem conferir o lote (fica registrado). FEFO_LIBERAR_ROLES, padrão admin,supervisor."""
     roles = {r.strip().lower() for r in os.environ.get("FEFO_LIBERAR_ROLES", "admin,supervisor").split(",") if r.strip()}
@@ -202,7 +211,7 @@ def fefo_sku(sku):
         return jsonify({"exigir": False, "motivo": "sem_lote"})
     pr = lotes[0]
     return jsonify({
-        "exigir": True, "pode_liberar": pode_liberar(),
+        "exigir": True, "modo": modo(), "pode_liberar": pode_liberar(),
         "proximo": {"lote": pr["lote"], "validade": pr["validade"], "saldo": pr["saldo"]},
         "lotes": [{"lote": l["lote"], "validade": l["validade"], "saldo": l["saldo"]} for l in lotes],
     })
@@ -232,6 +241,22 @@ def fefo_validar():
             return jsonify({"ok": True, "exigir": False})
         pr = lotes[0]
         escolhido = casa_lote(lido, lotes)
+        if escolhido is None and modo() == "lote":
+            # lote fora da lista com saldo (sync atrasada, lote novo, saldo local zerado): só trava se ele for
+            # comprovadamente MAIS NOVO que o mais antigo com saldo; senão passa (não trava o operador por dado incompleto)
+            cands = sorted(candidatos_lote(lido)) or [""]
+            r_l = conn.execute(
+                "SELECT lote, validade FROM fefo_lote WHERE sku_key=? AND lote_key IN (%s) ORDER BY validade LIMIT 1" % ",".join("?" * len(cands)),
+                (key, *cands)).fetchone()
+            if r_l and r_l["validade"] and pr["validade"] and r_l["validade"] > pr["validade"]:
+                return jsonify({
+                    "ok": False, "motivo": "lote_mais_novo", "pode_liberar": pode_liberar(),
+                    "mensagem": f"Há lote mais antigo em estoque: {pr['lote']} (val {pr['validade']}). Pegue esse primeiro.",
+                    "deve_pegar": {"lote": pr["lote"], "validade": pr["validade"], "saldo": pr["saldo"]},
+                })
+            return jsonify({"ok": True, "exigir": True, "lote": (r_l["lote"] if r_l else lido),
+                            "validade": (r_l["validade"] if r_l else None),
+                            "aviso": "lote fora do estoque do sistema: passou sem conferir a validade"})
         if escolhido is None:
             # lote lido não está entre os lotes com saldo: esgotado ou desconhecido
             cands = sorted(candidatos_lote(lido)) or [""]
