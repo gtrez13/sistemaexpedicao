@@ -1233,7 +1233,7 @@ DEP_LOCAL_ID = int(os.environ.get("BLING_DEPOSITO_LOCAL_ID", "10488672491"))
 ETAPAS_ENT = {"preparando": "Conferindo pedido, produtos e lotes no Bling", "nota": "Procurando a nota no Bling",
               "robo": "Robô manifestando e importando a nota no Bling",
               "aguardando_nota": "Esperando a nota ser manifestada e importada no Bling",
-              "vinculo": "Vinculando a nota ao pedido de compra", "pedido": "Mudando o pedido de compra para Atendido",
+              "vinculo": "Robô conciliando a nota com o pedido de compra no Bling", "pedido": "Mudando o pedido de compra para Atendido",
               "estoque": "Lançando o estoque no Local", "lotes": "Lançando os lotes", "contas": "Lançando as contas a pagar",
               "ok": "Entrada concluída", "erro": "Parou com erro", "desfazendo": "Desfazendo a entrada"}
 _ent_ativos: set = set()
@@ -1298,7 +1298,7 @@ def _ent_resumo(r):
 
 def _ent_rodando(r):
     try:
-        lim = 900 if r["entrada_etapa"] == "robo" else 300
+        lim = 900 if r["entrada_etapa"] in ("robo", "vinculo") else 300
         return r["entrada_etapa"] in ("preparando", "nota", "robo", "vinculo", "pedido", "estoque", "lotes", "contas", "desfazendo") and \
             _agora() - int(float(r["entrada_em"] or 0)) < lim
     except Exception:
@@ -1400,47 +1400,25 @@ def _ja_lancado(txt):
     return bool(re.search(r"ja (foi |esta |estao |foram )?(lancad|estornad)|ja possui (lancament|conta)|already", t))
 
 
-def _vincular_pc(nid, pc, nf_id, plano, quem):
-    """Concilia no Bling: marca nos itens do pedido de compra a nota de entrada (itens[].notaFiscal {id, quantidade}).
-    Lê o pedido inteiro e devolve inteiro (PUT); guarda o original para desfazer."""
-    import copy
-    st, txt, js = _bling_raw("GET", f"/pedidos/compras/{pc['id']}")
-    d = (js or {}).get("data") or {}
-    if st != 200 or not d:
-        return {"ok": False, "msg": f"não consegui ler o pedido {pc['numero']}: {_msg_bl(txt) or st}"}
-    orig = copy.deepcopy(d)
-    resta = {}
-    for x in plano["itens"]:
-        if x["pid"]:
-            resta[int(x["pid"])] = resta.get(int(x["pid"]), 0.0) + float(x["qtd"] or 0)
-    n = 0
-    for it in d.get("itens") or []:
-        pid = int((it.get("produto") or {}).get("id") or 0)
-        if resta.get(pid, 0) > 0:
-            q = min(float(it.get("quantidade") or 0), resta[pid])
-            resta[pid] -= q
-            it["notaFiscal"] = {"id": int(nf_id), "quantidade": q}
-            n += 1
-    if not n:
-        return {"ok": False, "msg": "nenhum item do pedido casou com a nota"}
-    st, txt, js = _bling_raw("PUT", f"/pedidos/compras/{pc['id']}", d)
-    ok = st in (200, 201, 204)
-    msg = f"{n} item(ns) do pedido {pc['numero']} vinculados à nota" if ok else (_msg_bl(txt) or f"HTTP {st}")
-    conferido = False
-    if ok:
-        # o Bling responde 200 mesmo quando ignora o campo: lê o pedido de volta e confere item a item
-        st2, txt2, js2 = _bling_raw("GET", f"/pedidos/compras/{pc['id']}")
-        its2 = (((js2 or {}).get("data") or {}).get("itens") or []) if st2 == 200 else []
-        gravados = sum(1 for i in its2 if str((i.get("notaFiscal") or {}).get("id") or "") == str(nf_id))
-        conferido = st2 == 200
-        if st2 == 200 and gravados == 0:
-            ok = False
-            msg = (f"o Bling aceitou o pedido {pc['numero']} mas NÃO gravou o vínculo com a nota (a API não vincula): "
-                   "vincule na tela do Bling. O resto da entrada continua normal")
-        elif st2 == 200 and gravados < n:
-            msg = f"{gravados} de {n} item(ns) do pedido {pc['numero']} vinculados à nota"
-    _ent_log(nid, f"vincular a nota ao pedido {pc['numero']}", ok, st, msg, txt, d, por=quem)
-    return {"ok": ok, "msg": msg, "original": orig if (st in (200, 201, 204)) else None, "conferido": conferido}
+def _conciliar_pc(nid, r, pc, nf, quem):
+    """Concilia a nota com o pedido de compra NO BLING, pelo robô (tela "Conciliação dos itens").
+    Pela API não dá: PUT /pedidos/compras com itens[].notaFiscal volta 200 e o Bling não grava (testado 12/11/2026).
+    E o Bling TRAVA a conciliação depois que a nota lança estoque ou contas: por isso é antes do estoque."""
+    if not ROBO_ENTRADA():
+        return {"ok": False, "pulado": True, "msg": "robô desligado (RECEB_ROBO_ENTRADA=0): a nota fica sem conciliação com o pedido"}
+    try:
+        from services.bling_entrada_robo import conciliar_pedido
+        out = conciliar_pedido(r["numero"], pc["numero"], valor=float(r["valor"] or 0) or None,
+                               n_itens=len(nf.get("itens") or []) or None, log=lambda t: print(t, flush=True))
+    except Exception as e:
+        msg = str(e)
+        trav = "TRAVADA" in msg
+        msg = msg.replace("TRAVADA: ", "")
+        _ent_log(nid, f"conciliar a nota com o pedido {pc['numero']} (robô)", False, None, msg[:500], por=quem)
+        return {"ok": False, "pulado": trav, "msg": msg[:300]}
+    msg = f"{out.get('itens')} item(ns) conciliados com o pedido {pc['numero']} (robô, na tela do Bling)"
+    _ent_log(nid, f"conciliar a nota com o pedido {pc['numero']} (robô)", True, None, msg + " · " + " · ".join(out.get("passos") or [])[:400], por=quem)
+    return {"ok": True, "robo": True, "msg": msg, "itens": out.get("itens")}
 
 
 def _contas_existentes(forn, contas):
@@ -1569,7 +1547,7 @@ def plano_entrada(nid, resumo=None):
     nome_sit = {0: "Em aberto", 1: "Atendido", 2: "Cancelado", 3: "Em andamento"}.get(sit, str(sit))
     if sit == 2:
         ponto(False, "Pedido de compra", f"o pedido {pc.get('numero')} está CANCELADO no Bling")
-    elif sit == 1 and (resumo or {}).get("pedido"):
+    elif sit == 1 and ((resumo or {}).get("pedido") or ((resumo or {}).get("vinculo") or {}).get("robo")):
         ponto(True, "Pedido de compra", f"pedido {pc.get('numero')} já Atendido (feito pelo WMS nesta entrada)")
     elif sit == 1:
         ponto(False, "Pedido de compra", f"o pedido {pc.get('numero')} já está Atendido no Bling: o estoque pode já ter entrado. "
@@ -1722,18 +1700,25 @@ def _job_entrada(nid, quem):
 
         # 0b) conciliar no Bling: a nota vinculada ao pedido de compra (não trava a entrada se o Bling recusar)
         vin0 = res.get("vinculo") or {}
-        if not vin0 or (vin0.get("ok") and not vin0.get("conferido")):     # versão antiga marcava ok sem conferir: confere agora
+        if not (vin0.get("ok") and vin0.get("robo")) and not vin0.get("pulado"):
             res["_etapa"] = "vinculo"; _ent_estado(nid, "vinculo")
-            novo = _vincular_pc(nid, pc, nf_id, p, quem)
-            if vin0.get("original"):
-                novo["original"] = vin0["original"]          # o pedido como estava ANTES do WMS (para desfazer)
-            res["vinculo"] = novo
+            if res.get("estoque") or res.get("contas") or res.get("contas_via"):
+                res["vinculo"] = {"ok": False, "pulado": True,
+                                  "msg": "o estoque/contas dessa nota já entraram e o Bling trava a conciliação depois disso: fica sem vínculo com o pedido"}
+            else:
+                res["vinculo"] = _conciliar_pc(nid, r, pc, res["nota"], quem)
             salvar()
+            if not res["vinculo"]["ok"] and not res["vinculo"].get("pulado"):
+                raise RuntimeError(f"VINC|O robô não conseguiu conciliar a nota com o pedido {pc['numero']} no Bling: {res['vinculo']['msg']}. "
+                                   "Clique Continuar para tentar de novo, ou Seguir sem conciliar (o Bling trava a conciliação depois do estoque).")
 
         # 1) pedido -> Atendido (medindo o estoque antes/depois: o Bling pode lançar sozinho ao atender)
         if not res.get("pedido"):
             res["_etapa"] = "pedido"; _ent_estado(nid, "pedido")
             antes = _saldos_local(ids)
+            st0, _, js0 = _bling_raw("GET", f"/pedidos/compras/{pc['id']}")
+            if st0 == 200:
+                pc["situacao_valor"] = int((((js0 or {}).get("data") or {}).get("situacao") or {}).get("valor") or pc["situacao_valor"])
             if pc["situacao_valor"] != 1:
                 st, txt, _ = _bling_raw("PATCH", f"/pedidos/compras/{pc['id']}/situacoes/{pc['atendido_id']}")
                 ok = st in (200, 204)
@@ -1918,8 +1903,8 @@ def _job_entrada(nid, quem):
         n_est = sum(1 for v in est.values() if v.get("via") == "wms")
         n_nota = sum(1 for v in est.values() if v.get("via") in ("nota", "importacao"))
         vin = res.get("vinculo") or {}
-        msg = (f"Entrada lançada no Bling: NF {r['numero']} vinculada ao pedido {pc['numero']}" if vin.get("ok")
-               else f"Entrada lançada no Bling (o vínculo da nota com o pedido {pc['numero']} ficou para fazer no Bling: {str(vin.get('msg') or '')[:120]})")
+        msg = (f"Entrada lançada no Bling: NF {r['numero']} conciliada com o pedido {pc['numero']}" if vin.get("ok")
+               else f"Entrada lançada no Bling (sem conciliar com o pedido {pc['numero']}: {str(vin.get('msg') or '')[:120]})")
         msg += (f" · pedido Atendido · estoque de {len(est)} item(ns) ({n_nota} pela nota, {n_est} produto a produto, "
                 f"{len(est) - n_nota - n_est} pelo pedido) · {len(lts)} lote(s) · {len([c for c in cts if c != 'nota']) or len(cts)} conta(s) a pagar"
                 + (" (da nota)" if res.get("contas_via") == "nota" else " (já existiam)" if res.get("contas_via") == "existentes" else "") + ".")
@@ -1930,8 +1915,9 @@ def _job_entrada(nid, quem):
     except Exception as e:
         import traceback
         t = str(e)
-        if t.startswith("BLING|") or t.startswith("CONF|"):
-            org, msg = ("bling" if t.startswith("BLING|") else "conferencia"), t.split("|", 1)[1]
+        if t.startswith("BLING|") or t.startswith("CONF|") or t.startswith("VINC|"):
+            org = {"BLING": "bling", "CONF": "conferencia", "VINC": "vinculo"}[t.split("|", 1)[0]]
+            msg = t.split("|", 1)[1]
         else:
             print(f"[ENTRADA] {nid}: {traceback.format_exc()}", flush=True)
             org, msg = "wms", f"Erro interno do WMS ({type(e).__name__}): {t[:300]}"
@@ -1995,6 +1981,13 @@ def entrada_lancar(nid):
         return jsonify({"error": "A entrada dessa nota já foi lançada no Bling.", "origem": "conferencia"}), 409
     if r["status"] != "conferida":
         return jsonify({"error": "Só nota CONFERIDA entra no Bling.", "origem": "conferencia"}), 409
+    if (request.get_json(silent=True) or {}).get("sem_vinculo") and not _ent_rodando(r):
+        res = _ent_resumo(r)
+        if not (res.get("vinculo") or {}).get("ok"):
+            res["vinculo"] = {"ok": False, "pulado": True, "msg": f"seguiu sem conciliar com o pedido (decisão de {_quem()})"}
+            with db_session() as c:
+                c.execute("UPDATE receb_notas SET entrada_resumo=? WHERE id=?", (json.dumps(res, ensure_ascii=False), nid))
+            _ent_log(nid, "conciliação nota x pedido", False, None, res["vinculo"]["msg"], por=_quem())
     if not _disparar_entrada(nid, _quem()):
         return jsonify({"success": True, "andamento": True}), 202
     return jsonify({"success": True, "andamento": True}), 202
@@ -2078,14 +2071,9 @@ def entrada_desfazer(nid):
         else:
             falhas.append(f"pedido: {_msg_bl(txt) or st}")
     vin = res.get("vinculo") or {}
-    if vin.get("ok") and vin.get("original") and r["pedido_compra_id"] and not res.get("pedido"):
-        st, txt, _ = _bling_raw("PUT", f"/pedidos/compras/{r['pedido_compra_id']}", vin["original"])
-        ok = st in (200, 201, 204)
-        _ent_log(nid, "desfazer vínculo nota x pedido", ok, st, "pedido voltou como estava" if ok else _msg_bl(txt), txt, por=quem)
-        if ok:
-            res.pop("vinculo", None)
-        else:
-            falhas.append(f"vínculo: {_msg_bl(txt) or st}")
+    if vin.get("ok") and vin.get("robo"):
+        _ent_log(nid, "conciliação nota x pedido", True, None, "continua no Bling. Para tirar: Notas de entrada > marcar a nota > "
+                 "Desvincular pedido compra (antes de lançar o estoque de novo)", por=quem)
     if not falhas:
         for k in ("nf_estoque", "saldo_inicio", "contas_via"):
             res.pop(k, None)
