@@ -430,6 +430,11 @@ def buscar_xml_por_chave(chave: str):
 
 # ───────────────────────── leitura ─────────────────────────
 def _txt_endereco(pp, pos):
+    try:                                       # mapa montável (16/11): nomes e códigos vêm do layout
+        import mapa_layout
+        return mapa_layout.endereco(pp, pos)
+    except Exception:
+        pass
     pp, pos = int(pp), int(pos)
     if pp > 100:
         return f"C{pp - 100}-F{pos}", f"Cesta {pp - 100} · Fileira {pos}"

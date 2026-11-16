@@ -45,6 +45,11 @@ except Exception:                     # sem cliente Bling: o mapa continua funci
 mapa_routes = Blueprint("mapa_routes", __name__)
 
 BLING_BASE = "https://api.bling.com.br/Api/v3"
+# Mapa montável (16/11): o desenho do galpão vem do layout (mapa_layout.py); sem o arquivo, vale o mapa fixo de antes.
+try:
+    import mapa_layout as _ML
+except Exception:                          # pragma: no cover
+    _ML = None
 VALID_PP = set(range(1, 11)) | set(range(101, 112)) | {31, 32, 51}  # Porta Palet 1..10 e Cestas 1..11 (codificadas 101..111)
 VALID_POS = set(range(1, 8))          # P1..P6 (porta palet) ou fileiras F1..F7 (cesta)
 
@@ -152,11 +157,14 @@ def listar_localizacoes():
             "SELECT sku, nome, foto, porta_palet, posicao FROM mapa_localizacao "
             "ORDER BY porta_palet, posicao, sku"
         ).fetchall()
-    return jsonify({"localizacoes": [
+    out = {"localizacoes": [
         {"sku": r["sku"], "nome": r["nome"], "foto": r["foto"],
          "porta_palet": r["porta_palet"], "posicao": r["posicao"]}
         for r in rows
-    ]})
+    ]}
+    if _ML:                                     # mapa montável: a tela desenha e calcula a rota com o layout em uso
+        out["layout"], out["layout_versao"] = _ML.layout()
+    return jsonify(out)
 
 
 @mapa_routes.post("/mapa/localizacao")
@@ -174,7 +182,10 @@ def salvar_localizacao():
         return jsonify({"error": "porta_palet e posicao devem ser números"}), 400
     if not sku:
         return jsonify({"error": "sku é obrigatório"}), 400
-    if pp not in VALID_PP or pos not in VALID_POS or (pp < 100 and pos > 6):
+    if _ML:
+        if not _ML.valido(pp, pos):
+            return jsonify({"error": f"Essa posição não existe no mapa ({pp}/{pos})."}), 400
+    elif pp not in VALID_PP or pos not in VALID_POS or (pp < 100 and pos > 6):
         return jsonify({"error": "porta_palet 1-10, vet 31-32, refri 51 (posicao 1-6) ou cesta 101-111 (fileira 1-7)"}), 400
 
     _garantir_tabelas()
@@ -384,6 +395,8 @@ def _servir(arq):
 # ───────────────────────── giro (vendas) x posição ─────────────────────────
 # Picking: quem sai mais tem que ficar mais perto do INÍCIO da rota. Mesma ordem da rota do celular (utils/rota.js).
 def _rank(pp, p):
+    if _ML:
+        return _ML.rank(pp, p)
     pp, p = int(pp), int(p or 0)
     if pp in (51, 52):
         return 8000 + (pp - 51)                       # refrigerador: sempre o último
@@ -399,11 +412,15 @@ def _rank(pp, p):
 
 
 def _zona(pp):
+    if _ML:
+        return _ML.zona(pp)
     pp = int(pp)
     return "cesta" if pp > 100 else "vet" if pp in (31, 32) else "refri" if pp in (51, 52) else "pp"
 
 
 def _rotulo(pp, p):
+    if _ML:
+        return _ML.rotulo(pp, p)
     pp = int(pp)
     if pp > 100:
         return f"Cesta {pp - 100} · F{p}"
@@ -2195,3 +2212,11 @@ try:
     _full_routes.registrar(mapa_routes)
 except Exception as _e:                      # sem o arquivo novo: o resto do mapa segue no ar
     _slowlog.warning("[full] módulo Full não carregou: %s", _e)
+
+
+# ───────────────────────── Mapa montável (rotas em mapa_layout.py) ─────────────────────────
+if _ML:
+    try:
+        _ML.registrar(mapa_routes)
+    except Exception as _e:
+        _slowlog.warning("[mapa] layout montável não carregou: %s", _e)
