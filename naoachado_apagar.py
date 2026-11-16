@@ -6,6 +6,7 @@
   venv/bin/python -u naoachado_apagar.py --ids 12,13 --apagar
   venv/bin/python -u naoachado_apagar.py --restaurar naoachado_apagados_<data>.json   DESFAZER"""
 import json
+import os
 import sys
 import time
 import warnings
@@ -33,6 +34,12 @@ if "--restaurar" in a:              # fora do bloco principal: sys.exit dentro d
             c.execute(f"INSERT INTO nao_achado ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})", tuple(r[k] for k in cols))
     print(f"Voltaram {len(rows)} ocorrência(s).")
     sys.exit(0)
+
+try:                                # mostra qual banco está lendo (tem que ser o mesmo do serviço)
+    import db.database as _D
+    print("Banco:", getattr(_D, "DB_PATH", None) or ("Postgres" if os.environ.get("DATABASE_URL") else "?"))
+except Exception:
+    pass
 
 with db_session() as c:
     sql, args = "SELECT * FROM nao_achado", []

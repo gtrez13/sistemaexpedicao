@@ -14,13 +14,20 @@ Registrado no blueprint do mapa (url_prefix /api) por registrar(bp). Rotas:
   POST /full/remessas/<id>/bipar         {codigo, quantidade}  -> etiqueta {codigo, titulo, variacao, qtd}
   POST /full/remessas/<id>/desfazer      {item_id?}            desfaz o último bip (do item)
   POST /full/remessas/<id>/status        {status: aberta|separada|enviada|cancelada}
-  GET  /full/novas                       remessas abertas (aviso com som em qualquer tela)"""
+  POST /full/remessas/<id>/reimprimir    {item_id, qtd}        manda N etiquetas de novo para a fila
+  GET  /full/etiquetas/fila?estacao=     computador da Elgin reserva e recebe as etiquetas que faltam imprimir
+  POST /full/etiquetas/impressas         {ids, estacao}        confirma as impressas (sem confirmar, voltam para a fila em 30 s)
+  GET  /full/novas                       remessas abertas (aviso com som em qualquer tela)
+
+Etiqueta: se o aparelho que bipou tem a Elgin (QZ), ele imprime na hora (imprime_aqui=true); senão o bip entra na fila e o
+computador da Elgin (estação) imprime sozinho. Assim o separador pode bipar pelo celular."""
 from __future__ import annotations
 
 import os
 import re
 import threading
 import time
+import uuid
 
 from flask import jsonify, request
 from flask_login import current_user, login_required
@@ -34,6 +41,8 @@ _ok_tab = False
 _anuncios = {"rodando": False, "em": 0, "erro": None, "n": 0}
 _lock = threading.Lock()
 ABERTAS = ("aberta", "separando")
+_estacao = {"nome": None, "em": 0}          # último computador que pediu a fila de etiquetas (o da Elgin)
+RESERVA_S = 30                               # etiqueta reservada e não confirmada volta para a fila depois disso
 
 
 def _quem():
@@ -58,7 +67,9 @@ def _tabelas():
                   "separado INTEGER NOT NULL DEFAULT 0)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_full_itens_rem ON full_itens (remessa_id)")
         c.execute(f"CREATE TABLE IF NOT EXISTS full_bips (id {pk}, remessa_id BIGINT, item_id BIGINT, qtd INTEGER, por TEXT, em BIGINT, "
-                  "desfeito INTEGER NOT NULL DEFAULT 0)")
+                  "desfeito INTEGER NOT NULL DEFAULT 0, reimpressao INTEGER NOT NULL DEFAULT 0, impresso_em BIGINT, impresso_por TEXT, "
+                  "reservado_por TEXT, reservado_em BIGINT)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_full_bips_fila ON full_bips (impresso_em, desfeito)")
     _ok_tab = True
 
 
@@ -162,6 +173,9 @@ def _rem(c, rid, com_itens=True):
     d["separadas"] = sum(min(int(x["separado"] or 0), int(x["qtd"] or 0)) for x in its)
     if com_itens:
         d["itens"] = its
+        d["etq_esperando"] = int(c.execute("SELECT COALESCE(SUM(qtd),0) AS n FROM full_bips WHERE remessa_id=? AND desfeito=0 AND impresso_em IS NULL",
+                                           (rid,)).fetchone()["n"] or 0)
+        d["estacao"] = {"nome": _estacao["nome"], "ha_s": int(time.time() - _estacao["em"]) if _estacao["em"] else None}
     return d
 
 
@@ -199,7 +213,7 @@ def registrar(bp):
             rows = [r for r in rows if q in " ".join(str(r.get(k) or "") for k in ("titulo", "sku", "item_id", "inventory_id", "variacao", "ean")).lower()]
         with _lock:
             st = dict(_anuncios)
-        return jsonify({"anuncios": rows[:300], "total": len(rows), "atualizando": st["rodando"], "erro": st["erro"],
+        return jsonify({"anuncios": rows[:2000], "total": len(rows), "atualizando": st["rodando"], "erro": st["erro"],
                         "atualizado_em": int(ult) if ult else None})
 
     @bp.get("/full/remessas")
@@ -287,6 +301,7 @@ def registrar(bp):
             qtd = max(1, int(d.get("quantidade") or 1))
         except (TypeError, ValueError):
             qtd = 1
+        aqui = bool(d.get("imprime_aqui"))         # o aparelho que bipou imprime (QZ); senão vai para a fila da estação
         k = cod.upper()
         kd = re.sub(r"\D", "", cod).lstrip("0")
         with db_session() as c:
@@ -305,13 +320,17 @@ def registrar(bp):
                 return jsonify({"success": False, "error": f"{achados[0]['titulo'][:50]} já está completo ({tot} de {tot}).", "tipo": "completo"}), 409
             dar = min(qtd, int(it["qtd"]) - int(it["separado"]))
             c.execute("UPDATE full_itens SET separado=separado+? WHERE id=?", (dar, it["id"]))
-            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em) VALUES (?,?,?,?,?)", (rid, it["id"], dar, _quem(), int(time.time())))
+            agora = int(time.time())
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, impresso_em, impresso_por) VALUES (?,?,?,?,?,?,?)",
+                      (rid, it["id"], dar, _quem(), agora, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None))
+            bip_id = c.execute("SELECT MAX(id) AS m FROM full_bips WHERE remessa_id=? AND item_id=? AND em=?", (rid, it["id"], agora)).fetchone()["m"]
             c.execute("UPDATE full_remessas SET status='separando', atualizado_em=? WHERE id=? AND status='aberta'", (int(time.time()), rid))
             novo = _rem(c, rid)
         itn = next(x for x in novo["itens"] if x["id"] == it["id"])
         tot = sum(int(x["qtd"]) for x in novo["itens"] if x["chave"] == it["chave"])
         sep = sum(int(x["separado"]) for x in novo["itens"] if x["chave"] == it["chave"])
-        return jsonify({"success": True, "item": itn, "bipado_agora": dar, "sku": it["sku"], "nome": it["titulo"],
+        return jsonify({"success": True, "bip_id": bip_id, "item": itn, "bipado_agora": dar, "etq_esperando": novo.get("etq_esperando", 0),
+                        "estacao": novo.get("estacao"), "sku": it["sku"], "nome": it["titulo"],
                         "produto": {"total": tot, "bipado": sep, "falta": tot - sep}, "remessa": {k2: novo[k2] for k2 in ("unidades", "separadas", "status")},
                         "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": dar,
                                      "sem_codigo": not it["inventory_id"]}})
@@ -322,7 +341,7 @@ def registrar(bp):
         _tabelas()
         d = request.get_json(silent=True) or {}
         with db_session() as c:
-            sql, args = "SELECT * FROM full_bips WHERE remessa_id=? AND desfeito=0", [rid]
+            sql, args = "SELECT * FROM full_bips WHERE remessa_id=? AND desfeito=0 AND reimpressao=0", [rid]
             if d.get("item_id"):
                 sql += " AND item_id=?"; args.append(int(d["item_id"]))
             b = c.execute(sql + " ORDER BY id DESC LIMIT 1", tuple(args)).fetchone()
@@ -330,7 +349,7 @@ def registrar(bp):
                 return jsonify({"success": False, "error": "Nada para desfazer."}), 404
             c.execute("UPDATE full_bips SET desfeito=1 WHERE id=?", (b["id"],))
             c.execute("UPDATE full_itens SET separado=CASE WHEN separado>=? THEN separado-? ELSE 0 END WHERE id=?", (b["qtd"], b["qtd"], b["item_id"]))
-            return jsonify({"success": True, "desfeito": int(b["qtd"]), "remessa": _rem(c, rid)})
+            return jsonify({"success": True, "desfeito": int(b["qtd"]), "impressa": b["impresso_em"] is not None, "remessa": _rem(c, rid)})
 
     @bp.post("/full/remessas/<int:rid>/status")
     @login_required
@@ -348,6 +367,58 @@ def registrar(bp):
             c.execute("UPDATE full_remessas SET status=?, atualizado_em=?, fechado_por=?, fechado_em=? WHERE id=?",
                       (st, int(time.time()), _quem() if st != "aberta" else None, int(time.time()) if st != "aberta" else None, rid))
             return jsonify({"success": True, "remessa": _rem(c, rid, False)})
+
+    @bp.post("/full/remessas/<int:rid>/reimprimir")
+    @login_required
+    def full_reimprimir(rid):
+        """Etiqueta estragou ou caiu: manda N de novo para a fila da estação (não mexe no separado)."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        try:
+            iid, q = int(d.get("item_id")), max(1, min(500, int(d.get("qtd") or 1)))
+        except (TypeError, ValueError):
+            return jsonify({"error": "item_id e qtd"}), 400
+        with db_session() as c:
+            it = c.execute("SELECT * FROM full_itens WHERE id=? AND remessa_id=?", (iid, rid)).fetchone()
+            if not it:
+                return jsonify({"error": "Produto não está nesta remessa."}), 404
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao) VALUES (?,?,?,?,?,1)", (rid, iid, q, _quem(), int(time.time())))
+        return jsonify({"success": True})
+
+    @bp.get("/full/etiquetas/fila")
+    @login_required
+    def full_fila():
+        """Computador da Elgin (estação): reserva as etiquetas ainda não impressas e devolve os dados para imprimir."""
+        _tabelas()
+        est = (str(request.args.get("estacao") or "").strip() or _quem())[:60]
+        agora = int(time.time())
+        _estacao.update(nome=est, em=agora)
+        tk = f"{est}#{uuid.uuid4().hex[:10]}"          # uma reserva por pedido da fila: nunca devolve a mesma etiqueta duas vezes
+        with db_session() as c:
+            c.execute("UPDATE full_bips SET reservado_por=?, reservado_em=? WHERE impresso_em IS NULL AND desfeito=0 AND em>? "
+                      "AND (reservado_em IS NULL OR reservado_em<?) "
+                      "AND remessa_id IN (SELECT id FROM full_remessas WHERE status IN ('aberta','separando','separada'))",
+                      (tk, agora, agora - 86400, agora - RESERVA_S))
+            rows = c.execute("SELECT b.id, b.qtd, b.reimpressao, b.por, b.remessa_id, i.inventory_id, i.titulo, i.variacao, i.sku, r.nome AS remessa "
+                             "FROM full_bips b JOIN full_itens i ON i.id=b.item_id JOIN full_remessas r ON r.id=b.remessa_id "
+                             "WHERE b.reservado_por=? AND b.impresso_em IS NULL AND b.desfeito=0 ORDER BY b.id",
+                             (tk,)).fetchall()
+        return jsonify({"etiquetas": [{"bip_id": r["id"], "codigo": r["inventory_id"], "titulo": r["titulo"], "variacao": r["variacao"], "sku": r["sku"],
+                                       "qtd": int(r["qtd"]), "reimpressao": bool(r["reimpressao"]), "por": r["por"], "remessa_id": r["remessa_id"],
+                                       "remessa": r["remessa"]} for r in rows]})
+
+    @bp.post("/full/etiquetas/impressas")
+    @login_required
+    def full_impressas():
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        est = (str(d.get("estacao") or "").strip() or _quem())[:80]
+        ids = [int(x) for x in (d.get("ids") or []) if str(x).isdigit()][:200]
+        agora = int(time.time())
+        with db_session() as c:
+            for i in ids:
+                c.execute("UPDATE full_bips SET impresso_em=?, impresso_por=? WHERE id=? AND impresso_em IS NULL", (agora, est, i))
+        return jsonify({"success": True, "n": len(ids)})
 
     @bp.get("/full/novas")
     @login_required
