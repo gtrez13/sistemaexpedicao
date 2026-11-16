@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Módulo FULL: remessas para o Mercado Livre Full nascem no WMS (o ML não deixa listar as do painel), aviso com som em todo WMS aberto,
-# separação com bip e dados da etiqueta do ML (código do anúncio no Full). Atualiza mapa_routes.py + full_routes.py. Backup + desfazer.
+# separação com bip e dados da etiqueta do ML (código do anúncio no Full), sugestão automática e leitura do arquivo do painel.
+# Atualiza mapa_routes.py + full_routes.py + full_auto.py. Backup + desfazer.
 set -e
 [ -f app.py ] || { echo "rode dentro da pasta do backend"; exit 1; }
 case "$PWD" in *RussianL*) ;; *) echo "isso é só para o LHVMed (RussianL)"; exit 1;; esac
@@ -10,9 +11,10 @@ TS=$(date +%Y%m%d%H%M%S)
 BK="mapa_routes.py.bak_full_$TS"
 URL="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF"
 cp mapa_routes.py "$BK"
-for f in mapa_routes.py full_routes.py; do curl -fsSL "$URL/$f" -o "$f.novo"; done
-venv/bin/python -m py_compile mapa_routes.py.novo full_routes.py.novo
-for f in mapa_routes.py full_routes.py; do mv "$f.novo" "$f"; done
+for f in mapa_routes.py full_routes.py full_auto.py; do curl -fsSL "$URL/$f" -o "$f.novo"; done
+venv/bin/python -m py_compile mapa_routes.py.novo full_routes.py.novo full_auto.py.novo
+for f in mapa_routes.py full_routes.py full_auto.py; do mv "$f.novo" "$f"; done
+venv/bin/python -c "import pypdf" 2>/dev/null || echo "AVISO: pypdf não está no venv: ler PDF do painel não vai funcionar (planilha e CSV sim). Instale: venv/bin/pip install pypdf==4.2.0"
 sudo systemctl restart wms-russia.service
 sleep 4
 if ! systemctl is-active --quiet wms-russia.service; then
@@ -29,6 +31,7 @@ import full_routes as F
 F._atualizar_anuncios()
 print("anúncios Full guardados:", F._anuncios["n"], "| erro:", F._anuncios["erro"])
 PY
+echo "A sugestão do Full calcula sozinha em segundo plano quando alguém abrir a tela Full (alguns minutos na 1ª vez)."
 echo
 echo "Desfazer:"
 echo "  cp $BK mapa_routes.py && sudo systemctl restart wms-russia.service"

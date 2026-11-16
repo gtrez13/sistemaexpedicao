@@ -420,6 +420,12 @@ def registrar(bp):
                 c.execute("UPDATE full_bips SET impresso_em=?, impresso_por=? WHERE id=? AND impresso_em IS NULL", (agora, est, i))
         return jsonify({"success": True, "n": len(ids)})
 
+    try:                                      # sugestão automática + ler o arquivo do painel (full_auto.py)
+        import full_auto
+        full_auto.registrar(bp)
+    except Exception as e:                    # sem o arquivo novo: o resto do Full segue no ar
+        print(f"⚠️ full: sugestão/importar não carregou: {e}", flush=True)
+
     @bp.get("/full/novas")
     @login_required
     def full_novas():
