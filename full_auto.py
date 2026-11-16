@@ -19,6 +19,7 @@ O ML não deixa ler a remessa criada no painel, então a lista nasce de dois jei
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import re
@@ -232,6 +233,97 @@ def calcular():
             _st["rodando"] = False
 
 
+# ───────────────────────── kit (composição no Bling) ─────────────────────────
+KIT_TTL = 7 * 86400
+_kits_st = {"rodando": False, "fila": [], "erro": None}
+
+
+def _kit_tab(c):
+    c.execute("CREATE TABLE IF NOT EXISTS full_kit (sku_key TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
+
+
+def kit_do_cache(sku):
+    """[] = simples; [{sku, nome, q, ean, bip}] = kit; None = ainda não conferido."""
+    if not sku:
+        return []
+    with db_session() as c:
+        _kit_tab(c)
+        r = c.execute("SELECT dados, em FROM full_kit WHERE sku_key=?", (str(sku).strip().lower(),)).fetchone()
+    if not r or time.time() - int(r["em"] or 0) > KIT_TTL:
+        return None
+    try:
+        return [dict(x, bip=0) for x in json.loads(r["dados"] or "[]")]
+    except Exception:
+        return None
+
+
+def kit_do_sku(sku):
+    """Lê no Bling se o SKU é produto com composição (kit) e quais componentes/quantidades. Guarda em full_kit."""
+    from recebimento_routes import _bling_raw
+    sku = str(sku or "").strip()
+    st, txt, js = _bling_raw("GET", "/produtos", params={"codigos[]": sku, "limite": 5, "criterio": 5})
+    if st != 200:
+        raise RuntimeError(f"Bling /produtos HTTP {st}")
+    p = next((x for x in (js or {}).get("data") or [] if str(x.get("codigo") or "").strip().lower() == sku.lower()), None)
+    comps = []
+    if p and str(p.get("formato") or "E").upper() == "E":
+        st2, _, js2 = _bling_raw("GET", f"/produtos/estruturas/{p['id']}")
+        if st2 == 200:
+            for cc in ((js2 or {}).get("data") or {}).get("componentes") or []:
+                pid = (cc.get("produto") or {}).get("id")
+                q = int(round(float(cc.get("quantidade") or 0)))
+                if not pid or q <= 0:
+                    continue
+                st3, _, js3 = _bling_raw("GET", f"/produtos/{pid}")
+                if st3 != 200:
+                    raise RuntimeError(f"Bling /produtos/{pid} HTTP {st3}")
+                dd = (js3 or {}).get("data") or {}
+                comps.append({"sku": str(dd.get("codigo") or pid), "nome": dd.get("nome"), "q": q, "ean": (dd.get("gtin") or None)})
+        elif st2 not in (400, 404):
+            raise RuntimeError(f"Bling estrutura HTTP {st2}")
+    with db_session() as c:
+        _kit_tab(c)
+        c.execute("DELETE FROM full_kit WHERE sku_key=?", (sku.lower(),))
+        c.execute("INSERT INTO full_kit (sku_key, dados, em) VALUES (?,?,?)", (sku.lower(), json.dumps(comps, ensure_ascii=False), int(time.time())))
+    return [dict(x, bip=0) for x in comps]
+
+
+def _rodar_kits():
+    while True:
+        with _lk:
+            if not _kits_st["fila"]:
+                _kits_st["rodando"] = False
+                return
+            sku = _kits_st["fila"].pop(0)
+        try:
+            if kit_do_cache(sku) is None:
+                kit_do_sku(sku)
+        except Exception as e:
+            with _lk:
+                _kits_st["erro"] = f"{sku}: {e}"[:200]
+
+
+def kits_de(skus):
+    """Kits que já estão no cache; o que falta entra na fila (segundo plano)."""
+    out, falta = {}, []
+    for s in skus:
+        k = kit_do_cache(s)
+        if k is None:
+            falta.append(s)
+        else:
+            out[s] = k
+    if falta:
+        with _lk:
+            for s in falta:
+                if s not in _kits_st["fila"]:
+                    _kits_st["fila"].append(s)
+            iniciar = not _kits_st["rodando"]
+            _kits_st["rodando"] = True
+        if iniciar:
+            threading.Thread(target=_rodar_kits, daemon=True).start()
+    return out, falta
+
+
 # ───────────────────────── 2) arquivo do painel ─────────────────────────
 def _texto_xlsx(b):
     z = zipfile.ZipFile(io.BytesIO(b))
@@ -333,7 +425,49 @@ def ler_texto(texto, tabela=False, paginas=None):
             "linhas_lidas": len(linhas), "vazio": not texto.strip()}
 
 
+def ler_preparacao(d):
+    """PDF "Lista de produtos e instruções de preparação" do ML (Frete #...), lido no navegador pela posição das colunas:
+    {frete, total_produtos, total_unidades, linhas: [{codigo, ean, sku, titulo, qtd, identificacao, instrucoes}]}."""
+    with db_session() as c:
+        an = [dict(r) for r in c.execute("SELECT * FROM full_anuncios").fetchall()]
+    por_inv = {}
+    for a in an:
+        if a["inventory_id"]:
+            k = a["inventory_id"].upper()
+            if k not in por_inv or (a["status"] == "active" and por_inv[k]["status"] != "active"):
+                por_inv[k] = a
+    itens = []
+    for ln in d.get("linhas") or []:
+        cod = re.sub(r"\s", "", str(ln.get("codigo") or "")).upper()
+        a = por_inv.get(cod)
+        instr = str(ln.get("instrucoes") or "")
+        itens.append({"chave": a["chave"] if a else f"INV:{cod}", "no_cache": not a, "inventory_id": cod, "qtd": int(ln.get("qtd") or 0),
+                      "conferir": not ln.get("qtd"), "codigo": cod, "sku": (a or {}).get("sku") or ln.get("sku"), "ean": ln.get("ean") or (a or {}).get("ean"),
+                      "titulo": (a or {}).get("titulo") or ln.get("titulo"), "variacao": (a or {}).get("variacao"), "foto": (a or {}).get("foto"),
+                      "identificacao": "codigo_universal" if "universal" in str(ln.get("identificacao") or "").lower() else "etiqueta",
+                      "instrucoes": instr or None, "exige_validade": bool(re.search(r"validade", instr, re.I)),
+                      "fragil": bool(re.search(r"pl[aá]stico-bolha", instr, re.I)), "pesado": bool(re.search(r"25 ?kg", instr, re.I))})
+    u = sum(x["qtd"] for x in itens)
+    tp, tu = d.get("total_produtos"), d.get("total_unidades")
+    kits, falta = kits_de(sorted({x["sku"] for x in itens if x["sku"]}))
+    for x in itens:
+        x["comp"] = kits.get(x["sku"]) if x["sku"] else []
+    return {"modo": "preparacao", "frete": d.get("frete"), "itens": itens, "unidades": u, "paginas": d.get("paginas"),
+            "confere": (tp is None or int(tp) == len(itens)) and (tu is None or int(tu) == u),
+            "total_produtos": tp, "total_unidades": tu, "kits_faltam": len(falta)}
+
+
 def registrar(bp):
+    @bp.post("/full/kits")
+    @login_required
+    def full_kits():
+        """{skus} -> kits do Bling (cache); os que faltam são conferidos em segundo plano: chame de novo."""
+        skus = [str(x).strip() for x in ((request.get_json(silent=True) or {}).get("skus") or []) if str(x).strip()][:300]
+        kits, falta = kits_de(skus)
+        with _lk:
+            st = {"rodando": _kits_st["rodando"], "erro": _kits_st["erro"]}
+        return jsonify({"kits": kits, "faltam": falta, **st})
+
     @bp.get("/full/sugestao")
     @login_required
     def full_sugestao():
@@ -368,6 +502,8 @@ def registrar(bp):
     def full_importar():
         d = request.get_json(silent=True) if request.is_json else None
         try:
+            if d and d.get("formato") == "preparacao":   # PDF "instruções de preparação" do ML (Frete #...), linhas lidas no navegador
+                return jsonify(ler_preparacao(d))
             if d and d.get("texto") is not None:       # PDF lido no navegador: chega só o texto (upload grande o servidor recusa)
                 r = ler_texto(str(d["texto"])[:20_000_000], bool(d.get("tabela")), d.get("paginas"))
             else:
