@@ -132,6 +132,10 @@ def _garantir_tabelas():
                       mensagem TEXT, resposta TEXT, enviado TEXT, por TEXT, em BIGINT)""")
         c.execute("CREATE TABLE IF NOT EXISTS receb_pc_cache (cnpj TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
         c.execute("CREATE TABLE IF NOT EXISTS receb_kits (sku_key TEXT PRIMARY KEY, dados TEXT, em BIGINT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS receb_etq (codigo TEXT PRIMARY KEY, nota_id BIGINT NOT NULL, item_id BIGINT NOT NULL,
+                      sku TEXT, mult INTEGER NOT NULL DEFAULT 1, seq INTEGER, lote TEXT, criado_por TEXT, criado_em BIGINT,
+                      bipado_por TEXT, bipado_em BIGINT, cancelado INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_receb_etq_item ON receb_etq (item_id)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
@@ -489,6 +493,10 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
     d["exigir_lote"] = EXIGIR_LOTE
     d["tol_total"] = TOL_TOTAL
     d["digitar_so_gestor"] = DIGITAR_SO_GESTOR
+    try:
+        _etq_info(c, nid, d)
+    except Exception as e:                  # tabela nova ainda não criada etc.: a tela segue no jeito antigo
+        print(f"⚠️ recebimento: etiquetas únicas: {e}", flush=True)
     d["eh_gestor"] = eh_gestor()
     return d
 
@@ -949,14 +957,206 @@ def _acha_item(itens, codigo: str):
     return None
 
 
+# ───────────────────────── etiqueta única por unidade (Biel 16/11) ─────────────────────────
+# Cada etiqueta impressa no recebimento tem um código só dela: QR "SKU*LOTE*U1234ABC" (sem lote: "SKU**U1234ABC").
+# A conferência é bipar cada etiqueta colada: cada código conta UMA vez (kit conta as unidades do kit).
+# RECEB_ETQ_UNICA: "nota" (padrão) = vale para a nota que já tem etiqueta com código (as telas novas sempre geram);
+#                  "1" = vale para todas as notas;  "0" = desligado (bip antigo, botão "Está tudo certo").
+ETQ_UNICA = (os.environ.get("RECEB_ETQ_UNICA", "nota").strip().lower() or "nota")
+_RE_ETQ = re.compile(r"^U[0-9A-HJKMNP-TV-Z]{7}$")
+_ALFA = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"          # sem I, L, O, U: não confunde lendo o número impresso
+
+
+def _novo_cod():
+    import secrets
+    return "U" + "".join(secrets.choice(_ALFA) for _ in range(7))
+
+
+def _parse_etq(lido):
+    """'SKU*LOTE*U1234ABC' -> (sku, lote, codigo); 'SKU*LOTE' -> (sku, lote, None); outro -> (lido, None, None)."""
+    t = str(lido or "").strip()
+    if "*" not in t:
+        return t, None, None
+    p = t.split("*")
+    return p[0].strip(), (p[1].strip() or None) if len(p) > 1 else None, (p[2].strip().upper() or None) if len(p) > 2 else None
+
+
+def _etq_ativa(c, nid) -> bool:
+    if ETQ_UNICA in ("0", "false", "nao", "não", "off"):
+        return False
+    if ETQ_UNICA in ("1", "true", "sim", "on", "todas"):
+        return True
+    return bool(c.execute("SELECT 1 FROM receb_etq WHERE nota_id=? LIMIT 1", (nid,)).fetchone())
+
+
+def _etq_info(c, nid, d):
+    """Na nota: modo e, por item, quantas etiquetas e quantas já bipadas."""
+    d["etq_modo"] = ETQ_UNICA
+    d["etq_suporte"] = ETQ_UNICA not in ("0", "false", "nao", "não", "off")
+    d["etq_unica"] = _etq_ativa(c, nid)
+    rows = c.execute("SELECT item_id, COUNT(*) AS n, SUM(mult) AS u, SUM(CASE WHEN bipado_em IS NOT NULL THEN 1 ELSE 0 END) AS nb, "
+                     "SUM(CASE WHEN bipado_em IS NOT NULL THEN mult ELSE 0 END) AS ub FROM receb_etq "
+                     "WHERE nota_id=? AND cancelado=0 GROUP BY item_id", (nid,)).fetchall()
+    por = {int(r["item_id"]): r for r in rows}
+    for it in d.get("itens") or []:
+        r = por.get(int(it["id"]))
+        it["etq_n"] = int(r["n"] or 0) if r else 0
+        it["etq_unid"] = int(r["u"] or 0) if r else 0
+        it["etq_bipadas"] = int(r["nb"] or 0) if r else 0
+        it["etq_unid_bipadas"] = int(r["ub"] or 0) if r else 0
+
+
+def _recontar(c, iid):
+    """Item conferido = soma das unidades das etiquetas bipadas (cada código uma vez)."""
+    u = c.execute("SELECT COALESCE(SUM(mult),0) AS u FROM receb_etq WHERE item_id=? AND cancelado=0 AND bipado_em IS NOT NULL", (iid,)).fetchone()["u"]
+    u = float(u or 0)
+    c.execute("UPDATE receb_itens SET qtd_conferida=?, qtd_bipada=? WHERE id=?", (u, str(u), iid))
+    return u
+
+
+def _item_resp(c, iid):
+    novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (iid,)).fetchone())
+    novo["qtd_nf"] = float(novo["qtd_nf"] or 0); novo["qtd_conferida"] = float(novo["qtd_conferida"] or 0)
+    _num_bip(novo)
+    r = c.execute("SELECT COUNT(*) AS n, SUM(mult) AS u, SUM(CASE WHEN bipado_em IS NOT NULL THEN 1 ELSE 0 END) AS nb FROM receb_etq "
+                  "WHERE item_id=? AND cancelado=0", (iid,)).fetchone()
+    novo["etq_n"], novo["etq_unid"], novo["etq_bipadas"] = int(r["n"] or 0), int(r["u"] or 0), int(r["nb"] or 0)
+    novo["etq_unid_bipadas"] = int(novo["qtd_conferida"])
+    return novo
+
+
+@recebimento_routes.post("/recebimento/notas/<int:nid>/etiquetas/codigos")
+@login_required
+def etiquetas_codigos(nid):
+    """Códigos únicos para imprimir. Corpo: {itens: [{item_id, grupos: [{sku, mult, qtd}]}]}  (grupo = etiqueta da unidade
+    ou do kit). Devolve os mesmos códigos se já existirem (reimprimir não cria outros). Etiqueta além da quantidade da nota
+    só quando todas as dele já foram bipadas (sobrou produto) ou com supervisor/admin."""
+    if ETQ_UNICA in ("0", "false", "nao", "não", "off"):
+        return jsonify({"error": "Etiqueta com código único está desligada (RECEB_ETQ_UNICA=0)."}), 409
+    d = request.get_json(silent=True) or {}
+    pedidos = d.get("itens") or []
+    garantir_tabelas()
+    out = {}
+    with db_session() as c:
+        nt = c.execute("SELECT status FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        if not nt:
+            return jsonify({"error": "Nota não encontrada."}), 404
+        aberta = nt["status"] not in ("conferida", "lancada")
+        for ped in pedidos:
+            iid = int(ped.get("item_id") or 0)
+            it = c.execute("SELECT * FROM receb_itens WHERE id=? AND nota_id=?", (iid, nid)).fetchone()
+            if not it:
+                return jsonify({"error": f"Item {iid} não é desta nota."}), 400
+            grupos = []
+            for g in ped.get("grupos") or []:
+                sku = str(g.get("sku") or "").strip()
+                try:
+                    mult, q = max(1, int(g.get("mult") or 1)), max(0, int(g.get("qtd") or 0))
+                except (TypeError, ValueError):
+                    return jsonify({"error": "Quantidade de etiquetas inválida."}), 400
+                if sku and q:
+                    grupos.append((sku, mult, q))
+            exist = [dict(r) for r in c.execute("SELECT * FROM receb_etq WHERE item_id=? AND cancelado=0 ORDER BY seq", (iid,)).fetchall()]
+            usados, plano = set(), []
+            for sku, mult, q in grupos:
+                mesmos = [e for e in exist if e["sku"] == sku and int(e["mult"]) == mult and e["codigo"] not in usados][:q]
+                usados.update(e["codigo"] for e in mesmos)
+                plano.append((sku, mult, q, mesmos))
+            bip_fora = [e for e in exist if e["codigo"] not in usados and e["bipado_em"]]
+            unid = sum(m * q for _, m, q, _ in plano) + sum(int(e["mult"]) for e in bip_fora)
+            nf = int(-(-float(it["qtd_nf"] or 0) // 1))
+            pendentes = [e for e in exist if not e["bipado_em"]]
+            if unid > nf and not eh_gestor() and pendentes:
+                return jsonify({"error": f"{it['descricao'][:40]}: a nota tem {nf} unidade(s) e isso daria {unid}. Etiqueta a mais só "
+                                         "depois de bipar todas as que já saíram (sobrou produto), ou com o supervisor.",
+                                "tipo": "acima_da_nota", "item_id": iid}), 403
+            seq = int(c.execute("SELECT COALESCE(MAX(seq),0) AS m FROM receb_etq WHERE item_id=?", (iid,)).fetchone()["m"] or 0)
+            lote = (it["lote"] or it["lote_xml"] or None)
+            res = []
+            for sku, mult, q, mesmos in plano:
+                cods = [{"codigo": e["codigo"], "bipado": bool(e["bipado_em"])} for e in mesmos]
+                while len(cods) < q:
+                    seq += 1
+                    for _ in range(5):
+                        cod = _novo_cod()
+                        if not c.execute("SELECT 1 FROM receb_etq WHERE codigo=?", (cod,)).fetchone():
+                            break
+                    c.execute("INSERT INTO receb_etq (codigo, nota_id, item_id, sku, mult, seq, lote, criado_por, criado_em) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (cod, nid, iid, sku, mult, seq, lote, _quem(), _agora()))
+                    cods.append({"codigo": cod, "bipado": False})
+                res.append({"sku": sku, "mult": mult, "codigos": cods})
+            # etiqueta que não foi bipada e saiu desta impressão (trocou unidade <-> kit, diminuiu): deixa de valer
+            for e in exist:
+                if e["codigo"] not in usados and not e["bipado_em"]:
+                    c.execute("UPDATE receb_etq SET cancelado=1 WHERE codigo=?", (e["codigo"],))
+            if aberta:          # daqui pra frente o item conferido é só o que foi bipado (apaga "Está tudo certo" de antes)
+                _recontar(c, iid)
+            out[str(iid)] = {"grupos": res}
+        c.execute("UPDATE receb_notas SET atualizado_em=? WHERE id=?", (_agora(), nid))
+    return jsonify({"success": True, "itens": out})
+
+
+@recebimento_routes.post("/recebimento/notas/<int:nid>/etiquetas/desbipar")
+@login_required
+def etiquetas_desbipar(nid):
+    """Desfaz o último bip de etiqueta do item (ou o código informado)."""
+    d = request.get_json(silent=True) or {}
+    garantir_tabelas()
+    with db_session() as c:
+        n = c.execute("SELECT status FROM receb_notas WHERE id=?", (nid,)).fetchone()
+        if not n:
+            return jsonify({"error": "Nota não encontrada."}), 404
+        if n["status"] in ("conferida", "lancada"):
+            return jsonify({"error": "Nota já conferida — reabra para alterar."}), 409
+        if d.get("codigo"):
+            e = c.execute("SELECT * FROM receb_etq WHERE codigo=? AND nota_id=?", (str(d["codigo"]).upper(), nid)).fetchone()
+        else:
+            e = c.execute("SELECT * FROM receb_etq WHERE item_id=? AND nota_id=? AND bipado_em IS NOT NULL AND cancelado=0 "
+                          "ORDER BY bipado_em DESC, seq DESC LIMIT 1", (int(d.get("item_id") or 0), nid)).fetchone()
+        if not e or not e["bipado_em"]:
+            return jsonify({"error": "Nenhuma etiqueta bipada para desfazer."}), 404
+        c.execute("UPDATE receb_etq SET bipado_em=NULL, bipado_por=NULL WHERE codigo=?", (e["codigo"],))
+        _recontar(c, e["item_id"])
+        novo = _item_resp(c, e["item_id"])
+    return jsonify({"success": True, "item": novo, "codigo": e["codigo"], "falta": novo["qtd_nf"] - novo["qtd_conferida"]})
+
+
+def _bipar_etq(c, nid, nota, sku, lote, cod):
+    """Bip de etiqueta com código único. -> (json, http)."""
+    e = c.execute("SELECT * FROM receb_etq WHERE codigo=?", (cod,)).fetchone()
+    if not e:
+        return {"success": False, "tipo": "desconhecida", "error": f"Etiqueta {cod} não existe no sistema (etiqueta de teste ou de outra impressão). Use as etiquetas impressas para esta nota."}, 404
+    if int(e["nota_id"]) != int(nid):
+        o = c.execute("SELECT numero FROM receb_notas WHERE id=?", (e["nota_id"],)).fetchone()
+        return {"success": False, "tipo": "outra_nota", "error": f"Essa etiqueta é da NF {o['numero'] if o else '?'}, não desta."}, 409
+    if int(e["cancelado"] or 0):
+        return {"success": False, "tipo": "cancelada", "error": "Essa etiqueta foi substituída por outra impressão e não vale mais. Use a etiqueta nova."}, 409
+    if e["bipado_em"]:
+        hora = datetime.datetime.fromtimestamp(int(e["bipado_em"])).strftime("%H:%M")
+        novo = _item_resp(c, e["item_id"])
+        return {"success": False, "tipo": "repetida", "item": novo, "falta": novo["qtd_nf"] - novo["qtd_conferida"],
+                "error": f"Bipada por {e['bipado_por'] or '?'} às {hora}. Não contou de novo."}, 409
+    c.execute("UPDATE receb_etq SET bipado_em=?, bipado_por=? WHERE codigo=? AND bipado_em IS NULL", (_agora(), _quem(), cod))
+    _recontar(c, e["item_id"])
+    it = c.execute("SELECT lote FROM receb_itens WHERE id=?", (e["item_id"],)).fetchone()
+    if lote and not (it and it["lote"]):
+        c.execute("UPDATE receb_itens SET lote=? WHERE id=?", (str(lote)[:60], e["item_id"]))
+    c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=? AND status IN ('aguardando','recusada','conferindo')", (_agora(), nid))
+    novo = _item_resp(c, e["item_id"])
+    falta = novo["qtd_nf"] - novo["qtd_conferida"]
+    return {"success": True, "item": novo, "falta": falta, "excedeu": falta < 0, "mult": int(e["mult"] or 1), "codigo": cod,
+            "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])}, 200
+
+
 @recebimento_routes.post("/recebimento/notas/<int:nid>/bipar")
 @login_required
 def bipar(nid):
     d = request.get_json(silent=True) or {}
     codigo = str(d.get("codigo") or "").strip()
-    if "*" in codigo:                       # etiqueta do WMS: QR "SKU*LOTE"
-        codigo, lote_etq = codigo.split("*", 1)
-        d.setdefault("lote", lote_etq.strip() or None)
+    cod_unico = None
+    if "*" in codigo:                       # etiqueta do WMS: QR "SKU*LOTE" ou "SKU*LOTE*U1234ABC"
+        codigo, lote_etq, cod_unico = _parse_etq(codigo)
+        d.setdefault("lote", lote_etq)
     try:
         qtd = float(d.get("quantidade") or 1)
     except (TypeError, ValueError):
@@ -970,6 +1170,13 @@ def bipar(nid):
             return jsonify({"success": False, "error": "Nota não encontrada."}), 404
         if nota["status"] in ("conferida", "lancada"):
             return jsonify({"success": False, "error": "Nota já conferida — reabra para alterar."}), 409
+        if cod_unico:
+            js, http = _bipar_etq(c, nid, nota, codigo, d.get("lote"), cod_unico)
+            return jsonify(js), http
+        if _etq_ativa(c, nid):
+            return jsonify({"success": False, "tipo": "precisa_etiqueta",
+                            "error": "Bipe a etiqueta do WMS colada no produto (cada unidade tem um código próprio). "
+                                     "Código do fabricante e etiqueta antiga não contam."}), 409
         it = _acha_item(nota["itens"], codigo)
         if not it:
             return jsonify({"success": False, "error": f"{codigo} não está nesta nota. Confira o produto ou vincule o SKU no item certo.", "nao_na_nota": True}), 404
@@ -1076,6 +1283,9 @@ def confirmar_item(nid, iid):
             return jsonify({"error": "Item não encontrado."}), 404
         if n["status"] in ("conferida", "lancada"):
             return jsonify({"error": "Nota já conferida — reabra para alterar."}), 409
+        if _etq_ativa(c, nid) and not eh_gestor():
+            return jsonify({"error": "Nesta nota a conferência é bipando a etiqueta de cada unidade. Só supervisor/admin ajusta na mão.",
+                            "origem": "conferencia", "tipo": "precisa_etiqueta"}), 403
         try:
             q = float(d["qtd"]) if d.get("qtd") is not None else float(it["qtd_nf"] or 0)
         except (TypeError, ValueError):
@@ -1117,6 +1327,9 @@ def editar_item(nid, iid):
                 nova = max(0.0, float(d["qtd_conferida"] or 0))
             except (TypeError, ValueError):
                 nova = None
+            if nova is not None and _etq_ativa(c, nid) and not eh_gestor():
+                return jsonify({"error": "Nesta nota a conferência é bipando a etiqueta de cada unidade. Só supervisor/admin ajusta na mão.",
+                                "origem": "conferencia", "tipo": "precisa_etiqueta"}), 403
             if nova is not None:
                 atual, bip = float(it["qtd_conferida"] or 0), float(it["qtd_bipada"] or 0)
                 if nova > atual and nova > bip and DIGITAR_SO_GESTOR and not eh_gestor():
