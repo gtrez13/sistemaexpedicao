@@ -77,7 +77,7 @@ def _tabelas():
 
 COLS_NOVAS = {                                 # 16/11 tarde: frete do ML, kit (composição do Bling), lote/validade, identificação
     "full_remessas": [("frete", "TEXT"), ("data_envio", "TEXT"), ("origem", "TEXT")],
-    "full_itens": [("identificacao", "TEXT"), ("instrucoes", "TEXT"), ("exige_validade", "INTEGER"), ("comp", "TEXT"), ("etiquetado", "INTEGER")],
+    "full_itens": [("identificacao", "TEXT"), ("instrucoes", "TEXT"), ("exige_validade", "INTEGER"), ("comp", "TEXT"), ("etiquetado", "INTEGER"), ("validade_etq", "TEXT")],
     "full_bips": [("lote", "TEXT"), ("validade", "TEXT"), ("detalhe", "TEXT"), ("fisico", "TEXT")],
 }
 
@@ -374,6 +374,63 @@ def _conferir_lote(c, rid, rem, it, sku_fis, lote_lido, qtd):
     return {"lote": l["lote"], "validade": l.get("validade"), "fefo_id": fid, "aviso": aviso}
 
 
+def _data_iso(txt):
+    """'05/2028', '01/05/2028', '2028-05-01' -> 'AAAA-MM-DD' (mês/ano = último dia do mês)."""
+    import calendar
+    t = str(txt or "").strip()
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", t)
+    if m:
+        return t
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})", t)
+    if m:
+        d, mo, a = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        a = a + 2000 if a < 100 else a
+    else:
+        m = re.fullmatch(r"(\d{1,2})[/.-](\d{2,4})", t)
+        if not m:
+            return None
+        mo, a = int(m.group(1)), int(m.group(2))
+        a = a + 2000 if a < 100 else a
+        d = calendar.monthrange(a, mo)[1] if 1 <= mo <= 12 else 0
+    try:
+        from datetime import date
+        return date(a, mo, d).isoformat()
+    except ValueError:
+        return None
+
+
+def _lote_da_etiqueta(c, it, lote_lido):
+    """Lote/validade que vai na etiqueta: o da etiqueta do WMS bipada (SKU*LOTE) ou, na ordem, o lote da unidade
+    separada que está sendo etiquetada (n-ésima etiqueta = n-ésima unidade separada). -> (lote, validade)"""
+    comp = it["comp"] or []
+    fis = comp[0]["sku"] if comp else it["sku"]
+    q0 = int(comp[0]["q"]) if comp else 1
+    if lote_lido:
+        try:
+            import fefo_routes as FR
+            cands = sorted(FR.candidatos_lote(lote_lido)) or [""]
+            r = c.execute("SELECT lote, validade FROM fefo_lote WHERE sku_key=? AND lote_key IN (%s) LIMIT 1" % ",".join("?" * len(cands)),
+                          (FR.sku_key(fis), *cands)).fetchone()
+            if r:
+                return r["lote"], r["validade"]
+        except Exception:
+            pass
+        return lote_lido, None
+    alvo = int(it.get("etiquetado") or 0) * q0          # índice da 1ª unidade (do 1º componente) desta etiqueta
+    soma = 0
+    for b in c.execute("SELECT lote, validade, detalhe, fisico FROM full_bips WHERE item_id=? AND reimpressao=0 AND desfeito=0 ORDER BY id",
+                       (it["id"],)).fetchall():
+        try:
+            det = json.loads(b["detalhe"] or "{}")
+        except Exception:
+            det = {}
+        n = int(det.get("un") or 0) if not comp else int((det.get("comp") or {}).get("0") or 0)
+        if n and alvo < soma + n:
+            return b["lote"], b["validade"]
+        soma += n
+    return None, None
+
+
 def registrar(bp):
     @bp.get("/full/anuncios")
     @login_required
@@ -645,7 +702,9 @@ def registrar(bp):
         """2ª etapa, na bancada: bipa a unidade (ou o kit montado) já separada -> sai 1 etiqueta do Full dela. Não passa do separado."""
         _tabelas()
         d = request.get_json(silent=True) or {}
-        cod = str(d.get("codigo") or "").strip().split("*")[0].strip()
+        partes = str(d.get("codigo") or "").strip().split("*")
+        cod = partes[0].strip()
+        lote_lido = partes[1].strip() if len(partes) > 1 else ""
         aqui = bool(d.get("imprime_aqui"))
         k, kd = cod.upper(), re.sub(r"\D", "", cod).lstrip("0")
         with db_session() as c:
@@ -673,10 +732,30 @@ def registrar(bp):
                                 "tipo": "falta_separar"}), 409
             if not it["inventory_id"]:
                 return jsonify({"success": False, "error": "Esse anúncio não tem código do Full: a etiqueta não sai. Chame o supervisor."}), 409
+            lote, val = _lote_da_etiqueta(c, it, lote_lido)
+            if it.get("exige_validade"):              # o ML marcou validade: a etiqueta sai com ela, sempre
+                if d.get("validade"):
+                    v = _data_iso(d["validade"])
+                    if not v:
+                        return jsonify({"success": False, "error": "Validade inválida: digite como 05/2028 ou 01/05/2028.", "tipo": "precisa_validade",
+                                        "item_id": it["id"]}), 400
+                    if v >= _limite_validade(r):          # só guarda validade que serve (as próximas unidades do item usam ela)
+                        c.execute("UPDATE full_itens SET validade_etq=? WHERE id=?", (v, it["id"]))
+                    val = v if not val else val
+                val = val or it.get("validade_etq")
+                if not val:
+                    return jsonify({"success": False, "error": f"{it['titulo'][:50]}: digite a validade impressa na embalagem.", "tipo": "precisa_validade",
+                                    "item_id": it["id"], "titulo": it["titulo"], "minima": _limite_validade(r)}), 409
+                if val[:10] < _limite_validade(r):
+                    lim = _limite_validade(r)
+                    return jsonify({"success": False, "tipo": "validade_curta", "item_id": it["id"],
+                                    "error": f"Validade {val[8:10]}/{val[5:7]}/{val[:4]}: o Full só aceita depois de {lim[8:10]}/{lim[5:7]}/{lim[:4]}. Essa unidade não vai."}), 409
             agora = int(time.time())
             c.execute("UPDATE full_itens SET etiquetado=COALESCE(etiquetado,0)+1 WHERE id=?", (it["id"],))
-            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, impresso_em, impresso_por, detalhe) VALUES (?,?,?,?,?,2,?,?,?)",
-                      (rid, it["id"], 1, _quem(), agora, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None, json.dumps({"etq": 1})))
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, impresso_em, impresso_por, detalhe, lote, validade) "
+                      "VALUES (?,?,?,?,?,2,?,?,?,?,?)",
+                      (rid, it["id"], 1, _quem(), agora, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None, json.dumps({"etq": 1}),
+                       lote, val if it.get("exige_validade") else None))
             bip_id = c.execute("SELECT MAX(id) AS m FROM full_bips WHERE remessa_id=? AND item_id=? AND em=? AND reimpressao=2", (rid, it["id"], agora)).fetchone()["m"]
             novo = _rem(c, rid)
         itn = next(x for x in novo["itens"] if x["id"] == it["id"])
@@ -684,7 +763,8 @@ def registrar(bp):
                         "por_kit": [{"sku": cp["sku"], "q": int(cp["q"]), "nome": cp.get("nome")} for cp in (it["comp"] or [])],
                         "remessa": {k2: novo[k2] for k2 in ("unidades", "separadas", "etiquetadas", "a_etiquetar", "prontas_para_etiquetar", "status")},
                         "etq_esperando": novo.get("etq_esperando", 0), "estacao": novo.get("estacao"),
-                        "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": 1}})
+                        "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": 1,
+                                     "validade": val if it.get("exige_validade") else None, "lote": lote if it.get("exige_validade") else None}})
 
     @bp.post("/full/remessas/<int:rid>/desetiquetar")
     @login_required
@@ -731,7 +811,9 @@ def registrar(bp):
             it = c.execute("SELECT * FROM full_itens WHERE id=? AND remessa_id=?", (iid, rid)).fetchone()
             if not it:
                 return jsonify({"error": "Produto não está nesta remessa."}), 404
-            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao) VALUES (?,?,?,?,?,1)", (rid, iid, q, _quem(), int(time.time())))
+            ult = c.execute("SELECT lote, validade FROM full_bips WHERE item_id=? AND reimpressao=2 AND desfeito=0 ORDER BY id DESC LIMIT 1", (iid,)).fetchone()
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, lote, validade) VALUES (?,?,?,?,?,1,?,?)",
+                      (rid, iid, q, _quem(), int(time.time()), ult["lote"] if ult else None, (ult["validade"] if ult else None) or it["validade_etq"]))
         return jsonify({"success": True})
 
     @bp.get("/full/etiquetas/fila")
@@ -748,13 +830,13 @@ def registrar(bp):
                       "AND (reservado_em IS NULL OR reservado_em<?) "
                       "AND remessa_id IN (SELECT id FROM full_remessas WHERE status IN ('aberta','separando','separada'))",
                       (tk, agora, agora - 86400, agora - RESERVA_S))
-            rows = c.execute("SELECT b.id, b.qtd, b.reimpressao, b.por, b.remessa_id, i.inventory_id, i.titulo, i.variacao, i.sku, r.nome AS remessa "
+            rows = c.execute("SELECT b.id, b.qtd, b.reimpressao, b.por, b.remessa_id, b.lote, b.validade, i.inventory_id, i.titulo, i.variacao, i.sku, r.nome AS remessa "
                              "FROM full_bips b JOIN full_itens i ON i.id=b.item_id JOIN full_remessas r ON r.id=b.remessa_id "
                              "WHERE b.reservado_por=? AND b.impresso_em IS NULL AND b.desfeito=0 ORDER BY b.id",
                              (tk,)).fetchall()
         return jsonify({"etiquetas": [{"bip_id": r["id"], "codigo": r["inventory_id"], "titulo": r["titulo"], "variacao": r["variacao"], "sku": r["sku"],
                                        "qtd": int(r["qtd"]), "reimpressao": bool(r["reimpressao"]), "por": r["por"], "remessa_id": r["remessa_id"],
-                                       "remessa": r["remessa"]} for r in rows]})
+                                       "remessa": r["remessa"], "lote": r["lote"], "validade": r["validade"]} for r in rows]})
 
     @bp.post("/full/etiquetas/impressas")
     @login_required
