@@ -12,7 +12,7 @@ O ML não deixa ler a remessa criada no painel, então a lista nasce de dois jei
    Roda em segundo plano (leva alguns minutos na 1ª vez) e fica guardado em full_sugestao; recalcula sozinho a cada 6 h
    quando alguém abre a tela, ou no botão "Recalcular".
 
-2) ARQUIVO DO PAINEL  (POST /full/importar, multipart "arquivo")
+2) ARQUIVO DO PAINEL  (POST /full/importar, multipart "arquivo"; ou JSON {texto, paginas} com o PDF lido no navegador)
    PDF de etiquetas, PDF/planilha do envio (xlsx/csv) que o painel do ML gera -> lê o texto, acha os códigos do Full
    (ou MLB / SKU) dos anúncios conhecidos e a quantidade: na etiqueta conta quantas vezes o código aparece; no resumo pega
    a quantidade da linha. Devolve a lista para conferir na tela antes de criar. Não grava nada."""
@@ -278,6 +278,10 @@ _RE_QTD = re.compile(r"(?:quantidade|qtd\.?|qtde|unidades|un\.?)\s*[:=]?\s*(\d{1
 
 def ler_arquivo(nome, b):
     texto, tabela, paginas = _texto(nome, b)
+    return ler_texto(texto, tabela, paginas)
+
+
+def ler_texto(texto, tabela=False, paginas=None):
     with db_session() as c:
         an = [dict(r) for r in c.execute("SELECT * FROM full_anuncios WHERE COALESCE(status,'') <> 'closed'").fetchall()]
     idx = {}                                      # código -> (prioridade, anúncio); inventory_id > MLB > SKU
@@ -362,14 +366,18 @@ def registrar(bp):
     @bp.post("/full/importar")
     @login_required
     def full_importar():
-        f = request.files.get("arquivo")
-        if not f:
-            return jsonify({"error": "Mande o arquivo (PDF, planilha ou CSV)."}), 400
-        b = f.read()
-        if len(b) > 30 * 1024 * 1024:
-            return jsonify({"error": "Arquivo grande demais (máx. 30 MB)."}), 400
+        d = request.get_json(silent=True) if request.is_json else None
         try:
-            r = ler_arquivo(f.filename, b)
+            if d and d.get("texto") is not None:       # PDF lido no navegador: chega só o texto (upload grande o servidor recusa)
+                r = ler_texto(str(d["texto"])[:20_000_000], bool(d.get("tabela")), d.get("paginas"))
+            else:
+                f = request.files.get("arquivo")
+                if not f:
+                    return jsonify({"error": "Mande o arquivo (PDF, planilha ou CSV)."}), 400
+                b = f.read()
+                if len(b) > 30 * 1024 * 1024:
+                    return jsonify({"error": "Arquivo grande demais (máx. 30 MB)."}), 400
+                r = ler_arquivo(f.filename, b)
         except Exception as e:
             return jsonify({"error": f"Não consegui ler o arquivo: {type(e).__name__}: {e}"[:300]}), 400
         if r["vazio"]:
