@@ -20,6 +20,7 @@ Regras de segurança contra 429 / travamento (o WMS roda com 1 worker, 1 thread)
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1358,6 +1359,11 @@ def _so_hoje_rodar(aplicar=True, log=None):
     """Uma rodada. aplicar=False: só diz o que faria (nada muda). -> resumo."""
     log = log or (lambda m: _slowlog.warning("[so-hoje] %s", m))
     hoje = _hoje()
+    if aplicar:
+        try:
+            _virada_se_preciso()
+        except Exception as e:
+            log(f"virada do dia falhou: {e}")
     res = {"hoje": hoje, "aplicado": bool(aplicar),
            "ml": {"ok": False, "conferidos": 0, "saiu": [], "voltou": [], "erro": None},
            "comercial": {"ok": False, "conferidos": 0, "saiu": [], "voltou": [], "erro": None}}
@@ -1531,6 +1537,196 @@ def separacao_so_hoje():
                 break
         time.sleep(0.5)
     return jsonify(_sohoje_estado())
+
+
+# ───────────────────────── Virada do dia: arquiva o que já acabou (Biel 16/11) ─────────────────────────
+# Ninguém precisa mais "limpar o banco": na primeira conferência do dia (abrir a Separação) e no cron da meia-noite, o que é de
+# dias anteriores E já terminou vira ARQUIVADO. Nada é apagado: pedido e itens ficam no banco e cada arquivamento fica em
+# pedidos_arquivo (quem/por quê/status de antes); "Voltar para a lista" desfaz. Não arquiva o que ainda tem que sair:
+#   - CONCLUIDO de antes de hoje: só se já foi carregado na Saída, se faz mais de 5 dias, ou se o ML diz que já saiu;
+#   - Mercado Livre aberto de antes de hoje: só se o ML diz cancelado ou já enviado/entregue (atrasado continua);
+#   - Comercial de antes de hoje: cancelado no Bling; Atendido no Bling se não foi separado aqui (feito fora do WMS),
+#     ou separado e já carregado na Saída / há mais de 5 dias.
+VIRADA_DIAS_CONCLUIDO = 5
+VIRADA_ATIVA = os.environ.get("WMS_VIRADA", "1").strip() not in ("0", "false", "nao", "não", "off")
+_virada_lock = threading.Lock()
+_ST_FIM_ML = ("shipped", "delivered", "not_delivered")
+
+
+def _arq_tabela(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS pedidos_arquivo (ml_id TEXT NOT NULL, em BIGINT NOT NULL, status_antes TEXT, motivo TEXT, "
+                 "por TEXT, origem TEXT, cliente TEXT, desfeito_em BIGINT, desfeito_por TEXT, PRIMARY KEY (ml_id, em))")
+    conn.execute("CREATE TABLE IF NOT EXISTS virada_dia (dia TEXT PRIMARY KEY, em BIGINT, resumo TEXT)")
+
+
+def _arquivar(conn, p, motivo, por):
+    conn.execute("UPDATE pedidos SET status='ARQUIVADO' WHERE id=? AND status=?", (p["id"], p["status"]))
+    r = conn.execute("SELECT status FROM pedidos WHERE id=?", (p["id"],)).fetchone()
+    if not r or r["status"] != "ARQUIVADO":
+        return False
+    em = int(time.time() * 1000)
+    conn.execute("INSERT INTO pedidos_arquivo (ml_id, em, status_antes, motivo, por, origem, cliente) VALUES (?,?,?,?,?,?,?)",
+                 (p["ml_id"], em, p["status"], str(motivo)[:200], str(por or "")[:80], str(p.get("origem") or "ML"), str(p.get("cliente_nome") or "")[:120]))
+    return True
+
+
+def _virada_rodar(aplicar=True, log=None):
+    """O que arquivar hoje. aplicar=False: só diz (nada muda)."""
+    log = log or (lambda m: _slowlog.warning("[virada] %s", m))
+    hoje = _hoje()
+    lim = _dia_ts(time.time(), -VIRADA_DIAS_CONCLUIDO)
+    with db_session() as conn:
+        _arq_tabela(conn)
+        _saida_tabelas(conn)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM pedidos WHERE status IN ('PENDENTE','PARCIAL','SEPARADO','CONCLUIDO','FORA_BLING')").fetchall()]
+        na_saida = {r["ml_id"] for r in conn.execute("SELECT ml_id FROM saida_bipes").fetchall()}
+    origem = lambda p: str(p.get("origem") or "ML").upper()
+    dia = lambda v: str(v or "")[:10] if re.match(r"\d{4}-\d{2}-\d{2}", str(v or "")) else ""
+    decid = []                                   # (pedido, motivo)
+    ml_ver, com_ver = [], []
+    for p in rows:
+        st, cri, upd = p["status"], dia(p.get("criado_em")), dia(p.get("atualizado_em"))
+        if st == "CONCLUIDO":
+            if not upd or upd >= hoje:
+                continue
+            if p["ml_id"] in na_saida:
+                decid.append((p, "concluído e carregado na Saída"))
+            elif upd < lim:
+                decid.append((p, f"concluído em {_br(upd)}"))
+            elif origem(p) == "ML" and p.get("ml_shipping_id"):
+                ml_ver.append(p)
+            continue
+        if not cri or cri >= hoje:
+            continue
+        if origem(p) == "ML" and p.get("ml_shipping_id") and st != "FORA_BLING":
+            ml_ver.append(p)
+        elif origem(p) == "COMERCIAL" and _pv_id(p):
+            com_ver.append(p)
+    res = {"hoje": hoje, "aplicado": bool(aplicar), "arquivados": [], "ml_conferidos": len(ml_ver), "com_conferidos": len(com_ver), "erros": []}
+    # Mercado Livre: cancelado ou já enviado
+    if ml_ver:
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            from services.ml_service import MercadoLivreService
+            ml = MercadoLivreService()
+            sids = [str(p["ml_shipping_id"]) for p in ml_ver]
+            _status_envio_ml(ml, sids[0])
+            with ThreadPoolExecutor(6) as ex:
+                envio = dict(zip(sids, ex.map(lambda s: _status_envio_ml(ml, s), sids)))
+            for p in ml_ver:
+                st_ml = (envio.get(str(p["ml_shipping_id"])) or (None,))[0]
+                if st_ml == "cancelled":
+                    decid.append((p, "cancelado no Mercado Livre"))
+                elif st_ml in _ST_FIM_ML:
+                    decid.append((p, "concluído; já saiu pelo Mercado Livre" if p["status"] == "CONCLUIDO" else "já saiu pelo Mercado Livre"))
+        except Exception as e:
+            res["erros"].append(f"ML: {str(e)[:150]}")
+    # Comercial: situação no Bling
+    if com_ver:
+        try:
+            b = _bling_svc()
+            if not b:
+                raise RuntimeError("sem cliente Bling")
+            for p in com_ver:
+                time.sleep(0.4)
+                try:
+                    dd = (b._get_json(f"/pedidos/vendas/{int(_pv_id(p))}", timeout=(10, 30)) or {}).get("data") or {}
+                    sid = str((dd.get("situacao") or {}).get("id") or "")
+                except Exception as e:
+                    if "404" in str(e):
+                        decid.append((p, "não existe mais no Bling"))
+                    continue
+                if sid == "12":
+                    decid.append((p, "cancelado no Bling"))
+                elif sid == "9":
+                    if p["status"] != "SEPARADO":
+                        decid.append((p, "Atendido no Bling (feito fora do WMS)"))
+                    elif p["ml_id"] in na_saida or dia(p.get("criado_em")) < lim:
+                        decid.append((p, "Atendido no Bling e já saiu"))
+        except Exception as e:
+            res["erros"].append(f"Bling: {str(e)[:150]}")
+    if decid:
+        with db_session() as conn:
+            _arq_tabela(conn)
+            for p, motivo in decid:
+                if not aplicar or _arquivar(conn, p, motivo, "virada do dia"):
+                    res["arquivados"].append({"ml_id": p["ml_id"], "cliente": p.get("cliente_nome"), "origem": origem(p),
+                                              "status_antes": p["status"], "motivo": motivo})
+    for x in res["arquivados"]:
+        log(f"{'arquivou' if aplicar else 'arquivaria'} {x['ml_id']} ({x.get('cliente')}, {x['status_antes']}): {x['motivo']}")
+    return res
+
+
+def _virada_se_preciso(log=None):
+    """Roda a virada uma vez por dia (o primeiro que chegar: cron da meia-noite ou a Separação aberta)."""
+    hoje = _hoje()
+    if not VIRADA_ATIVA or not _virada_lock.acquire(blocking=False):
+        return None
+    try:
+        with db_session() as conn:
+            _arq_tabela(conn)
+            if conn.execute("SELECT 1 FROM virada_dia WHERE dia=?", (hoje,)).fetchone():
+                return None
+        r = _virada_rodar(True, log)
+        with db_session() as conn:
+            conn.execute("DELETE FROM virada_dia WHERE dia=?", (hoje,))
+            conn.execute("INSERT INTO virada_dia (dia, em, resumo) VALUES (?,?,?)",
+                         (hoje, int(time.time()), json.dumps({"n": len(r["arquivados"]), "erros": r["erros"]}, ensure_ascii=False)))
+        return r
+    finally:
+        _virada_lock.release()
+
+
+@mapa_routes.get("/arquivados")
+@login_required
+def arquivados():
+    """Pedidos arquivados dos últimos N dias (padrão 7), mais recente primeiro, e quantos a virada de hoje arquivou."""
+    try:
+        dias = max(1, min(90, int(request.args.get("dias") or 7)))
+    except ValueError:
+        dias = 7
+    desde = int((time.time() - dias * 86400) * 1000)
+    with db_session() as conn:
+        _arq_tabela(conn)
+        rows = conn.execute("SELECT a.*, p.status AS st_agora FROM pedidos_arquivo a LEFT JOIN pedidos p ON p.ml_id = a.ml_id "
+                            "WHERE a.em >= ? ORDER BY a.em DESC LIMIT 500", (desde,)).fetchall()
+        v = conn.execute("SELECT * FROM virada_dia WHERE dia=?", (_hoje(),)).fetchone()
+    lista = [{"ml_id": r["ml_id"], "cliente": r["cliente"], "origem": r["origem"], "motivo": r["motivo"], "por": r["por"],
+              "status_antes": r["status_antes"], "em": int(r["em"] // 1000), "dia": _dia_ts(r["em"] // 1000),
+              "ativo": r["st_agora"] == "ARQUIVADO" and not r["desfeito_em"], "desfeito_por": r["desfeito_por"]} for r in rows]
+    resumo = json.loads(v["resumo"]) if v and v["resumo"] else None
+    return jsonify({"hoje": _hoje(), "virada": {"rodou": bool(v), "em": int(v["em"]) if v else None, **(resumo or {})}, "arquivados": lista})
+
+
+@mapa_routes.post("/pedidos/<path:ml_id>/arquivar")
+@login_required
+def arquivar_pedido(ml_id):
+    obs = str((request.get_json(silent=True) or {}).get("observacao") or "").strip()
+    with db_session() as conn:
+        _arq_tabela(conn)
+        p = conn.execute("SELECT * FROM pedidos WHERE ml_id=?", (ml_id,)).fetchone()
+        if not p:
+            return jsonify({"success": False, "error": "Pedido não encontrado."}), 404
+        p = dict(p)
+        if p["status"] == "ARQUIVADO":
+            return jsonify({"success": True, "ja_estava": True})
+        ok = _arquivar(conn, p, "arquivado na mão" + (f": {obs}" if obs else ""), _quem_saida())
+    return (jsonify({"success": True}) if ok else (jsonify({"success": False, "error": "O pedido mudou agora há pouco. Tente de novo."}), 409))
+
+
+@mapa_routes.post("/pedidos/<path:ml_id>/desarquivar")
+@login_required
+def desarquivar_pedido(ml_id):
+    with db_session() as conn:
+        _arq_tabela(conn)
+        a = conn.execute("SELECT * FROM pedidos_arquivo WHERE ml_id=? AND desfeito_em IS NULL ORDER BY em DESC LIMIT 1", (ml_id,)).fetchone()
+        p = conn.execute("SELECT status FROM pedidos WHERE ml_id=?", (ml_id,)).fetchone()
+        if not a or not p or p["status"] != "ARQUIVADO":
+            return jsonify({"success": False, "error": "Esse pedido não está arquivado."}), 404
+        conn.execute("UPDATE pedidos SET status=? WHERE ml_id=? AND status='ARQUIVADO'", (a["status_antes"] or "PENDENTE", ml_id))
+        conn.execute("UPDATE pedidos_arquivo SET desfeito_em=?, desfeito_por=? WHERE ml_id=? AND em=?", (int(time.time()), _quem_saida(), ml_id, a["em"]))
+    return jsonify({"success": True, "status": a["status_antes"] or "PENDENTE"})
 
 
 @mapa_routes.post("/saida/liberar")
