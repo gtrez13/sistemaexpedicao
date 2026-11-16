@@ -77,7 +77,7 @@ def _tabelas():
 
 COLS_NOVAS = {                                 # 16/11 tarde: frete do ML, kit (composição do Bling), lote/validade, identificação
     "full_remessas": [("frete", "TEXT"), ("data_envio", "TEXT"), ("origem", "TEXT")],
-    "full_itens": [("identificacao", "TEXT"), ("instrucoes", "TEXT"), ("exige_validade", "INTEGER"), ("comp", "TEXT")],
+    "full_itens": [("identificacao", "TEXT"), ("instrucoes", "TEXT"), ("exige_validade", "INTEGER"), ("comp", "TEXT"), ("etiquetado", "INTEGER")],
     "full_bips": [("lote", "TEXT"), ("validade", "TEXT"), ("detalhe", "TEXT"), ("fisico", "TEXT")],
 }
 
@@ -227,6 +227,10 @@ def _rem(c, rid, com_itens=True):
     d["n_itens"] = len(its)
     d["unidades"] = sum(int(x["qtd"] or 0) for x in its)
     d["separadas"] = sum(min(int(x["separado"] or 0), int(x["qtd"] or 0)) for x in its)
+    etq = [x for x in its if x.get("identificacao") != "codigo_universal"]
+    d["a_etiquetar"] = sum(int(x["qtd"] or 0) for x in etq)                     # etiquetas que a remessa precisa (kit = 1 por kit)
+    d["etiquetadas"] = sum(min(int(x.get("etiquetado") or 0), int(x["qtd"] or 0)) for x in etq)
+    d["prontas_para_etiquetar"] = sum(max(0, min(int(x["separado"] or 0), int(x["qtd"] or 0)) - int(x.get("etiquetado") or 0)) for x in etq)
     d["validade_minima"] = _limite_validade(d)
     if com_itens:
         d["itens"] = its
@@ -556,7 +560,7 @@ def registrar(bp):
             if lt.get("fefo_id"):
                 det["fefo_id"] = lt["fefo_id"]
             sem_etq = (it.get("identificacao") == "codigo_universal")
-            n_etq = 0 if sem_etq else etq
+            n_etq = 0                                  # etiqueta é na 2ª etapa (Etiquetar, na bancada): a separação não imprime
             agora = int(time.time())
             c.execute("UPDATE full_itens SET separado=?, comp=? WHERE id=?", (novo_sep, json.dumps(comp, ensure_ascii=False) if it["comp"] is not None else None, it["id"]))
             pronto = aqui or n_etq <= 0                # nada para imprimir (ou o aparelho imprime): não entra na fila
@@ -611,6 +615,15 @@ def registrar(bp):
             except Exception:
                 det = {"un": int(b["qtd"] or 0)}
             comp = _comp(it)
+            etqd = int(it.get("etiquetado") or 0)
+            if det.get("comp") and comp:
+                teste = [dict(cp) for cp in comp]
+                for j, n in det["comp"].items():
+                    teste[int(j)]["bip"] = max(0, int(teste[int(j)].get("bip") or 0) - int(n))
+                if _kits_feitos(teste, it["qtd"]) < etqd:
+                    return jsonify({"success": False, "error": "Esse kit já foi etiquetado: desfaça a etiqueta primeiro (Etiquetar > desfazer)."}), 409
+            elif int(it["separado"] or 0) - int(det.get("un") or 0) < etqd:
+                return jsonify({"success": False, "error": "Essa unidade já foi etiquetada: desfaça a etiqueta primeiro (Etiquetar > desfazer)."}), 409
             if det.get("comp") and comp:
                 for j, n in det["comp"].items():
                     cp = comp[int(j)]
@@ -626,6 +639,65 @@ def registrar(bp):
             impressa = b["impresso_em"] is not None and int(b["qtd"] or 0) > 0 and (b.get("impresso_por") or "") != "sem etiqueta"
             return jsonify({"success": True, "desfeito": unid, "etiquetas": int(b["qtd"] or 0), "impressa": impressa, "remessa": _rem(c, rid)})
 
+    @bp.post("/full/remessas/<int:rid>/etiquetar")
+    @login_required
+    def full_etiquetar(rid):
+        """2ª etapa, na bancada: bipa a unidade (ou o kit montado) já separada -> sai 1 etiqueta do Full dela. Não passa do separado."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        cod = str(d.get("codigo") or "").strip().split("*")[0].strip()
+        aqui = bool(d.get("imprime_aqui"))
+        k, kd = cod.upper(), re.sub(r"\D", "", cod).lstrip("0")
+        with db_session() as c:
+            r = _rem(c, rid)
+            if not r:
+                return jsonify({"success": False, "error": "Remessa não encontrada."}), 404
+            if r["status"] in ("enviada", "cancelada"):
+                return jsonify({"success": False, "error": "Remessa já fechada."}), 409
+            alvos = [a for a in _alvos(r["itens"], k, kd)]
+            if not alvos:
+                return jsonify({"success": False, "error": f"{cod} não está nesta remessa.", "tipo": "fora"}), 404
+            its = []
+            for _, it, _i in sorted(alvos, key=lambda a: a[1]["id"]):
+                if it not in its:
+                    its.append(it)
+            if all(it.get("identificacao") == "codigo_universal" for it in its):
+                return jsonify({"success": False, "error": "Esse produto não leva etiqueta: o Full lê o código de barras dele.", "tipo": "sem_etiqueta"}), 409
+            its = [it for it in its if it.get("identificacao") != "codigo_universal"]
+            it = next((x for x in its if int(x.get("etiquetado") or 0) < min(int(x["separado"] or 0), int(x["qtd"]))), None)
+            if not it:
+                x = its[0]
+                if int(x.get("etiquetado") or 0) >= int(x["qtd"]):
+                    return jsonify({"success": False, "error": f"{x['titulo'][:50]}: todas as etiquetas já saíram ({x['qtd']}).", "tipo": "completo"}), 409
+                return jsonify({"success": False, "error": f"{x['titulo'][:50]}: etiquetou tudo o que foi separado ({x['separado']}). Separe mais antes.",
+                                "tipo": "falta_separar"}), 409
+            if not it["inventory_id"]:
+                return jsonify({"success": False, "error": "Esse anúncio não tem código do Full: a etiqueta não sai. Chame o supervisor."}), 409
+            agora = int(time.time())
+            c.execute("UPDATE full_itens SET etiquetado=COALESCE(etiquetado,0)+1 WHERE id=?", (it["id"],))
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, impresso_em, impresso_por, detalhe) VALUES (?,?,?,?,?,2,?,?,?)",
+                      (rid, it["id"], 1, _quem(), agora, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None, json.dumps({"etq": 1})))
+            bip_id = c.execute("SELECT MAX(id) AS m FROM full_bips WHERE remessa_id=? AND item_id=? AND em=? AND reimpressao=2", (rid, it["id"], agora)).fetchone()["m"]
+            novo = _rem(c, rid)
+        itn = next(x for x in novo["itens"] if x["id"] == it["id"])
+        return jsonify({"success": True, "bip_id": bip_id, "item": itn, "kit": bool(it["comp"]),
+                        "por_kit": [{"sku": cp["sku"], "q": int(cp["q"]), "nome": cp.get("nome")} for cp in (it["comp"] or [])],
+                        "remessa": {k2: novo[k2] for k2 in ("unidades", "separadas", "etiquetadas", "a_etiquetar", "prontas_para_etiquetar", "status")},
+                        "etq_esperando": novo.get("etq_esperando", 0), "estacao": novo.get("estacao"),
+                        "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": 1}})
+
+    @bp.post("/full/remessas/<int:rid>/desetiquetar")
+    @login_required
+    def full_desetiquetar(rid):
+        _tabelas()
+        with db_session() as c:
+            b = c.execute("SELECT * FROM full_bips WHERE remessa_id=? AND desfeito=0 AND reimpressao=2 ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+            if not b:
+                return jsonify({"success": False, "error": "Nenhuma etiqueta para desfazer."}), 404
+            c.execute("UPDATE full_bips SET desfeito=1 WHERE id=?", (b["id"],))
+            c.execute("UPDATE full_itens SET etiquetado=CASE WHEN COALESCE(etiquetado,0)>0 THEN etiquetado-1 ELSE 0 END WHERE id=?", (b["item_id"],))
+            return jsonify({"success": True, "impressa": b["impresso_em"] is not None, "remessa": _rem(c, rid)})
+
     @bp.post("/full/remessas/<int:rid>/status")
     @login_required
     def full_status(rid):
@@ -637,6 +709,8 @@ def registrar(bp):
             r = _rem(c, rid, False)
             if not r:
                 return jsonify({"error": "Remessa não encontrada."}), 404
+            if st == "separada" and (r["separadas"] < r["unidades"] or r["etiquetadas"] < r["a_etiquetar"]):
+                return jsonify({"error": f"Ainda falta: separadas {r['separadas']}/{r['unidades']}, etiquetadas {r['etiquetadas']}/{r['a_etiquetar']}."}), 409
             if st == "cancelada" and r["separadas"] > 0:
                 return jsonify({"error": "Já tem unidade separada: desfaça os bips antes de cancelar."}), 409
             c.execute("UPDATE full_remessas SET status=?, atualizado_em=?, fechado_por=?, fechado_em=? WHERE id=?",
