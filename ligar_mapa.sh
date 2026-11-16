@@ -36,7 +36,7 @@ if ! systemctl is-active --quiet wms-russia.service; then
   echo "O serviço não subiu com os arquivos novos: voltei tudo como estava. Nada mudou."
   exit 1
 fi
-code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/mapa/layout)
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/mapa/layout || true)
 echo "OK: serviço no ar, /api/mapa/layout respondeu $code (401 = existe, pede login)"
 echo "recebimento_routes.py: $REC"
 venv/bin/python - <<'PY' || true
