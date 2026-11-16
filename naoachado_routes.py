@@ -13,15 +13,19 @@ Endpoints (url_prefix="/api"; todos exigem login):
     POST /api/nao-achado/<id>/reprocessar admin: refaz o que falhou (zerar no Bling / avisar o Velaplace)
     GET  /api/nao-achado/resumo          supervisor/admin: contadores (abertos, vencidos, a decidir)
 
-ÚLTIMA ETAPA (admin com confirmar_sem_estoque=true): o WMS zera o saldo do produto NO DEPÓSITO da
-LHVMed (BLING_DEPOSITO_ID) no Bling (lançamento de balanço = 0), confere o saldo depois e avisa o
-Velaplace (VELAPLACE_API_URL + VELAPLACE_TOKEN; sem isso o aviso fica "simulado").
-Só roda com NAO_ACHADO_ZERAR_BLING=1 no ambiente do serviço (senão fica "desligado" e nada é escrito no Bling).
-Falha nunca derruba a decisão: o resultado fica gravado e o admin pode "reprocessar".
+ZERAR NO BLING (Biel 16/11: "precisariam ir para o Bling e zerar o estoque, e subir uma mensagem para o supervisor"):
+NA HORA DO RELATO o WMS zera o saldo do produto NO DEPÓSITO da LHVMed (BLING_DEPOSITO_ID, senão BLING_DEPOSITO_LOCAL_ID)
+com balanço = 0, só se o saldo for maior que 0 (negativo/zero não mexe), guarda o saldo de antes, confere e avisa o Velaplace.
+O supervisor recebe o aviso na tela (resumo.novos) e responde: "não achei" (explica) ou "achei" -> o WMS devolve o
+saldo de antes no Bling (lançamento de entrada). A decisão do admin não zera de novo.
+NAO_ACHADO_ZERAR_QUANDO=relato (padrão) | decisao (jeito antigo: só quando o admin confirma).
+Só escreve no Bling com NAO_ACHADO_ZERAR_BLING=1 (senão fica "desligado"). Falha nunca derruba nada: fica gravado e o
+admin pode "reprocessar". NAO_ACHADO_DISCORD_WEBHOOK (opcional): manda o aviso também no Discord.
 """
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 from flask import Blueprint, jsonify, request
@@ -114,9 +118,37 @@ def _zerar_ligado() -> bool:
     return os.environ.get("NAO_ACHADO_ZERAR_BLING", "0").strip() in ("1", "true", "True", "sim")
 
 
+def _zerar_no_relato() -> bool:
+    return os.environ.get("NAO_ACHADO_ZERAR_QUANDO", "relato").strip().lower() != "decisao"
+
+
+def _deposito() -> str:
+    return (os.environ.get("BLING_DEPOSITO_ID", "").strip() or os.environ.get("BLING_DEPOSITO_LOCAL_ID", "").strip() or "10488672491")
+
+
+def _bling_req(fn, *a, **k):
+    """Chamada ao Bling com 3 tentativas no 429 (limite de requisições: o Bling recusa antes de processar)."""
+    for t in range(4):
+        r = fn(*a, **k)
+        if getattr(r, "status_code", 0) != 429:
+            return r
+        time.sleep(1.5 * (t + 1))
+    return r
+
+
+def _produto_id(bs, sku):
+    r = _bling_req(bs._get, "/produtos", params={"codigo": sku, "limite": 5})
+    if r.status_code != 200:
+        raise RuntimeError(f"Bling produtos HTTP {r.status_code}")
+    prods = [p for p in ((r.json() or {}).get("data") or []) if str(p.get("codigo", "")).lower() == sku.lower()]
+    if not prods:
+        raise LookupError("Produto não encontrado no Bling pelo código (SKU).")
+    return int(prods[0]["id"])
+
+
 def _saldo_no_deposito(bs, produto_id, deposito):
     """Saldo físico do produto SÓ no depósito informado (None se não deu para ler)."""
-    r = bs._get("/estoques/saldos", params=[("idsProdutos[]", str(int(produto_id)))])
+    r = _bling_req(bs._get, "/estoques/saldos", params=[("idsProdutos[]", str(int(produto_id)))])
     if r.status_code != 200:
         raise RuntimeError(f"Bling saldos HTTP {r.status_code}")
     rows = (r.json() or {}).get("data") or []
@@ -131,25 +163,20 @@ def zerar_no_bling(sku: str, motivo: str):
     """-> (status, saldo_anterior, mensagem). status: ok | ja_zerado | desligado | erro."""
     if not _zerar_ligado():
         return "desligado", None, "NAO_ACHADO_ZERAR_BLING não está ligado: nada foi escrito no Bling."
-    dep = os.environ.get("BLING_DEPOSITO_ID", "").strip()
-    if not dep:
-        return "erro", None, "BLING_DEPOSITO_ID não definido: não sei qual depósito zerar."
+    dep = _deposito()
     try:
         from services.bling_service import BlingService
         bs = BlingService()
-        r = bs._get("/produtos", params={"codigo": sku, "limite": 5})
-        if r.status_code != 200:
-            return "erro", None, f"Bling produtos HTTP {r.status_code}"
-        prods = [p for p in ((r.json() or {}).get("data") or []) if str(p.get("codigo", "")).lower() == sku.lower()]
-        if not prods:
-            return "erro", None, "Produto não encontrado no Bling pelo código (SKU)."
-        pid = int(prods[0]["id"])
+        try:
+            pid = _produto_id(bs, sku)
+        except LookupError as e:
+            return "erro", None, str(e)
         antes = _saldo_no_deposito(bs, pid, dep)
-        if antes == 0:
-            return "ja_zerado", 0.0, "O saldo já era 0 no depósito da LHVMed."
+        if antes <= 0:
+            return "ja_zerado", antes, f"O saldo já era {antes:g} no depósito da LHVMed: nada foi lançado."
         corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "B", "quantidade": 0,
                  "observacoes": ("WMS: não achado em estoque. " + (motivo or ""))[:250]}
-        w = bs._post("/estoques", json=corpo)
+        w = _bling_req(bs._post, "/estoques", json=corpo)
         if w.status_code not in (200, 201):
             return "erro", antes, f"Bling recusou o balanço: HTTP {w.status_code} {w.text[:200]}"
         depois = _saldo_no_deposito(bs, pid, dep)
@@ -158,6 +185,75 @@ def zerar_no_bling(sku: str, motivo: str):
         return "ok", antes, f"Saldo {antes:g} -> 0 no depósito {dep}."
     except Exception as e:   # nunca derruba a decisão do admin
         return "erro", None, f"{type(e).__name__}: {e}"[:300]
+
+
+def devolver_no_bling(sku: str, qtd: float, motivo: str):
+    """Achou o produto: lança ENTRADA da quantidade que foi zerada. -> (status, mensagem). status: ok | erro | desligado."""
+    if not _zerar_ligado():
+        return "desligado", "NAO_ACHADO_ZERAR_BLING não está ligado: nada foi escrito no Bling."
+    if not qtd or qtd <= 0:
+        return "ok", "Nada a devolver (o saldo já era zero ou negativo quando foi relatado)."
+    dep = _deposito()
+    try:
+        from services.bling_service import BlingService
+        bs = BlingService()
+        pid = _produto_id(bs, sku)
+        antes = _saldo_no_deposito(bs, pid, dep)
+        corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "E", "quantidade": float(qtd),
+                 "observacoes": ("WMS: produto achado, devolve o saldo zerado. " + (motivo or ""))[:250]}
+        w = _bling_req(bs._post, "/estoques", json=corpo)
+        if w.status_code not in (200, 201):
+            return "erro", f"Bling recusou a entrada: HTTP {w.status_code} {w.text[:200]}"
+        depois = _saldo_no_deposito(bs, pid, dep)
+        return "ok", f"Saldo {antes:g} -> {depois:g} no depósito {dep} (+{float(qtd):g})."
+    except Exception as e:
+        return "erro", f"{type(e).__name__}: {e}"[:300]
+
+
+def _zerar_agora(nid):
+    """Segundo plano, logo depois do relato: zera no Bling, avisa o Velaplace e (se configurado) o Discord."""
+    try:
+        with db_session() as conn:
+            r = conn.execute("SELECT * FROM nao_achado WHERE id=?", (nid,)).fetchone()
+            if not r or r["estoque_status"] in ("ok", "ja_zerado", "restaurado"):
+                return
+            conn.execute("UPDATE nao_achado SET estoque_status='zerando' WHERE id=?", (nid,))
+        motivo = f"Não achado na separação por {r['reportado_por'] or '?'}" + (f" (pedido {r['ml_id']})" if r["ml_id"] else "")
+        est, antes, msg = zerar_no_bling(r["sku"], motivo)
+        vst = vmsg = None
+        if est == "ok":
+            vst, vmsg = avisar_velaplace({
+                "evento": "estoque_zerado", "sku": r["sku"], "produto": r["nome"], "quantidade_anterior": antes,
+                "motivo": motivo, "ocorrencia_id": nid, "origem": "wms-lhvmed", "confirmado_por": r["reportado_por"],
+                "confirmado_em": int(time.time())})
+        with db_session() as conn:
+            conn.execute("UPDATE nao_achado SET estoque_status=?, estoque_anterior=?, estoque_msg=?, estoque_zerado_em=?, "
+                         "velaplace_status=?, velaplace_msg=? WHERE id=?",
+                         (est, antes, (msg or "")[:300], int(time.time()) if est in ("ok", "ja_zerado") else None,
+                          vst, (vmsg or "")[:300] or None, nid))
+        _avisar_discord(r, est, antes)
+    except Exception as e:
+        print(f"⚠️ não achado {nid}: zerar no Bling falhou: {e}", flush=True)
+        try:
+            with db_session() as conn:
+                conn.execute("UPDATE nao_achado SET estoque_status='erro', estoque_msg=? WHERE id=?", (str(e)[:300], nid))
+        except Exception:
+            pass
+
+
+def _avisar_discord(r, est, antes):
+    url = os.environ.get("NAO_ACHADO_DISCORD_WEBHOOK", "").strip()
+    if not url:
+        return
+    try:
+        import requests
+        zer = f"Estoque zerado no Bling ({antes:g} -> 0)." if est == "ok" else "Estoque no Bling não foi alterado." if est != "ja_zerado" else "No Bling já estava sem saldo."
+        txt = (f"**Produto não encontrado na separação**\n{r['nome'] or r['sku']} ({r['sku']}), {r['qtd']:g} un"
+               f"{', pedido ' + r['ml_id'] if r['ml_id'] else ''}. Relatado por {r['reportado_por'] or '?'}.\n{zer}\n"
+               f"Supervisor: responda o que houve em Não achados.")
+        requests.post(url, json={"content": txt[:1900]}, timeout=8)
+    except Exception as e:
+        print(f"⚠️ não achado: Discord falhou: {e}", flush=True)
 
 
 def avisar_velaplace(dados: dict):
@@ -180,8 +276,10 @@ def avisar_velaplace(dados: dict):
 
 def _executar_final(conn, nid, r, parecer):
     """Zera no Bling e avisa o Velaplace; grava o resultado na ocorrência."""
-    if r["estoque_status"] in ("ok", "ja_zerado"):       # reprocesso: só o aviso falhou, não zera de novo
+    if r["estoque_status"] in ("ok", "ja_zerado", "restaurado", "zerando"):   # já tratado (no relato / achou): não zera de novo
         est, antes, msg = r["estoque_status"], r["estoque_anterior"], r["estoque_msg"] or ""
+        if est in ("restaurado", "zerando"):
+            return {"estoque_status": est, "estoque_msg": msg, "velaplace_status": r["velaplace_status"], "velaplace_msg": r["velaplace_msg"]}
     else:
         est, antes, msg = zerar_no_bling(r["sku"], r["explicacao"] or "")
     agora = int(time.time())
@@ -243,7 +341,11 @@ def criar():
              (d.get("obs") or "")[:300], _quem(), agora, prazo))
         nid = conn.execute("SELECT id FROM nao_achado WHERE sku_key=? AND reportado_em=? ORDER BY id DESC LIMIT 1",
                            (key, agora)).fetchone()["id"]
-    return jsonify({"success": True, "id": nid, "prazo_em": prazo, "prazo_horas": horas_prazo()})
+    zera = _zerar_no_relato()
+    if zera:
+        threading.Thread(target=_zerar_agora, args=(nid,), daemon=True).start()
+    return jsonify({"success": True, "id": nid, "prazo_em": prazo, "prazo_horas": horas_prazo(),
+                    "zera_bling": zera and _zerar_ligado()})
 
 
 @naoachado_routes.get("/nao-achado")
@@ -277,7 +379,10 @@ def resumo():
         ab = conn.execute("SELECT COUNT(*) AS n FROM nao_achado WHERE status='aberto'").fetchone()["n"]
         ve = conn.execute("SELECT COUNT(*) AS n FROM nao_achado WHERE status='aberto' AND prazo_em < ?", (agora,)).fetchone()["n"]
         ex = conn.execute("SELECT COUNT(*) AS n FROM nao_achado WHERE status='explicado'").fetchone()["n"]
-    return jsonify({"abertos": ab, "vencidos": ve, "a_decidir": ex})
+        novos = conn.execute("SELECT id, sku, nome, qtd, ml_id, reportado_por, reportado_em, estoque_status, estoque_anterior "
+                             "FROM nao_achado WHERE status='aberto' AND reportado_em > ? ORDER BY id DESC LIMIT 20",
+                             (agora - 3 * 86400,)).fetchall()
+    return jsonify({"abertos": ab, "vencidos": ve, "a_decidir": ex, "novos": [dict(x) for x in novos]})
 
 
 @naoachado_routes.post("/nao-achado/<int:nid>/explicar")
@@ -299,6 +404,37 @@ def explicar(nid):
         conn.execute("UPDATE nao_achado SET status='explicado', explicacao=?, explicado_por=?, explicado_em=? WHERE id=?",
                      (texto[:1000], _quem(), int(time.time()), nid))
     return jsonify({"success": True})
+
+
+@naoachado_routes.post("/nao-achado/<int:nid>/achei")
+@login_required
+def achei(nid):
+    """Supervisor/admin: o produto foi achado. Devolve no Bling o saldo que foi zerado e fecha como explicado."""
+    if not eh_gestor():
+        return jsonify({"error": "Somente supervisor/admin."}), 403
+    d = request.get_json(silent=True) or {}
+    texto = (d.get("texto") or "").strip()
+    if len(texto) < 10:
+        return jsonify({"error": "Conte onde estava o produto (mín. 10 caracteres)."}), 400
+    garantir_tabelas()
+    with db_session() as conn:
+        r = conn.execute("SELECT * FROM nao_achado WHERE id=?", (nid,)).fetchone()
+        if not r:
+            return jsonify({"error": "Ocorrência não encontrada."}), 404
+        if r["status"] != "aberto":
+            return jsonify({"error": "Esta ocorrência já foi respondida."}), 409
+        if r["estoque_status"] == "zerando":
+            return jsonify({"error": "O WMS ainda está zerando no Bling. Tente de novo em alguns segundos."}), 409
+    est, msg = ("ok", "Estoque não tinha sido zerado: nada a devolver.")
+    if r["estoque_status"] == "ok":
+        est, msg = devolver_no_bling(r["sku"], float(r["estoque_anterior"] or 0), f"Achado por {_quem()}: {texto}")
+        if est != "ok":
+            return jsonify({"error": f"Não devolvi o estoque no Bling: {msg}"}), 502
+    with db_session() as conn:
+        conn.execute("UPDATE nao_achado SET status='explicado', explicacao=?, explicado_por=?, explicado_em=?, "
+                     "estoque_status=CASE WHEN estoque_status='ok' THEN 'restaurado' ELSE estoque_status END, estoque_msg=? WHERE id=?",
+                     (("ACHADO: " + texto)[:1000], _quem(), int(time.time()), msg[:300], nid))
+    return jsonify({"success": True, "estoque_msg": msg})
 
 
 @naoachado_routes.post("/nao-achado/<int:nid>/decidir")
