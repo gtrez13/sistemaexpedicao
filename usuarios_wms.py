@@ -70,12 +70,22 @@ def achar_tabela(c):
 def esquema_hash(c, T):
     """Mesmo formato das senhas que já existem + o que o código do servidor usa para conferir."""
     h = next((r[0] for r in c.execute(f"SELECT {T['senha']} FROM {T['tabela']} WHERE {T['senha']} IS NOT NULL").fetchall() if r[0]), "")
-    fonte = ""
-    for f in ["app.py", "user_routes.py", "auth_routes.py", "models.py"] + glob.glob("*auth*.py") + glob.glob("*user*.py"):
-        try:
-            fonte += open(f, encoding="utf-8", errors="ignore").read()
-        except OSError:
-            pass
+    fonte, onde = "", []
+    for raiz, dirs, arqs in os.walk("."):        # o código do login pode estar em qualquer pasta (fora do venv)
+        dirs[:] = [d for d in dirs if d not in ("venv", ".venv", "env", ".git", "__pycache__", "node_modules", "site-packages")]
+        for nome in arqs:
+            if not nome.endswith(".py") or nome in ("usuarios_wms.py",):
+                continue
+            f = os.path.join(raiz, nome)
+            try:
+                txt = open(f, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            if any(k in txt for k in ("checkpw", "bcrypt", "check_password_hash", "passlib")):
+                fonte += txt
+                onde.append(f[2:])
+    if onde:
+        print("Login confere a senha em: " + ", ".join(sorted(onde)[:6]))
     if h.startswith(("pbkdf2:", "scrypt:")):
         if fonte and "check_password_hash" not in fonte:
             sys.exit("As senhas são do werkzeug, mas não achei check_password_hash no código do servidor: parei sem mexer.")
