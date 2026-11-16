@@ -2187,3 +2187,11 @@ def _foto_url(prod: dict):
             if link:
                 return link
     return None
+
+
+# ───────────────────────── Módulo FULL (rotas em full_routes.py) ─────────────────────────
+try:
+    import full_routes as _full_routes
+    _full_routes.registrar(mapa_routes)
+except Exception as _e:                      # sem o arquivo novo: o resto do mapa segue no ar
+    _slowlog.warning("[full] módulo Full não carregou: %s", _e)
