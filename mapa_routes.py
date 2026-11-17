@@ -2233,3 +2233,11 @@ if _ML:
         _ML.registrar(mapa_routes)
     except Exception as _e:
         _slowlog.warning("[mapa] layout montável não carregou: %s", _e)
+
+
+# ───────────────────────── Tarefas + inventário rotativo (rotas em tarefas_routes.py) ─────────────────────────
+try:
+    import tarefas_routes as _tarefas
+    _tarefas.registrar(mapa_routes)
+except Exception as _e:                      # sem o arquivo novo: o resto segue no ar
+    _slowlog.warning("[tarefas] módulo de tarefas não carregou: %s", _e)
