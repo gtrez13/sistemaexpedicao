@@ -30,7 +30,8 @@ done
 # picking e recebimento: só troca se o do servidor for o de sempre
 AVISOS=""
 for f in picking_routes.py recebimento_routes.py; do
-  if curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$BASE/$f" -o .base 2>/dev/null && cmp -s .base "$f"; then
+  B=$BASE; [ "$f" = recebimento_routes.py ] && B=44cf75c      # recebimento: o de antes do mapa montável
+  if curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$B/$f" -o .base 2>/dev/null && cmp -s .base "$f"; then
     mv "$f.novo" "$f"; AVISOS="$AVISOS\n$f: atualizado"
   else
     rm -f "$f.novo"; AVISOS="$AVISOS\n$f: NÃO trocado (o do servidor é diferente do esperado; me mande: md5sum $f)"
