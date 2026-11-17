@@ -511,6 +511,14 @@ def _pessoas(c):
 
 # ─────────────────────────── rotas ───────────────────────────
 def registrar(bp):
+    # cadastro só por convite (convites_routes.py): vem junto com as tarefas para não mexer de novo no mapa_routes.py
+    try:
+        import convites_routes
+        convites_routes.registrar(bp)
+    except Exception as e:                     # sem o arquivo: o cadastro continua como era
+        import logging
+        logging.getLogger("gunicorn.error").warning("[convites] não carregou: %s", e)
+
     @bp.get("/tarefas")
     @login_required
     def tarefas_listar():

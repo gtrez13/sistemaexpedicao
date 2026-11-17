@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tarefas + inventário rotativo (Biel 17/11), LHVMed: tarefas_routes.py (novo) + 8 linhas no fim do mapa_routes.py que ligam o módulo.
+# Tarefas + inventário rotativo + cadastro só por convite (Biel 17/11), LHVMed: tarefas_routes.py e convites_routes.py (novos)
+# + 8 linhas no fim do mapa_routes.py que ligam o módulo. CADASTRO_SO_CONVITE=0 no .env volta o cadastro aberto.
 # Inventário: depois das 14h, seg-sex, o WMS monta a contagem do dia pelo mapa; o aviso só aparece na tela nova (Início).
 # Ajustes no .env (opcional): INV_HORA=14:00  INV_DIAS=12345  INV_LIGADO=1  INV_BLING_ESCREVER=1  INV_AVISO_ADMIN=0
 # Backup + desfazer; se o serviço não subir, volta sozinho.
@@ -23,6 +24,10 @@ fi
 rm -f .base .base2 .bloco
 curl -fsSL "$G/$REF/tarefas_routes.py" -o tarefas_routes.py.novo
 venv/bin/python -m py_compile tarefas_routes.py.novo
+[ -f convites_routes.py ] && cp -p convites_routes.py "$BKD/"
+[ -f convites_routes.py ] || TIRAR="$TIRAR && rm -f convites_routes.py"
+curl -fsSL "$G/$REF/convites_routes.py" -o convites_routes.py.novo
+venv/bin/python -m py_compile convites_routes.py.novo
 if ! grep -q "import tarefas_routes" mapa_routes.py; then
   cat >> mapa_routes.py <<'PYEOF'
 
@@ -36,19 +41,22 @@ except Exception as _e:                      # sem o arquivo novo: o resto segue
 PYEOF
 fi
 if ! venv/bin/python -m py_compile mapa_routes.py; then
-  cp -p "$BKD/mapa_routes.py" .; rm -f tarefas_routes.py.novo
+  cp -p "$BKD/mapa_routes.py" .; rm -f tarefas_routes.py.novo convites_routes.py.novo
   echo "mapa_routes.py não compilou com as linhas novas: voltei como estava. Nada mudou."; exit 1
 fi
 mv tarefas_routes.py.novo tarefas_routes.py
+mv convites_routes.py.novo convites_routes.py
 sudo systemctl restart wms-russia.service
 sleep 4
 if ! systemctl is-active --quiet wms-russia.service; then
-  cp -p "$BKD"/*.py .; [ -f "$BKD/tarefas_routes.py" ] || rm -f tarefas_routes.py
+  cp -p "$BKD"/*.py .; [ -f "$BKD/tarefas_routes.py" ] || rm -f tarefas_routes.py; [ -f "$BKD/convites_routes.py" ] || rm -f convites_routes.py
   sudo systemctl restart wms-russia.service
   echo "O serviço não subiu com os arquivos novos: voltei tudo como estava. Nada mudou."; exit 1
 fi
 code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/tarefas/aviso || true)
 echo "OK: serviço no ar (/api/tarefas/aviso respondeu $code; 401 = existe, pede login)"
+cad=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8000/api/auth/register-public || true)
+echo "Cadastro sem convite agora responde $cad (403 = travado, só com link de convite)"
 venv/bin/python - <<'PY' || true
 import tarefas_routes as T
 T._tabelas()
