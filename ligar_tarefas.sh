@@ -15,11 +15,12 @@ cp -p mapa_routes.py "$BKD/"; [ -f tarefas_routes.py ] && cp -p tarefas_routes.p
 TIRAR=""; [ -f tarefas_routes.py ] || TIRAR=" && rm -f tarefas_routes.py"
 # o mapa_routes.py do servidor fica como está: só acrescento no fim as linhas que ligam o módulo novo
 curl -fsSL "$G/$BASE/mapa_routes.py" -o .base
-if ! cmp -s .base mapa_routes.py; then
+cp .base .base2; sed -n '/^# ─* Tarefas + inventário rotativo/,$p' mapa_routes.py > .bloco; [ -s .bloco ] && { printf '\n\n' >> .base2; cat .bloco >> .base2; }
+if ! cmp -s .base mapa_routes.py && ! cmp -s .base2 mapa_routes.py; then
   echo "Aviso: o mapa_routes.py do servidor é diferente do que o ligar_dia.sh baixou. Não troco ele; só acrescento as linhas do módulo."
   echo "Diferença (para me mandar):"; diff .base mapa_routes.py | head -40; echo "(fim da diferença)"
 fi
-rm -f .base
+rm -f .base .base2 .bloco
 curl -fsSL "$G/$REF/tarefas_routes.py" -o tarefas_routes.py.novo
 venv/bin/python -m py_compile tarefas_routes.py.novo
 if ! grep -q "import tarefas_routes" mapa_routes.py; then

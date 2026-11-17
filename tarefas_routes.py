@@ -533,7 +533,22 @@ def registrar(bp):
                                  "OR (status = 'feita' AND (pego_por = ? OR feito_por = ? OR para = ?) AND feito_em >= ?) "
                                  "ORDER BY criado_em DESC LIMIT 200", (eu, eu, eu, eu, eu, eu, ini)).fetchall()
             vistas = {int(r["tarefa_id"]) for r in c.execute("SELECT tarefa_id FROM tarefa_vista WHERE usuario=?", (eu,)).fetchall()}
+            # inventário em andamento: quantas posições já foram contadas na rodada de agora (Painel TV e Início)
+            ids_inv = [int(r["id"]) for r in rows if r["tipo"] == "inventario" and r["status"] in ("andamento", "recontar", "conferindo")]
+            contadas = {}
+            for tid in ids_inv:
+                t = next(dict(r) for r in rows if int(r["id"]) == tid)
+                try:
+                    rod = int(json.loads(t.get("ref") or "{}").get("rodada", 1))
+                except Exception:
+                    rod = 1
+                n = c.execute("SELECT COUNT(*) AS n FROM (SELECT DISTINCT porta_palet, posicao FROM inv_contagem WHERE tarefa_id=? AND rodada=?) x",
+                              (tid, rod)).fetchone()["n"]
+                contadas[tid] = int(n or 0)
         lista = [_fmt(dict(r), vistas) for r in rows]
+        for t in lista:
+            if t["id"] in contadas:
+                t["inventario"]["contadas"] = contadas[t["id"]]
         if not todas and _role() == "admin" and _env("INV_AVISO_ADMIN", "0") != "1":
             lista = [t for t in lista if not (t["tipo"] == "inventario" and t["status"] == "aberta")]
         return jsonify({"tarefas": lista, "eu": eu, "gestor": _gestor(), "agora": int(time.time())})
