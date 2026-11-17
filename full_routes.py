@@ -71,6 +71,7 @@ def _tabelas():
                   "desfeito INTEGER NOT NULL DEFAULT 0, reimpressao INTEGER NOT NULL DEFAULT 0, impresso_em BIGINT, impresso_por TEXT, "
                   "reservado_por TEXT, reservado_em BIGINT)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_full_bips_fila ON full_bips (impresso_em, desfeito)")
+        c.execute(f"CREATE TABLE IF NOT EXISTS full_atualizacoes (id {pk}, remessa_id BIGINT, em BIGINT, por TEXT, tipo TEXT, antes TEXT, mudancas TEXT)")
     _colunas()
     _ok_tab = True
 
@@ -215,6 +216,22 @@ def _limite_validade(rem):
     return (d + timedelta(days=VALIDADE_DIAS)).isoformat()
 
 
+def _sobra(it, q):
+    """Unidades já separadas além da quantidade q (PDF novo pediu menos ou tirou o produto): voltam para a prateleira."""
+    if it.get("comp"):
+        return sum(max(0, int(cp.get("bip") or 0) - int(cp["q"]) * q) for cp in it["comp"])
+    return max(0, int(it.get("separado") or 0) - q)
+
+
+def _mexeu(it):
+    return int(it.get("separado") or 0) > 0 or int(it.get("etiquetado") or 0) > 0 or any(int(cp.get("bip") or 0) for cp in (it.get("comp") or []))
+
+
+def _chave_full(x):
+    inv = str(x.get("inventory_id") or "").strip().upper()
+    return inv or f"CH:{x.get('chave')}"
+
+
 def _rem(c, rid, com_itens=True):
     r = c.execute("SELECT * FROM full_remessas WHERE id=?", (rid,)).fetchone()
     if not r:
@@ -224,6 +241,10 @@ def _rem(c, rid, com_itens=True):
     for it in its:
         it["comp"] = _comp(it)
         it["exige_validade"] = bool(it.get("exige_validade"))
+        it["sobra"] = _sobra(it, int(it["qtd"] or 0))                          # PDF novo pediu menos: unidades para devolver
+        it["etq_sobra"] = max(0, int(it.get("etiquetado") or 0) - int(it["qtd"] or 0))
+    d["sobra"] = sum(x["sobra"] for x in its)
+    d["etq_sobra"] = sum(x["etq_sobra"] for x in its)
     d["n_itens"] = len(its)
     d["unidades"] = sum(int(x["qtd"] or 0) for x in its)
     d["separadas"] = sum(min(int(x["separado"] or 0), int(x["qtd"] or 0)) for x in its)
@@ -549,6 +570,181 @@ def registrar(bp):
             threading.Thread(target=_completar_kits, args=(rid,), daemon=True).start()
         return jsonify({"success": True, "remessa": out})
 
+    @bp.post("/full/remessas/<int:rid>/atualizar")
+    @login_required
+    def full_atualizar(rid):
+        """PDF novo do mesmo frete (Biel 17/11: o painel do ML mudou a remessa e não dá para perder o que já foi feito).
+        Troca a lista da remessa pela do PDF sem mexer no que já foi separado/etiquetado. Casa pelo código do Full
+        (inventory_id), senão pela chave do anúncio. Pediu menos do que já separaram: a diferença vira sobra (devolver
+        à prateleira, botão Devolvi). Produto que saiu do PDF: some se ninguém mexeu; se já mexeram fica com 0 e sobra.
+        aplicar=0 só mostra o que muda; aplicar=1 grava (e guarda a lista de antes em full_atualizacoes)."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        aplicar = bool(d.get("aplicar"))
+        frete = re.sub(r"\D", "", str(d.get("frete") or ""))[:20] or None
+        with db_session() as c:
+            r = _rem(c, rid)
+            if not r:
+                return jsonify({"error": "Remessa não encontrada."}), 404
+            if r["status"] in ("enviada", "cancelada"):
+                return jsonify({"error": f"Remessa já {'enviada ao Full' if r['status'] == 'enviada' else 'cancelada'}: não dá para atualizar."}), 409
+            if frete and r.get("frete") and frete != str(r["frete"]) and not d.get("outro_frete"):
+                return jsonify({"error": f"Esse PDF é do Frete #{frete} e esta remessa é do Frete #{r['frete']}. Abra a remessa certa.",
+                                "tipo": "outro_frete"}), 409
+            try:
+                lidos = [y for y in (_item_de(c, p) for p in d.get("itens") or []) if y]
+            except LookupError as e:
+                return jsonify({"error": str(e)}), 400
+            if not lidos:
+                return jsonify({"error": "O PDF não trouxe nenhum produto."}), 400
+            pdf = {}
+            for x, q in lidos:                                  # o mesmo código do Full em duas linhas do PDF: soma
+                k = _chave_full(x)
+                pdf[k] = (pdf[k][0], pdf[k][1] + q) if k in pdf else (x, q)
+            usados, mud = set(), []
+            for it in r["itens"]:
+                k = _chave_full(it)
+                if k not in pdf or k in usados:
+                    k = next((kk for kk, (x, _) in pdf.items() if kk not in usados and x.get("chave") == it.get("chave")), k)
+                base = {"item_id": it["id"], "titulo": it["titulo"], "codigo": it.get("inventory_id"), "sku": it.get("sku"),
+                        "antes": int(it["qtd"] or 0), "separado": int(it["separado"] or 0), "etiquetado": int(it.get("etiquetado") or 0),
+                        "kit": bool(it.get("comp"))}
+                if k in pdf and k not in usados:
+                    usados.add(k)
+                    x, q = pdf[k]
+                    attrs = (x["identificacao"] != (it.get("identificacao") or "etiqueta") or (x["instrucoes"] or None) != (it.get("instrucoes") or None)
+                             or bool(x["exige_validade"]) != bool(it.get("exige_validade")))
+                    sep_q = min(_kits_feitos(it["comp"], q) if it.get("comp") else base["separado"], q)
+                    mud.append({**base, "tipo": "igual" if q == base["antes"] and not attrs else "mudou", "depois": q,
+                                "sobra": _sobra(it, q), "etq_sobra": max(0, base["etiquetado"] - q), "_x": x,
+                                "valem": sep_q,
+                                "etq_valem": min(base["etiquetado"], q)})
+                else:
+                    mud.append({**base, "tipo": "saiu", "depois": 0, "acao": "zerar" if _mexeu(it) else "apagar",
+                                "sobra": _sobra(it, 0), "etq_sobra": base["etiquetado"]})
+            for k, (x, q) in pdf.items():
+                if k not in usados:
+                    mud.append({"item_id": None, "titulo": x.get("titulo"), "codigo": x.get("inventory_id"), "sku": x.get("sku"), "antes": 0,
+                                "depois": q, "separado": 0, "etiquetado": 0, "kit": bool(x.get("comp") and x["comp"] != "[]"),
+                                "tipo": "novo", "sobra": 0, "etq_sobra": 0, "_x": x})
+            conta = lambda t: sum(1 for m in mud if m["tipo"] == t)
+            resumo = {"novos": conta("novo"), "mudaram": conta("mudou"), "sairam": conta("saiu"), "iguais": conta("igual"),
+                      "unidades_antes": r["unidades"], "unidades_depois": sum(m["depois"] for m in mud),
+                      "separadas": r["separadas"], "etiquetadas": r["etiquetadas"],
+                      "sobra": sum(m["sobra"] for m in mud), "etq_sobra": sum(m["etq_sobra"] for m in mud),
+                      "separadas_valem": sum(m.get("valem", 0) for m in mud), "etiquetadas_valem": sum(m.get("etq_valem", 0) for m in mud)}
+            publico = [{k2: v for k2, v in m.items() if k2 != "_x"} for m in mud]
+            if not aplicar:
+                return jsonify({"previa": True, "frete": r.get("frete"), "mudancas": publico, "resumo": resumo})
+            antes = json.dumps([{k2: v for k2, v in it.items() if k2 not in ("sobra", "etq_sobra")} for it in r["itens"]], ensure_ascii=False, default=str)
+            for m in mud:
+                if m["tipo"] in ("igual", "mudou"):
+                    x, q = m["_x"], m["depois"]
+                    it = next(i for i in r["itens"] if i["id"] == m["item_id"])
+                    sep = _kits_feitos(it["comp"], q) if it.get("comp") else int(it["separado"] or 0)
+                    c.execute("UPDATE full_itens SET qtd=?, separado=?, identificacao=?, instrucoes=?, exige_validade=?, "
+                              "sku=COALESCE(sku, ?), ean=COALESCE(ean, ?), foto=COALESCE(foto, ?) WHERE id=?",
+                              (q, sep, x["identificacao"], x["instrucoes"], x["exige_validade"], x.get("sku"), x.get("ean"), x.get("foto"), m["item_id"]))
+                elif m["tipo"] == "saiu":
+                    if m["acao"] == "apagar":
+                        c.execute("DELETE FROM full_itens WHERE id=?", (m["item_id"],))
+                    else:
+                        it = next(i for i in r["itens"] if i["id"] == m["item_id"])
+                        c.execute("UPDATE full_itens SET qtd=0, separado=? WHERE id=?", (0 if it.get("comp") else int(it["separado"] or 0), m["item_id"]))
+                else:
+                    _inserir_item(c, rid, m["_x"], m["depois"])
+            agora = int(time.time())
+            if str(d.get("data_envio") or "")[:10] and not r.get("data_envio"):
+                c.execute("UPDATE full_remessas SET data_envio=? WHERE id=?", (str(d["data_envio"])[:10], rid))
+            c.execute("UPDATE full_remessas SET atualizado_em=? WHERE id=?", (agora, rid))
+            c.execute("INSERT INTO full_atualizacoes (remessa_id, em, por, tipo, antes, mudancas) VALUES (?,?,?,?,?,?)",
+                      (rid, agora, _quem(), "pdf", antes, json.dumps({"resumo": resumo, "mudancas": publico}, ensure_ascii=False, default=str)))
+            out = _rem(c, rid)
+            if out["status"] == "separada" and (out["separadas"] < out["unidades"] or out["etiquetadas"] < out["a_etiquetar"] or out["sobra"]):
+                c.execute("UPDATE full_remessas SET status='separando', fechado_por=NULL, fechado_em=NULL WHERE id=?", (rid,))
+                out = _rem(c, rid)
+        print(f"[full] remessa {rid} atualizada pelo PDF por {_quem()}: {resumo}", flush=True)
+        if out.get("kits_pendentes"):
+            threading.Thread(target=_completar_kits, args=(rid,), daemon=True).start()
+        return jsonify({"success": True, "mudancas": publico, "resumo": resumo, "remessa": out})
+
+    @bp.post("/full/remessas/<int:rid>/devolver")
+    @login_required
+    def full_devolver(rid):
+        """Sobra devolvida à prateleira: desfaz os últimos bips do produto até caber na quantidade nova (devolve o lote no
+        FEFO) e tira as etiquetas a mais (a pessoa arranca a etiqueta da unidade que voltou)."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        try:
+            item_id = int(d.get("item_id") or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        with db_session() as c:
+            r = c.execute("SELECT status FROM full_remessas WHERE id=?", (rid,)).fetchone()
+            if not r:
+                return jsonify({"success": False, "error": "Remessa não encontrada."}), 404
+            if r["status"] in ("enviada", "cancelada"):
+                return jsonify({"success": False, "error": "Remessa já fechada."}), 409
+            row = c.execute("SELECT * FROM full_itens WHERE id=? AND remessa_id=?", (item_id, rid)).fetchone()
+            if not row:
+                return jsonify({"success": False, "error": "Produto não está nesta remessa."}), 404
+            it = dict(row)
+            comp = _comp(it)
+            it["comp"] = comp
+            q = int(it["qtd"] or 0)
+            if comp:
+                exc = {str(i): max(0, int(cp.get("bip") or 0) - int(cp["q"]) * q) for i, cp in enumerate(comp)}
+            else:
+                exc = {"un": max(0, int(it["separado"] or 0) - q)}
+            exc = {k: v for k, v in exc.items() if v > 0}
+            etq_exc = max(0, int(it.get("etiquetado") or 0) - q)
+            devolvidas = sum(exc.values())
+            for b in c.execute("SELECT * FROM full_bips WHERE remessa_id=? AND item_id=? AND desfeito=0 AND reimpressao=0 ORDER BY id DESC",
+                               (rid, item_id)).fetchall():
+                if not any(v > 0 for v in exc.values()):
+                    break
+                b = dict(b)
+                try:
+                    det = json.loads(b.get("detalhe") or "null") or {"un": int(b["qtd"] or 0)}
+                except Exception:
+                    det = {"un": int(b["qtd"] or 0)}
+                tirado = 0
+                if exc.get("un") and int(det.get("un") or 0) > 0:
+                    t = min(exc["un"], int(det["un"])); exc["un"] -= t; det["un"] = int(det["un"]) - t; tirado += t
+                for j, n in list((det.get("comp") or {}).items()):
+                    if exc.get(str(j), 0) > 0 and int(n) > 0:
+                        t = min(exc[str(j)], int(n)); exc[str(j)] -= t; det["comp"][j] = int(n) - t; tirado += t
+                if not tirado:
+                    continue
+                resta = int(det.get("un") or 0) + sum(int(v) for v in (det.get("comp") or {}).values())
+                if det.get("fefo_id"):
+                    if resta <= 0:
+                        c.execute("DELETE FROM fefo_bip WHERE id=?", (det["fefo_id"],))
+                    else:
+                        c.execute("UPDATE fefo_bip SET qtd=CASE WHEN qtd>? THEN qtd-? ELSE 0 END WHERE id=?", (tirado, tirado, det["fefo_id"]))
+                if resta <= 0:
+                    c.execute("UPDATE full_bips SET desfeito=1 WHERE id=?", (b["id"],))
+                else:
+                    c.execute("UPDATE full_bips SET detalhe=? WHERE id=?", (json.dumps(det), b["id"]))
+            if comp:
+                for cp in comp:
+                    cp["bip"] = min(int(cp.get("bip") or 0), int(cp["q"]) * q)
+                c.execute("UPDATE full_itens SET comp=?, separado=? WHERE id=?", (json.dumps(comp, ensure_ascii=False), _kits_feitos(comp, q), item_id))
+            else:
+                c.execute("UPDATE full_itens SET separado=? WHERE id=? AND separado>?", (q, item_id, q))
+            if etq_exc:
+                for e in c.execute("SELECT id FROM full_bips WHERE remessa_id=? AND item_id=? AND desfeito=0 AND reimpressao=2 ORDER BY id DESC LIMIT ?",
+                                   (rid, item_id, etq_exc)).fetchall():
+                    c.execute("UPDATE full_bips SET desfeito=1 WHERE id=?", (e["id"],))
+                c.execute("UPDATE full_itens SET etiquetado=? WHERE id=?", (q, item_id))
+            c.execute("INSERT INTO full_atualizacoes (remessa_id, em, por, tipo, antes, mudancas) VALUES (?,?,?,?,?,?)",
+                      (rid, int(time.time()), _quem(), "devolver", json.dumps({k2: v for k2, v in it.items()}, ensure_ascii=False, default=str),
+                       json.dumps({"item_id": item_id, "devolvidas": devolvidas, "etiquetas": etq_exc})))
+            if q == 0:
+                c.execute("DELETE FROM full_itens WHERE id=? AND qtd=0 AND separado=0 AND COALESCE(etiquetado,0)=0", (item_id,))
+            out = _rem(c, rid)
+        return jsonify({"success": True, "devolvidas": devolvidas, "etiquetas": etq_exc, "remessa": out})
+
     @bp.post("/full/remessas/<int:rid>/bipar")
     @login_required
     def full_bipar(rid):
@@ -579,6 +775,9 @@ def registrar(bp):
                 return jsonify({"success": False, "error": f"{cod} não está nesta remessa.", "tipo": "fora"}), 404
             alvos.sort(key=lambda a: (0 if a[0] == "un" else 1, a[1]["id"]))
             alvo = next((a for a in alvos if _espaco(*a) > 0), None)
+            if not alvo and all(int(a[1]["qtd"] or 0) == 0 for a in alvos):
+                return jsonify({"success": False, "error": f"{alvos[0][1]['titulo'][:50]}: saiu da remessa no PDF novo, não vai para o Full. Devolva à prateleira.",
+                                "tipo": "saiu"}), 409
             if not alvo:
                 it0 = alvos[0][1]
                 meio = next((a for a in alvos if a[0] == "kit" and any(int(cp["q"]) * int(a[1]["qtd"]) > int(cp.get("bip") or 0) for cp in a[1]["comp"])), None)
@@ -723,6 +922,9 @@ def registrar(bp):
             if all(it.get("identificacao") == "codigo_universal" for it in its):
                 return jsonify({"success": False, "error": "Esse produto não leva etiqueta: o Full lê o código de barras dele.", "tipo": "sem_etiqueta"}), 409
             its = [it for it in its if it.get("identificacao") != "codigo_universal"]
+            if all(int(x["qtd"] or 0) == 0 for x in its):
+                return jsonify({"success": False, "error": f"{its[0]['titulo'][:50]}: saiu da remessa no PDF novo, não leva etiqueta. Devolva à prateleira.",
+                                "tipo": "saiu"}), 409
             it = next((x for x in its if int(x.get("etiquetado") or 0) < min(int(x["separado"] or 0), int(x["qtd"]))), None)
             if not it:
                 x = its[0]
@@ -791,6 +993,8 @@ def registrar(bp):
                 return jsonify({"error": "Remessa não encontrada."}), 404
             if st == "separada" and (r["separadas"] < r["unidades"] or r["etiquetadas"] < r["a_etiquetar"]):
                 return jsonify({"error": f"Ainda falta: separadas {r['separadas']}/{r['unidades']}, etiquetadas {r['etiquetadas']}/{r['a_etiquetar']}."}), 409
+            if st == "separada" and r.get("sobra"):
+                return jsonify({"error": f"Sobraram {r['sobra']} unidade(s) que o PDF novo tirou: devolva à prateleira e toque em Devolvi antes de fechar."}), 409
             if st == "cancelada" and r["separadas"] > 0:
                 return jsonify({"error": "Já tem unidade separada: desfaça os bips antes de cancelar."}), 409
             c.execute("UPDATE full_remessas SET status=?, atualizado_em=?, fechado_por=?, fechado_em=? WHERE id=?",
