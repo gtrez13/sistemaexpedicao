@@ -57,7 +57,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/mapa/lay
 echo "OK: serviço no ar (/api/mapa/layout respondeu $code; 401 = existe, pede login)"
 echo -e "${AVISOS#\\n}"
 echo "Cron da virada agora:"
-crontab -l | grep virada_dia_wms
+crontab -l | grep virada_dia_wms || echo "  (não achei a linha no crontab: me avise)"
 echo "Rodando a virada agora (pode levar uns segundos):"
 venv/bin/python -u virada_dia.py --cron || true
 echo
