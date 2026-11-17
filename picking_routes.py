@@ -140,22 +140,45 @@ def separacao_bipar():
 
         restante, distribuido, fechados, tocados = qtd, [], [], []
         nome, sku_real = linhas[0]["nome"], linhas[0]["sku"]
+        travados, fechados_agora = set(), set()
         for row in linhas:
             if restante <= 0:
                 break
-            falta = int(row["quantidade"]) - int(row["quantidade_bipada"])
+            if row["pedido_id"] in fechados_agora:
+                continue
+            # VÁRIOS SEPARADORES AO MESMO TEMPO (Biel 17/11: "aguentar 50 pessoas"): trava a linha do pedido antes de mexer
+            # (quem chegar junto espera este terminar e lê o que ficou) e só soma se ainda couber. Assim 2 bips no mesmo
+            # segundo nunca contam a mesma unidade, e o pedido fecha uma vez só.
+            if row["pedido_id"] not in travados:
+                ainda = conn.execute("UPDATE pedidos SET atualizado_em = atualizado_em WHERE id = ? AND status = 'PENDENTE' RETURNING id",
+                                     (row["pedido_id"],)).fetchone()
+                if not ainda:                  # outro separador fechou esse pedido agora: vai para o próximo
+                    fechados_agora.add(row["pedido_id"])
+                    continue
+                travados.add(row["pedido_id"])
+            atual = conn.execute("SELECT quantidade, quantidade_bipada FROM pedido_produtos WHERE id = ?", (row["pp_id"],)).fetchone()
+            falta = int(atual["quantidade"]) - int(atual["quantidade_bipada"]) if atual else 0
             dar = min(restante, falta)
-            conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? WHERE id = ?", (dar, row["pp_id"]))
+            if dar <= 0:
+                continue
+            ok = conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? "
+                              "WHERE id = ? AND quantidade_bipada + ? <= quantidade RETURNING id", (dar, row["pp_id"], dar)).fetchone()
+            if not ok:
+                continue
             restante -= dar
             distribuido.append({"ml_id": row["ml_id"], "cliente": row["cliente_nome"], "quantidade": dar})
             if row["pedido_id"] not in tocados:
                 tocados.append(row["pedido_id"])
+        if not distribuido:
+            return jsonify({"success": False, "error": f"{sku} já foi completado agora por outro separador"}), 409
         for pid in tocados:
             itens = _itens_do_pedido(conn, pid)
             if itens and all(i["falta"] == 0 for i in itens):
-                conn.execute("UPDATE pedidos SET status='SEPARADO', atualizado_em=CURRENT_TIMESTAMP WHERE id=?", (pid,))
-                conn.execute("UPDATE pedido_produtos SET quantidade_separada = quantidade_bipada, quantidade_bipada = 0 WHERE pedido_id = ?", (pid,))
-                fechados.append(conn.execute("SELECT ml_id FROM pedidos WHERE id=?", (pid,)).fetchone()["ml_id"])
+                virou = conn.execute("UPDATE pedidos SET status='SEPARADO', atualizado_em=CURRENT_TIMESTAMP "
+                                     "WHERE id=? AND status='PENDENTE' RETURNING ml_id", (pid,)).fetchone()
+                if virou:                      # só quem fechou move as quantidades (fechar duas vezes zeraria o separado)
+                    conn.execute("UPDATE pedido_produtos SET quantidade_separada = quantidade_bipada, quantidade_bipada = 0 WHERE pedido_id = ?", (pid,))
+                    fechados.append(virou["ml_id"])
         produto = _totais_produto(conn, sku_real)
         # pedido do último bip (compatibilidade com a tela)
         ult = distribuido[-1]
@@ -194,10 +217,18 @@ def expedicao_bipar_lote():
         row = _linha(conn, sku, ml_id, "SEPARADO")
         if not row:
             return jsonify({"success": False, "error": f"{sku} não é do pedido #{ml_id} (ou já está completo nele)"}), 404
-        falta = int(row["quantidade"]) - int(row["quantidade_bipada"])
+        ainda = conn.execute("UPDATE pedidos SET atualizado_em = atualizado_em WHERE id = ? AND status = 'SEPARADO' RETURNING id",
+                             (row["pedido_id"],)).fetchone()   # trava (bip simultâneo) e confere que o pedido ainda está aqui
+        if not ainda:
+            return jsonify({"success": False, "error": f"O pedido #{ml_id} mudou agora há pouco. Bipe de novo."}), 409
+        atual = conn.execute("SELECT quantidade, quantidade_bipada FROM pedido_produtos WHERE id = ?", (row["pp_id"],)).fetchone()
+        falta = int(atual["quantidade"]) - int(atual["quantidade_bipada"])
         somar = min(qtd, falta - 1)               # deixa 1 para o /scanner/bipar fechar do jeito de sempre
         if somar > 0:
-            conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? WHERE id = ?", (somar, row["pp_id"]))
+            ok = conn.execute("UPDATE pedido_produtos SET quantidade_bipada = quantidade_bipada + ? "
+                              "WHERE id = ? AND quantidade_bipada + ? < quantidade RETURNING id", (somar, row["pp_id"], somar)).fetchone()
+            if not ok:
+                somar = 0
         itens = _itens_do_pedido(conn, row["pedido_id"])
 
     if somar > 0:

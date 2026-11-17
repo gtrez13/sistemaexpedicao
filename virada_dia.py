@@ -1,7 +1,7 @@
 """Virada do dia: arquiva (sem apagar) o que é de dias anteriores e já terminou. Regras em mapa_routes.py (_virada_rodar).
 
   --previa          mostra o que arquivaria (NÃO muda nada)
-  --cron            roda se ainda não rodou hoje (é o que o cron da meia-noite chama)
+  --cron            roda se não rodou nos últimos VIRADA_INTERVALO_MIN (30) min: é o que o cron chama a cada 30 min
   --aplicar         roda agora, mesmo que já tenha rodado hoje
   --lista [dias]    arquivados dos últimos dias (padrão 2)
   --desfazer DIA    DESFAZER: volta para a lista tudo que a virada arquivou nesse dia (AAAA-MM-DD)
@@ -43,7 +43,12 @@ if __name__ == "__main__":
             c.execute("INSERT INTO virada_dia (dia, em, resumo) VALUES (?,?,?)", (m._hoje(), int(time.time()), '{"manual": true}'))
     elif op == "--cron":
         r = m._virada_se_preciso(log=lambda s: None)
-        print(time.strftime("%Y-%m-%d %H:%M"), "já tinha rodado hoje" if r is None else f"arquivou {len(r['arquivados'])}")
+        if r is None:
+            print(time.strftime("%Y-%m-%d %H:%M"), f"rodou há menos de {m.VIRADA_INTERVALO_MIN} min (ou WMS_VIRADA=0)")
+        else:
+            print(time.strftime("%Y-%m-%d %H:%M"), f"arquivou {len(r['arquivados'])}")
+            for x in r["arquivados"]:
+                print(f"   {x['ml_id']} {x.get('cliente') or ''}: {x['motivo']}")
     elif op == "--lista":
         dias = int(args[1]) if len(args) > 1 else 2
         with db_session() as c:

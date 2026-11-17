@@ -1566,6 +1566,9 @@ def separacao_so_hoje():
 #     ou separado e já carregado na Saída / há mais de 5 dias.
 VIRADA_DIAS_CONCLUIDO = 5
 VIRADA_ATIVA = os.environ.get("WMS_VIRADA", "1").strip() not in ("0", "false", "nao", "não", "off")
+# Biel 17/11: "não está atualizando o dia a dia". Uma vez por dia (00:10) deixava na lista o que saiu durante o dia até a
+# meia-noite seguinte. Agora confere de novo a cada VIRADA_INTERVALO_MIN (cron a cada 30 min + abrir a Separação).
+VIRADA_INTERVALO_MIN = max(5, int(os.environ.get("VIRADA_INTERVALO_MIN", "30") or 30))
 _virada_lock = threading.Lock()
 _ST_FIM_ML = ("shipped", "delivered", "not_delivered")
 
@@ -1683,13 +1686,23 @@ def _virada_se_preciso(log=None):
     try:
         with db_session() as conn:
             _arq_tabela(conn)
-            if conn.execute("SELECT 1 FROM virada_dia WHERE dia=?", (hoje,)).fetchone():
+            v = conn.execute("SELECT em, resumo FROM virada_dia WHERE dia=?", (hoje,)).fetchone()
+            if v and time.time() - int(v["em"] or 0) < VIRADA_INTERVALO_MIN * 60 - 30:
                 return None
+            try:
+                antes = int((json.loads(v["resumo"]) or {}).get("n") or 0) if v and v["resumo"] else 0
+            except Exception:
+                antes = 0
+            # marca já (outro processo/servidor que chegar junto não roda em dobro)
+            conn.execute("DELETE FROM virada_dia WHERE dia=?", (hoje,))
+            conn.execute("INSERT INTO virada_dia (dia, em, resumo) VALUES (?,?,?)",
+                         (hoje, int(time.time()), json.dumps({"n": antes, "rodando": True}, ensure_ascii=False)))
         r = _virada_rodar(True, log)
         with db_session() as conn:
             conn.execute("DELETE FROM virada_dia WHERE dia=?", (hoje,))
             conn.execute("INSERT INTO virada_dia (dia, em, resumo) VALUES (?,?,?)",
-                         (hoje, int(time.time()), json.dumps({"n": len(r["arquivados"]), "erros": r["erros"]}, ensure_ascii=False)))
+                         (hoje, int(time.time()), json.dumps({"n": antes + len(r["arquivados"]), "ultima": len(r["arquivados"]),
+                                                              "erros": r["erros"]}, ensure_ascii=False)))
         return r
     finally:
         _virada_lock.release()
