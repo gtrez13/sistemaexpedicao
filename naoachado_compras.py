@@ -33,7 +33,7 @@ print(f"{len(rows)} produto(s) zerado(s) sem aviso ao comprador. StockMind {'con
 for r in rows:
     print(f"  #{r['id']}  {r['sku']}  {(r['nome'] or '')[:50]}  tinha {r['estoque_anterior']}  ({r['estoque_status']}, aviso: {r['compras_status'] or 'nunca'})")
 if not enviar:
-    print("\nPrévia: nada foi enviado. Para mandar: venv/bin/python -u naoachado_compras.py --enviar")
+    print("\nPrévia: nada foi enviado. Para mandar, rode o mesmo comando com --enviar (com COMPRAS_API_URL e COMPRAS_TOKEN, como o ligar_compras.sh mostra).")
     sys.exit(0)
 if not cfg:
     sys.exit("COMPRAS_API_URL/COMPRAS_TOKEN não estão no ambiente: rode com as variáveis do serviço (veja o ligar_compras.sh).")
