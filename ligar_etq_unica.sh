@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Etiqueta única por unidade (Biel 16/11 + 18/11), LHVMed:
-#  - Recebimento: cada etiqueta impressa tem código próprio (QR SKU*LOTE*U1234ABC); a conferência é bipar cada uma (conta 1 vez).
+#  - Recebimento: cada etiqueta impressa tem código próprio (QR SKU*LOTE*U1234ABC); confere como hoje e, no fim, bipa todas as
+#    etiquetas para confirmar as unidades (a nota só fecha com todas bipadas). RECEB_ETQ_UNICA=estrito = só bipando; 0 = desliga.
 #  - Depois do recebimento (18/11): Separação, Expedição e Full não contam a mesma etiqueta duas vezes no mesmo dia;
 #    Rastrear mostra a trilha da unidade e os bips repetidos por pessoa.
 # Troca só o recebimento_routes.py. Antes de trocar, confere se o do servidor é uma versão conhecida (do git):
@@ -15,6 +16,7 @@ PY=venv/bin/python; [ -x "$PY" ] || PY=python3
 
 # versões do recebimento_routes.py que já saíram do git (hash do conteúdo -> commit)
 CONHECIDAS="
+83e138e522a2ae958eaa3323318a7046b8921b67 d989880
 ada4c84287753bbfbf2741fc014d8cb15c29e05e 88691e2
 cdedcbb14aaee5fe606e254921b55b4ff4df0a82 56c07a7
 c5ae48768459ffeeebfce322f0593c3767ba11bf cf0b67a
@@ -99,7 +101,7 @@ with R.db_session() as c:
     n = c.execute("SELECT COUNT(*) AS n FROM receb_etq").fetchone()["n"]
     u = c.execute("SELECT COUNT(*) AS n FROM etq_uso").fetchone()["n"]
 print(f"Tabelas prontas: {n} etiqueta(s) com código já impressa(s), {u} unidade(s) contada(s) depois do recebimento.")
-print(f"Modo: RECEB_ETQ_UNICA={R.ETQ_UNICA} (nota = vale na nota que já tem etiqueta com código; 1 = todas; 0 = desliga)")
+print(f"Modo: RECEB_ETQ_UNICA={R.ETQ_UNICA} (fim = confere como hoje e bipa as etiquetas no fim; estrito = só bipando; 0 = desliga)")
 PY
 echo
 echo "Desfazer:"
