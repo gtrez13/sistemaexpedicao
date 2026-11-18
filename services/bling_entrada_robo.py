@@ -46,11 +46,43 @@ def _dig(v):
     return re.sub(r"\D", "", str(v or ""))
 
 
+# ───────── login e espera da tela, aqui mesmo (Biel 18/11: "'BlingRPA' object has no attribute 'garantir_logado'") ─────────
+# O services/bling_nfe_rpa.py do servidor é outra versão (sem garantir_logado): o robô da entrada não depende mais dele.
+class _Tela:
+    def garantir_logado(self, page):
+        page.wait_for_load_state("domcontentloaded", timeout=60000)
+        page.wait_for_timeout(400)
+        if "login" not in (page.url or ""):
+            return
+        print("🔐 [ROBO ENTRADA] sessão do Bling expirada: entrando de novo...", flush=True)
+        user, pwd = os.getenv("BLING_USER"), os.getenv("BLING_PASS")
+        if not user or not pwd:
+            raise RoboErro("sessão do Bling expirou e BLING_USER / BLING_PASS não estão no .env")
+        page.wait_for_selector("#username", state="visible", timeout=60000)
+        page.wait_for_timeout(800)                         # o React do Bling precisa desse tempo
+        page.fill("#username", user)
+        page.fill("input[type='password']", pwd)
+        js_botao = "() => [...document.querySelectorAll('button,div')].find(e => (e.innerText||'').trim() === 'Entrar')"
+        page.wait_for_function(f"() => {{ const b = ({js_botao})(); return b && !b.disabled; }}", timeout=60000)
+        page.evaluate(f"() => {{ const b = ({js_botao})(); if (b) b.click(); }}")
+        page.wait_for_function("() => !location.href.includes('login')", timeout=60000)
+        page.wait_for_load_state("networkidle")
+
+    def wait_no_overlay(self, page, timeout_ms: int = 180000):
+        """Espera o overlay (blockUI) do Bling sumir de verdade."""
+        try:
+            page.wait_for_function(
+                """() => { const o = document.querySelector('.blockUI.blockOverlay'); if (!o) return true;
+                           const st = window.getComputedStyle(o); return st.display === 'none' || st.visibility === 'hidden' || o.offsetHeight === 0; }""",
+                timeout=timeout_ms)
+        except Exception:
+            pass
+
+
 def manifestar_e_importar(numero: str, chave: str = "", valor: float | None = None, evento: str = EVENTO_CONFIRMO,
                           headless: bool = True, log=print) -> dict:
     """-> {"ok": True, "nf_id": "...", "passos": [...]} ou levanta RoboErro com a mensagem e a foto."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    from services.bling_nfe_rpa import BlingRPA
 
     numero = str(numero).lstrip("0") or str(numero)
     passos = []
@@ -68,7 +100,7 @@ def manifestar_e_importar(numero: str, chave: str = "", valor: float | None = No
             context = browser.new_context(storage_state=estado if os.path.exists(estado) else None,
                                           viewport={"width": 1440, "height": 900})
             page = context.new_page()
-            rpa = BlingRPA(headless=headless)
+            rpa = _Tela()
             try:
                 page.goto(URL_ENTRADAS, wait_until="domcontentloaded", timeout=120000)
                 rpa.garantir_logado(page)
@@ -209,7 +241,6 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
       > "Conciliar Produtos" (#botaoSalvarConciliacao) > Salvar a nota (#botaoSalvar).
     -> {"ok": True, "itens": n, "passos": [...]} ou RoboErro (mensagem começa com TRAVADA: quando o Bling não deixa mais)."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    from services.bling_nfe_rpa import BlingRPA
 
     numero = str(numero).lstrip("0") or str(numero)
     pc_numero = str(pc_numero).strip()
@@ -228,7 +259,7 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
             context = browser.new_context(storage_state=estado if os.path.exists(estado) else None,
                                           viewport={"width": 1600, "height": 900})
             page = context.new_page()
-            rpa = BlingRPA(headless=headless)
+            rpa = _Tela()
             try:
                 page.goto(URL_ENTRADAS, wait_until="domcontentloaded", timeout=120000)
                 rpa.garantir_logado(page)
