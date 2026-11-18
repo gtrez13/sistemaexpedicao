@@ -1900,23 +1900,58 @@ def _dups_xml(xml):
     return out
 
 
-def _forma_pagamento(id_fornecedor):
-    """Forma de pagamento das contas: env RECEB_FORMA_PAGAMENTO_ID; senão a mais usada nas contas a pagar desse fornecedor."""
+_TPAG_NOME = {1: "dinheiro", 2: "cheque", 3: "cartão de crédito", 4: "cartão de débito", 15: "boleto", 16: "depósito", 17: "pix",
+              18: "transferência"}
+
+
+def _tpag_xml(xml):
+    """Meio de pagamento da NF (<detPag><tPag>). Nota com duplicatas e tPag 90/99/sem = boleto (15)."""
+    t = [int(x) for x in re.findall(r"<tPag>\s*(\d+)\s*</tPag>", xml or "") if x.isdigit()]
+    t = [x for x in t if x not in (90, 99)]
+    return t[0] if t else 15
+
+
+def _formas_bling():
+    st, _, js = _bling_raw("GET", "/formas-pagamentos", params={"limite": 100})
+    return [x for x in ((js or {}).get("data") or []) if str(x.get("situacao", 1)) in ("1", "True", "true")] if st == 200 else []
+
+
+def _forma_pagamento(id_fornecedor, xml=None):
+    """Forma de pagamento das contas: env RECEB_FORMA_PAGAMENTO_ID; senão a mais usada nas contas a pagar desse fornecedor;
+    senão (fornecedor novo, Biel 18/11 NF 13003) a forma do Bling do mesmo meio de pagamento da NF (boleto quando tem duplicata);
+    senão a mais usada nas contas a pagar da empresa. -> (id, de onde veio) ou (None, formas que existem no Bling)."""
     if os.environ.get("RECEB_FORMA_PAGAMENTO_ID"):
         return int(os.environ["RECEB_FORMA_PAGAMENTO_ID"]), "configurada no WMS"
-    cont = {}
+    cont, geral = {}, {}
     for pag in (1, 2, 3):
         st, _, js = _bling_raw("GET", "/contas/pagar", params={"pagina": pag, "limite": 100})
         lst = (js or {}).get("data") or []
         for x in lst:
-            if str((x.get("contato") or {}).get("id")) == str(id_fornecedor) and (x.get("formaPagamento") or {}).get("id"):
-                f = int(x["formaPagamento"]["id"])
-                cont[f] = cont.get(f, 0) + 1
+            f = (x.get("formaPagamento") or {}).get("id")
+            if not f:
+                continue
+            geral[int(f)] = geral.get(int(f), 0) + 1
+            if str((x.get("contato") or {}).get("id")) == str(id_fornecedor):
+                cont[int(f)] = cont.get(int(f), 0) + 1
         if len(lst) < 100:
             break
     if cont:
         return max(cont, key=cont.get), "a mesma das últimas contas desse fornecedor"
-    return None, None
+    formas = _formas_bling()
+    tp = _tpag_xml(xml)
+    nome = _TPAG_NOME.get(tp, "")
+    cands = [x for x in formas if str(x.get("tipoPagamento") or "").lstrip("0") == str(tp)]
+    if not cands and nome:
+        cands = [x for x in formas if nome.split()[0] in str(x.get("descricao") or "").lower()]
+    if cands:
+        cands.sort(key=lambda x: (-geral.get(int(x["id"]), 0), 0 if x.get("padrao") else 1))
+        f = cands[0]
+        return int(f["id"]), f"{f.get('descricao') or nome} (o meio de pagamento da nota{': ' + nome if nome else ''})"
+    if geral:
+        f = max(geral, key=geral.get)
+        d = next((x.get("descricao") for x in formas if int(x.get("id") or 0) == f), None)
+        return f, f"{d or 'a forma'} mais usada nas contas a pagar"
+    return None, ", ".join(f"{x.get('descricao')} (id {x.get('id')})" for x in formas[:8]) or None
 
 
 VIGIA_S = int(os.environ.get("RECEB_VIGIA_S", "180"))          # de quanto em quanto tempo procura a nota no Bling
@@ -2167,9 +2202,10 @@ def plano_entrada(nid, resumo=None):
     if not dups:
         ponto(None, "Contas a pagar", "o XML não tem duplicatas: nenhuma conta será lançada")
     else:
-        fp, origem_fp = _forma_pagamento(forn)
+        fp, origem_fp = _forma_pagamento(forn, r["xml"])
         if not fp:
-            ponto(False, "Contas a pagar", "não sei a forma de pagamento: configure RECEB_FORMA_PAGAMENTO_ID")
+            ponto(False, "Contas a pagar", "não achei a forma de pagamento (fornecedor sem contas antes e nenhuma forma parecida no Bling): "
+                                           "ponha RECEB_FORMA_PAGAMENTO_ID=<id> no .env" + (f". Formas no Bling: {origem_fp}" if origem_fp else ""))
         tot = round(sum(d["valor"] for d in dups), 2)
         for k, d in enumerate(dups):
             plano["contas"].append({"numero": d["numero"], "vencimento": d["vencimento"], "valor": d["valor"],
