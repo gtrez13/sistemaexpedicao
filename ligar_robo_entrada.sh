@@ -11,6 +11,7 @@ ARQ=services/bling_entrada_robo.py
 G="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao"
 PY=venv/bin/python; [ -x "$PY" ] || PY=python3
 CONHECIDAS="
+2f482c56b080a3721fd829dcf2a5196778f6235f d3cbbe6
 e36154250bc422df717190d4719ad7ddb960763e 2eff668
 7cb84bb2483afcf626ddb436455980d906c19f14 355b9a6
 55e31eede581cdb4e31328fdc0cd2a1b09e58614 5e6907a
