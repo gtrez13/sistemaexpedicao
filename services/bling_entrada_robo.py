@@ -46,6 +46,17 @@ def _dig(v):
     return re.sub(r"\D", "", str(v or ""))
 
 
+def _msg_login(page, motivo):
+    """Login automático não deu: diz o que a tela mostrava e como resolver (login à mão uma vez, que o robô reaproveita)."""
+    try:
+        trecho = re.sub(r"\s+", " ", page.inner_text("body", timeout=3000))[:160]
+    except Exception:
+        trecho = ""
+    return (f"Login automático no Bling não deu: {motivo}. Tela: \"{trecho}\". Resolva entrando uma vez no servidor: "
+            f"venv/bin/python bling_login_once.py (abre o navegador; entre no Bling e aperte ENTER no terminal) e toque em Continuar "
+            f"(foto: {_foto(page, 'login_bling')})")
+
+
 # ───────── login e espera da tela, aqui mesmo (Biel 18/11: "'BlingRPA' object has no attribute 'garantir_logado'") ─────────
 # O services/bling_nfe_rpa.py do servidor é outra versão (sem garantir_logado): o robô da entrada não depende mais dele.
 class _Tela:
@@ -57,22 +68,33 @@ class _Tela:
         print("🔐 [ROBO ENTRADA] sessão do Bling expirada: entrando de novo...", flush=True)
         user, pwd = os.getenv("BLING_USER"), os.getenv("BLING_PASS")
         if not user or not pwd:
-            raise RoboErro("sessão do Bling expirou e BLING_USER / BLING_PASS não estão no .env")
-        page.wait_for_selector("#username", state="visible", timeout=60000)
-        page.wait_for_timeout(800)                         # o React do Bling precisa desse tempo
-        page.fill("#username", user)
-        page.fill("input[type='password']", pwd)
+            raise RoboErro(_msg_login(page, "a sessão expirou e BLING_USER / BLING_PASS não estão no .env"))
         js_botao = "() => [...document.querySelectorAll('button,div')].find(e => (e.innerText||'').trim() === 'Entrar')"
-        page.wait_for_function(f"() => {{ const b = ({js_botao})(); return b && !b.disabled; }}", timeout=60000)
+        try:
+            page.wait_for_selector("#username", state="visible", timeout=30000)
+            page.wait_for_timeout(800)                         # o React do Bling precisa desse tempo
+            page.fill("#username", user)
+            page.fill("input[type='password']", pwd)
+            page.wait_for_function(f"() => {{ const b = ({js_botao})(); return b && !b.disabled; }}", timeout=30000)
+        except Exception:
+            raise RoboErro(_msg_login(page, "a tela de login não liberou o botão Entrar (o Bling pode estar pedindo captcha)"))
         page.evaluate(f"() => {{ const b = ({js_botao})(); if (b) b.click(); }}")
-        page.wait_for_function("() => !location.href.includes('login')", timeout=60000)
-        # NÃO esperar "networkidle": o Bling fica consultando o servidor e a rede nunca para (Biel 18/11 17:41: Timeout 30000ms
-        # logo depois de entrar). Espera a página carregar e segue.
+        try:
+            page.wait_for_function("() => !location.href.includes('login')", timeout=60000)
+        except Exception:
+            raise RoboErro(_msg_login(page, "depois de Entrar continuou na tela de login (senha, captcha ou verificação)"))
         try:
             page.wait_for_load_state("domcontentloaded", timeout=60000)
         except Exception:
             pass
         page.wait_for_timeout(2500)
+        try:
+            txt = page.inner_text("body", timeout=5000)[:1500]
+        except Exception:
+            txt = ""
+        if re.search(r"c[oó]digo de (verifica|seguran|acesso)|verifica[cç][aã]o em (duas|2)|novo dispositivo|confirme (seu|o) acesso", txt, re.I):
+            raise RoboErro(_msg_login(page, "o Bling pediu código de verificação no login"))
+        # NÃO esperar "networkidle": o Bling fica consultando o servidor e a rede nunca para (Timeout 30000ms, 18/11 17:41)
         try:                                               # guarda a sessão nova: o próximo robô já entra logado
             page.context.storage_state(path=os.path.join(BASE_DIR, "bling_state.json"))
         except Exception:
