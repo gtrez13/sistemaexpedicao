@@ -136,6 +136,13 @@ def _garantir_tabelas():
                       sku TEXT, mult INTEGER NOT NULL DEFAULT 1, seq INTEGER, lote TEXT, criado_por TEXT, criado_em BIGINT,
                       bipado_por TEXT, bipado_em BIGINT, cancelado INTEGER NOT NULL DEFAULT 0)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_receb_etq_item ON receb_etq (item_id)")
+        # rastreio da unidade (18/11): uso atual da etiqueta em cada etapa + histórico de tudo que aconteceu com ela
+        c.execute("""CREATE TABLE IF NOT EXISTS etq_uso (codigo TEXT NOT NULL, etapa TEXT NOT NULL, sku TEXT, pedido TEXT,
+                      quem TEXT, em BIGINT, dia TEXT, tk TEXT, PRIMARY KEY (codigo, etapa))""")
+        c.execute(f"""CREATE TABLE IF NOT EXISTS etq_evento (id {pk}, codigo TEXT, etapa TEXT, acao TEXT, sku TEXT, pedido TEXT,
+                      quem TEXT, em BIGINT, detalhe TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_etq_evento_em ON etq_evento (em)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_etq_evento_cod ON etq_evento (codigo)")
         c.execute("""
             CREATE TABLE IF NOT EXISTS receb_vinculos (
                 fornecedor_cnpj TEXT NOT NULL, cprod TEXT NOT NULL, sku TEXT NOT NULL,
@@ -1121,6 +1128,7 @@ def etiquetas_desbipar(nid):
         if not e or not e["bipado_em"]:
             return jsonify({"error": "Nenhuma etiqueta bipada para desfazer."}), 404
         c.execute("UPDATE receb_etq SET bipado_em=NULL, bipado_por=NULL WHERE codigo=?", (e["codigo"],))
+        _evento(c, e["codigo"], "recebimento", "soltou", e["sku"], None, _quem(), f"desfez a conferência (era de {e['bipado_por'] or '?'})")
         _recontar(c, e["item_id"])
         novo = _item_resp(c, e["item_id"])
     return jsonify({"success": True, "item": novo, "codigo": e["codigo"], "falta": novo["qtd_nf"] - novo["qtd_conferida"]})
@@ -1130,15 +1138,19 @@ def _bipar_etq(c, nid, nota, sku, lote, cod):
     """Bip de etiqueta com código único. -> (json, http)."""
     e = c.execute("SELECT * FROM receb_etq WHERE codigo=?", (cod,)).fetchone()
     if not e:
+        _evento(c, cod, "recebimento", "desconhecida", sku, nota.get("numero"), _quem(), "etiqueta que o sistema não imprimiu")
         return {"success": False, "tipo": "desconhecida", "error": f"Etiqueta {cod} não existe no sistema (etiqueta de teste ou de outra impressão). Use as etiquetas impressas para esta nota."}, 404
     if int(e["nota_id"]) != int(nid):
         o = c.execute("SELECT numero FROM receb_notas WHERE id=?", (e["nota_id"],)).fetchone()
+        _evento(c, cod, "recebimento", "outra_nota", sku, nota.get("numero"), _quem(), f"etiqueta da NF {o['numero'] if o else '?'}")
         return {"success": False, "tipo": "outra_nota", "error": f"Essa etiqueta é da NF {o['numero'] if o else '?'}, não desta."}, 409
     if int(e["cancelado"] or 0):
+        _evento(c, cod, "recebimento", "substituida", sku, nota.get("numero"), _quem(), "etiqueta trocada por outra impressão")
         return {"success": False, "tipo": "cancelada", "error": "Essa etiqueta foi substituída por outra impressão e não vale mais. Use a etiqueta nova."}, 409
     if e["bipado_em"]:
         hora = datetime.datetime.fromtimestamp(int(e["bipado_em"])).strftime("%H:%M")
         novo = _item_resp(c, e["item_id"])
+        _evento(c, cod, "recebimento", "repetida", sku, nota.get("numero"), _quem(), f"já bipada por {e['bipado_por'] or '?'} às {hora}")
         return {"success": False, "tipo": "repetida", "item": novo, "falta": novo["qtd_nf"] - novo["qtd_conferida"],
                 "error": f"Bipada por {e['bipado_por'] or '?'} às {hora}. Não contou de novo."}, 409
     c.execute("UPDATE receb_etq SET bipado_em=?, bipado_por=? WHERE codigo=? AND bipado_em IS NULL", (_agora(), _quem(), cod))
@@ -1199,6 +1211,223 @@ def bipar(nid):
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return jsonify({"success": True, "item": novo, "falta": falta, "excedeu": falta < 0,
                     "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])})
+
+
+# ───────────────────────── rastreio da unidade (Biel 18/11) ─────────────────────────
+# "vai colar em cada uma uma etiqueta que diferencie uma da outra pra gente conseguir pegar caca dos caras":
+# a etiqueta única do recebimento acompanha a unidade. Separação, Expedição e Full reservam o código ANTES de contar
+# (POST /recebimento/unidade/usar). Na mesma etapa e no mesmo dia, a mesma etiqueta não conta duas vezes: o bip repetido
+# para "completar" o pedido é recusado e fica registrado (quem tentou, quando, de quem era). Unidade que voltou para a
+# prateleira e sai de novo em OUTRO dia passa (fica no histórico como "de novo"). O supervisor libera uma etiqueta no
+# Rastrear. Etiqueta que o sistema não imprimiu (ou substituída) conta, mas fica registrada como ocorrência.
+ETAPAS = {"recebimento": "Recebimento", "separacao": "Separação", "expedicao": "Expedição", "full": "Full"}
+OCORRENCIAS = ("repetida", "desconhecida", "substituida", "outra_nota", "liberou")
+_RE_ETQ_NO_TEXTO = re.compile(r"(?:^|[*#\s])(U[0-9A-HJKMNP-TV-Z]{7})\s*$")
+
+
+def _utc(ts):
+    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _dia_sp(ts=None) -> str:
+    """Data em Brasília (o 'mesmo dia' da regra)."""
+    t = _utc(ts if ts is not None else _agora()) - datetime.timedelta(hours=3)
+    return t.strftime("%Y-%m-%d")
+
+
+def _hora_sp(ts) -> str:
+    try:
+        t = _utc(int(ts)) - datetime.timedelta(hours=3)
+        return t.strftime("%H:%M") if t.strftime("%Y-%m-%d") == _dia_sp() else t.strftime("%d/%m %H:%M")
+    except Exception:
+        return "?"
+
+
+def _cod_do_texto(t) -> str | None:
+    """'SKU*LOTE*U1234ABC', '#U1234ABC' ou 'U1234ABC' -> 'U1234ABC'."""
+    t = str(t or "").strip().upper()
+    if _RE_ETQ.match(t):
+        return t
+    m = _RE_ETQ_NO_TEXTO.search(t)
+    return m.group(1) if m else None
+
+
+def _evento(c, codigo, etapa, acao, sku=None, pedido=None, quem=None, detalhe=None):
+    """Histórico da etiqueta. Nunca derruba o bip: se falhar, segue."""
+    try:
+        c.execute("INSERT INTO etq_evento (codigo, etapa, acao, sku, pedido, quem, em, detalhe) VALUES (?,?,?,?,?,?,?,?)",
+                  (codigo, etapa, acao, (str(sku)[:80] if sku else None), (str(pedido)[:60] if pedido else None), quem, _agora(),
+                   (str(detalhe)[:300] if detalhe else None)))
+    except Exception as ex:
+        print(f"⚠️ etq_evento: {ex}", flush=True)
+
+
+def _txt_uso(r) -> str:
+    ped = f" no pedido {r['pedido']}" if r.get("pedido") else ""
+    return f"{r.get('quem') or '?'} às {_hora_sp(r.get('em'))}{ped}"
+
+
+@recebimento_routes.post("/recebimento/unidade/usar")
+@login_required
+def unidade_usar():
+    """Reserva a etiqueta da unidade nesta etapa antes de contar. Corpo: {codigo, etapa, sku, pedido?}.
+    200 = pode contar (aviso quando a etiqueta não é do sistema / foi substituída / sai de novo em outro dia);
+    409 = já contou hoje nesta etapa (não conte de novo)."""
+    import secrets
+    d = request.get_json(silent=True) or {}
+    cod = _cod_do_texto(d.get("codigo"))
+    etapa = str(d.get("etapa") or "").strip().lower()
+    sku = str(d.get("sku") or "").strip()[:80] or None
+    pedido = str(d.get("pedido") or "").strip()[:60] or None
+    if not cod or etapa not in ("separacao", "expedicao", "full"):
+        return jsonify({"success": False, "error": "Código da etiqueta ou etapa inválidos."}), 400
+    garantir_tabelas()
+    quem, agora, dia, tk = _quem(), _agora(), _dia_sp(), secrets.token_hex(6)
+    with db_session() as c:
+        e = c.execute("SELECT * FROM receb_etq WHERE codigo=?", (cod,)).fetchone()
+        c.execute("INSERT INTO etq_uso (codigo, etapa, sku, pedido, quem, em, dia, tk) VALUES (?,?,?,?,?,?,?,?) "
+                  "ON CONFLICT (codigo, etapa) DO NOTHING", (cod, etapa, sku, pedido, quem, agora, dia, tk))
+        r = dict(c.execute("SELECT * FROM etq_uso WHERE codigo=? AND etapa=?", (cod, etapa)).fetchone())
+        acao, antes = "usou", None
+        if r["tk"] != tk:
+            if r["dia"] == dia:
+                _evento(c, cod, etapa, "repetida", sku, pedido, quem, f"já contada por {_txt_uso(r)}")
+                return jsonify({"success": False, "tipo": "repetida", "codigo": cod, "antes": {k: r[k] for k in ("etapa", "pedido", "quem", "em")},
+                                "antes_txt": _txt_uso(r),
+                                "error": f"Essa unidade já foi bipada por {_txt_uso(r)}. Cada etiqueta conta uma vez: pegue outra unidade.",
+                                "detalhe": "Se ela voltou para a prateleira, o supervisor libera no Rastrear."}), 409
+            antes = r
+            c.execute("UPDATE etq_uso SET sku=?, pedido=?, quem=?, em=?, dia=?, tk=? WHERE codigo=? AND etapa=? AND dia<>?",
+                      (sku, pedido, quem, agora, dia, tk, cod, etapa, dia))
+            r2 = c.execute("SELECT * FROM etq_uso WHERE codigo=? AND etapa=?", (cod, etapa)).fetchone()
+            if not r2 or r2["tk"] != tk:            # outro aparelho bipou a mesma etiqueta no mesmo instante
+                _evento(c, cod, etapa, "repetida", sku, pedido, quem, "bipada em dois aparelhos ao mesmo tempo")
+                return jsonify({"success": False, "tipo": "repetida", "codigo": cod,
+                                "error": "Essa unidade acabou de ser bipada em outro aparelho. Pegue outra unidade."}), 409
+            acao = "de_novo"
+        aviso = None
+        if not e:
+            acao, aviso = "desconhecida", "Etiqueta que o sistema não imprimiu (teste ou outra impressão): contou, mas ficou registrado."
+        elif int(e["cancelado"] or 0):
+            acao, aviso = "substituida", "Etiqueta trocada por outra impressão: contou, mas ficou registrado. Cole a etiqueta nova."
+        det = f"saiu antes com {_txt_uso(antes)} ({antes['dia']})" if antes else None
+        _evento(c, cod, etapa, acao, sku, pedido, quem, det)
+    return jsonify({"success": True, "codigo": cod, "etapa": etapa, "aviso": aviso, "de_novo": bool(antes),
+                    "unidade": ({"sku": e["sku"], "mult": int(e["mult"] or 1), "lote": e["lote"], "nota_id": e["nota_id"]} if e else None)})
+
+
+@recebimento_routes.post("/recebimento/unidade/confirmar")
+@login_required
+def unidade_confirmar():
+    """Depois que o bip contou: grava em qual pedido a unidade foi (a Separação só sabe depois que o servidor distribui)."""
+    d = request.get_json(silent=True) or {}
+    cod, etapa = _cod_do_texto(d.get("codigo")), str(d.get("etapa") or "").strip().lower()
+    pedido = str(d.get("pedido") or "").strip()[:60] or None
+    if not cod or etapa not in ETAPAS or not pedido:
+        return jsonify({"success": False, "error": "Dados inválidos."}), 400
+    garantir_tabelas()
+    with db_session() as c:
+        c.execute("UPDATE etq_uso SET pedido=? WHERE codigo=? AND etapa=?", (pedido, cod, etapa))
+        ult = c.execute("SELECT id FROM etq_evento WHERE codigo=? AND etapa=? ORDER BY id DESC LIMIT 1", (cod, etapa)).fetchone()
+        if ult:
+            c.execute("UPDATE etq_evento SET pedido=? WHERE id=? AND pedido IS NULL", (pedido, ult["id"]))
+    return jsonify({"success": True})
+
+
+@recebimento_routes.post("/recebimento/unidade/soltar")
+@login_required
+def unidade_soltar():
+    """Desfaz a reserva: o bip não contou (falhou/cancelou), o pedido foi limpo, ou o supervisor libera.
+    Corpo: {etapa, codigo} ou {etapa, pedido} (todas as unidades daquele pedido nessa etapa). Operador só solta as dele."""
+    d = request.get_json(silent=True) or {}
+    etapa = str(d.get("etapa") or "").strip().lower()
+    cod = _cod_do_texto(d.get("codigo")) if d.get("codigo") else None
+    pedido = str(d.get("pedido") or "").strip()[:60] or None
+    motivo = str(d.get("motivo") or "").strip()[:200] or None
+    if etapa not in ("separacao", "expedicao", "full") or not (cod or pedido):
+        return jsonify({"success": False, "error": "Dados inválidos."}), 400
+    garantir_tabelas()
+    quem, gestor = _quem(), eh_gestor()
+    with db_session() as c:
+        if cod:
+            rows = c.execute("SELECT * FROM etq_uso WHERE codigo=? AND etapa=?", (cod, etapa)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM etq_uso WHERE pedido=? AND etapa=?", (pedido, etapa)).fetchall()
+        soltas = []
+        for r in rows:
+            if r["quem"] != quem and not gestor:
+                continue
+            c.execute("DELETE FROM etq_uso WHERE codigo=? AND etapa=?", (r["codigo"], etapa))
+            acao = "liberou" if (gestor and (d.get("liberar") or r["quem"] != quem)) else "soltou"
+            _evento(c, r["codigo"], etapa, acao, r["sku"], r["pedido"], quem, motivo or f"era de {_txt_uso(dict(r))}")
+            soltas.append(r["codigo"])
+    if cod and not soltas:
+        return jsonify({"success": False, "error": "Essa etiqueta não está contada nessa etapa (ou é de outra pessoa: só o supervisor libera)."}), 404
+    return jsonify({"success": True, "soltas": soltas})
+
+
+@recebimento_routes.get("/recebimento/unidade/<path:codigo>")
+@login_required
+def unidade_ver(codigo):
+    """Tudo o que aconteceu com uma unidade: de qual nota veio, quem imprimiu, quem conferiu, quem separou/expediu e as tentativas recusadas."""
+    cod = _cod_do_texto(codigo)
+    if not cod:
+        return jsonify({"success": False, "error": "Bipe ou digite a etiqueta do WMS (o código começa com U, ex.: U7K2M9QX)."}), 400
+    garantir_tabelas()
+    with db_session() as c:
+        e = c.execute("SELECT * FROM receb_etq WHERE codigo=?", (cod,)).fetchone()
+        etq = None
+        if e:
+            etq = dict(e)
+            n = c.execute("SELECT numero, fornecedor_nome, status FROM receb_notas WHERE id=?", (e["nota_id"],)).fetchone()
+            it = c.execute("SELECT descricao, sku, lote, validade FROM receb_itens WHERE id=?", (e["item_id"],)).fetchone()
+            etq.update({"nota_numero": n["numero"] if n else None, "fornecedor": n["fornecedor_nome"] if n else None,
+                        "nota_status": n["status"] if n else None, "descricao": it["descricao"] if it else None,
+                        "validade": it["validade"] if it else None, "lote": e["lote"] or (it["lote"] if it else None)})
+        usos = [dict(r) for r in c.execute("SELECT codigo, etapa, sku, pedido, quem, em, dia FROM etq_uso WHERE codigo=?", (cod,)).fetchall()]
+        evs = [dict(r) for r in c.execute("SELECT id, etapa, acao, sku, pedido, quem, em, detalhe FROM etq_evento WHERE codigo=? "
+                                         "ORDER BY em DESC, id DESC LIMIT 200", (cod,)).fetchall()]
+    if not etq and not usos and not evs:
+        return jsonify({"success": False, "error": f"{cod} não aparece em nada: a etiqueta não foi impressa por este sistema."}), 404
+    ordem = list(ETAPAS)
+    usos.sort(key=lambda u: ordem.index(u["etapa"]) if u["etapa"] in ordem else 99)
+    return jsonify({"success": True, "codigo": cod, "etiqueta": etq, "usos": usos, "eventos": evs, "etapas": ETAPAS})
+
+
+@recebimento_routes.get("/recebimento/unidade/ocorrencias")
+@login_required
+def unidade_ocorrencias():
+    """Supervisor: bip repetido, etiqueta de fora / substituída / de outra nota e liberações, no período (padrão: últimos 7 dias)."""
+    if not eh_gestor():
+        return jsonify({"success": False, "error": "Só supervisor/admin."}), 403
+    garantir_tabelas()
+    def _ts(s, fim=False):
+        try:
+            t = datetime.datetime.strptime(str(s), "%Y-%m-%d") + datetime.timedelta(hours=3)   # meia-noite em Brasília
+            return int((t - datetime.datetime(1970, 1, 1)).total_seconds()) + (86400 if fim else 0)
+        except Exception:
+            return None
+    ate = _ts(request.args.get("ate"), True) or (_agora() + 60)
+    de = _ts(request.args.get("de")) or (ate - 7 * 86400)
+    marcas = ",".join("?" * len(OCORRENCIAS))
+    with db_session() as c:
+        evs = [dict(r) for r in c.execute(f"SELECT id, codigo, etapa, acao, sku, pedido, quem, em, detalhe FROM etq_evento "
+                                          f"WHERE em>=? AND em<? AND acao IN ({marcas}) ORDER BY em DESC, id DESC LIMIT 1000",
+                                          (de, ate) + OCORRENCIAS).fetchall()]
+        tot = c.execute("SELECT COUNT(*) AS n FROM etq_evento WHERE em>=? AND em<? AND acao IN ('usou','de_novo','desconhecida','substituida')",
+                        (de, ate)).fetchone()
+    por = {}
+    for ev in evs:
+        p = por.setdefault(ev["quem"] or "?", {"quem": ev["quem"] or "?", "repetida": 0, "fora": 0, "liberou": 0})
+        if ev["acao"] == "repetida":
+            p["repetida"] += 1
+        elif ev["acao"] == "liberou":
+            p["liberou"] += 1
+        else:
+            p["fora"] += 1
+    pessoas = sorted(por.values(), key=lambda p: (-p["repetida"], -p["fora"], p["quem"]))
+    return jsonify({"success": True, "ocorrencias": evs, "pessoas": pessoas, "bipes": int(tot["n"] or 0) if tot else 0,
+                    "de": _dia_sp(de), "ate": _dia_sp(ate - 1), "etapas": ETAPAS})
 
 
 KITS_CACHE_S = 7 * 86400
