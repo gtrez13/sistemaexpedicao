@@ -82,11 +82,27 @@ def garantir_tabelas():
         if _tabelas_ok:
             return
         _garantir_tabelas()
+        _completar_validades()
         _tabelas_ok = True
     try:
         _vigia_ligar()          # notas esperando ser importadas no Bling (depois de reiniciar o serviço)
     except Exception:
         pass
+
+
+def _completar_validades():
+    """Nota aberta com item sem validade cuja descrição tem 'VAL: SET/29' / 'VAL: 09/2029' (antes não era lido): completa."""
+    try:
+        with db_session() as c:
+            rows = c.execute("SELECT i.id, i.descricao FROM receb_itens i JOIN receb_notas n ON n.id=i.nota_id "
+                             "WHERE n.status IN ('aguardando','conferindo','recusada') AND COALESCE(i.validade,'')='' "
+                             "AND COALESCE(i.validade_xml,'')=''").fetchall()
+            for r in rows:
+                vl = lote_da_descricao(r["descricao"])[1]
+                if vl:
+                    c.execute("UPDATE receb_itens SET validade_xml=?, validade=? WHERE id=?", (vl, vl, r["id"]))
+    except Exception as e:
+        print(f"⚠️ completar validades: {e}", flush=True)
 
 
 def _garantir_tabelas():
@@ -484,6 +500,10 @@ def _nota_dict(c, nid: int, com_pc: bool = True) -> dict | None:
             lt, vl = lote_da_descricao(it.get("descricao"))
             if lt:
                 it["lote_xml"], it["validade_xml"], it["lote_origem"] = lt, it.get("validade_xml") or vl, "descricao"
+        if not it.get("validade_xml"):
+            vl = lote_da_descricao(it.get("descricao"))[1]
+            if vl:
+                it["validade_xml"] = vl
         it["pc_qtd"] = float(it["pc_qtd"]) if it["pc_qtd"] is not None else None
     d["itens"] = itens
     _enderecos(c, itens)
@@ -618,18 +638,43 @@ def _comparacao(d: dict) -> dict | None:
 
 _RX_LOTE = re.compile(r"\b(?:LT|LOTE|LOT)\s*[:.]?\s*([A-Z0-9][A-Z0-9/\-.]{2,24})", re.I)
 _RX_VAL = re.compile(r"\b(?:VAL|VALIDADE|VENC|VCTO)\s*[:.]?\s*(\d{2})[/.-](\d{2})[/.-](\d{2,4})", re.I)
+# Biel 18/11: "VAL: SET/29", "Val: OUT/29" (Dermafreeze, NF 13003) e "VAL: 09/2029" não eram lidos -> etiqueta sem validade
+_MESES = {"JAN": 1, "FEV": 2, "FEB": 2, "MAR": 3, "ABR": 4, "APR": 4, "MAI": 5, "MAY": 5, "JUN": 6, "JUL": 7, "AGO": 8, "AUG": 8,
+          "SET": 9, "SEP": 9, "OUT": 10, "OCT": 10, "NOV": 11, "DEZ": 12, "DEC": 12}
+_RX_VAL_MES = re.compile(r"\b(?:VAL|VALIDADE|VENC|VCTO)\s*[:.]?\s*(JAN|FEV|FEB|MAR|ABR|APR|MAI|MAY|JUN|JUL|AGO|AUG|SET|SEP|OUT|OCT|NOV|DEZ|DEC)[A-Z]*"
+                         r"\s*[/.\- ]\s*(\d{2}|\d{4})\b", re.I)
+_RX_VAL_MA = re.compile(r"\b(?:VAL|VALIDADE|VENC|VCTO)\s*[:.]?\s*(\d{1,2})[/.-](\d{4}|\d{2})(?![/.\-]?\d)", re.I)
+
+
+def _fim_do_mes(ano, mes):
+    import calendar
+    return f"{ano:04d}-{mes:02d}-{calendar.monthrange(ano, mes)[1]:02d}"
 
 
 def lote_da_descricao(desc):
-    """Fornecedor sem <rastro> que escreve 'LT: 20240410 - VAL: 01/01/2040' na descrição -> (lote, 'AAAA-MM-DD')."""
+    """Fornecedor sem <rastro> que escreve a validade na descrição -> (lote, 'AAAA-MM-DD').
+    'VAL: 01/01/2040' (dia/mês/ano), 'VAL: SET/29' ou 'Val: OUT/2029' (mês por extenso: último dia do mês), 'VAL: 09/2029'."""
     t = str(desc or "")
-    m, v = _RX_LOTE.search(t), _RX_VAL.search(t)
+    m = _RX_LOTE.search(t)
     lote = m.group(1).strip(" -.") if m else ""
     val = ""
+    v = _RX_VAL.search(t)
     if v:
         d, mth, a = v.groups()
         a = ("20" + a) if len(a) == 2 else a
         val = f"{a}-{mth}-{d}"
+    else:
+        v = _RX_VAL_MES.search(t)
+        if v:
+            a = int(v.group(2)); a = a + 2000 if a < 100 else a
+            val = _fim_do_mes(a, _MESES[v.group(1).upper()[:3]])
+        else:
+            v = _RX_VAL_MA.search(t)
+            if v and 1 <= int(v.group(1)) <= 12:
+                a = int(v.group(2)); a = a + 2000 if a < 100 else a
+                val = _fim_do_mes(a, int(v.group(1)))
+    if lote and val:            # 'Lote: 151414/SQ VAL...' -> o lote não leva o pedaço da validade
+        lote = re.split(r"\s*\b(?:VAL|VALIDADE|VENC|VCTO)\b", lote, flags=re.I)[0].strip(" -.")
     return lote, val
 
 
