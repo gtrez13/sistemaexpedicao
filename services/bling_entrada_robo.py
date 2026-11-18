@@ -66,7 +66,18 @@ class _Tela:
         page.wait_for_function(f"() => {{ const b = ({js_botao})(); return b && !b.disabled; }}", timeout=60000)
         page.evaluate(f"() => {{ const b = ({js_botao})(); if (b) b.click(); }}")
         page.wait_for_function("() => !location.href.includes('login')", timeout=60000)
-        page.wait_for_load_state("networkidle")
+        # NÃO esperar "networkidle": o Bling fica consultando o servidor e a rede nunca para (Biel 18/11 17:41: Timeout 30000ms
+        # logo depois de entrar). Espera a página carregar e segue.
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+        page.wait_for_timeout(2500)
+        try:                                               # guarda a sessão nova: o próximo robô já entra logado
+            page.context.storage_state(path=os.path.join(BASE_DIR, "bling_state.json"))
+        except Exception:
+            pass
+        print("🔐 [ROBO ENTRADA] entrou no Bling.", flush=True)
 
     def wait_no_overlay(self, page, timeout_ms: int = 180000):
         """Espera o overlay (blockUI) do Bling sumir de verdade."""
