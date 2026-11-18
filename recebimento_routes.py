@@ -971,10 +971,16 @@ def _acha_item(itens, codigo: str):
 
 # ───────────────────────── etiqueta única por unidade (Biel 16/11) ─────────────────────────
 # Cada etiqueta impressa no recebimento tem um código só dela: QR "SKU*LOTE*U1234ABC" (sem lote: "SKU**U1234ABC").
-# A conferência é bipar cada etiqueta colada: cada código conta UMA vez (kit conta as unidades do kit).
-# RECEB_ETQ_UNICA: "nota" (padrão) = vale para a nota que já tem etiqueta com código (as telas novas sempre geram);
-#                  "1" = vale para todas as notas;  "0" = desligado (bip antigo, botão "Está tudo certo").
-ETQ_UNICA = (os.environ.get("RECEB_ETQ_UNICA", "nota").strip().lower() or "nota")
+# Biel 18/11: "o cara imprime todas as etiquetas dos produtos, funciona como está hoje, só que no fim tem que bipar todas
+# essas etiquetas para confirmar a unidade que entrou". Cada código conta UMA vez (kit conta as unidades do kit).
+# RECEB_ETQ_UNICA: "fim" (padrão) = confere como hoje (Está tudo certo / quantidade / bip do produto) e, na nota que tem etiqueta
+#                  com código, só fecha com as etiquetas bipadas = quantidade conferida de cada item (bip da etiqueta também conta
+#                  a unidade); "estrito" = a conferência é SÓ bipando a etiqueta (botão e digitar só supervisor);
+#                  "0" = desligado (sem código nas etiquetas).
+ETQ_UNICA = (os.environ.get("RECEB_ETQ_UNICA", "fim").strip().lower() or "fim")
+if ETQ_UNICA in ("nota", "1", "true", "sim", "on", "todas"):
+    ETQ_UNICA = "estrito"
+ETQ_DESLIGADA = ETQ_UNICA in ("0", "false", "nao", "não", "off")
 _RE_ETQ = re.compile(r"^U[0-9A-HJKMNP-TV-Z]{7}$")
 _ALFA = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"          # sem I, L, O, U: não confunde lendo o número impresso
 
@@ -993,19 +999,53 @@ def _parse_etq(lido):
     return p[0].strip(), (p[1].strip() or None) if len(p) > 1 else None, (p[2].strip().upper() or None) if len(p) > 2 else None
 
 
+def _tem_etq(c, nid) -> bool:
+    return not ETQ_DESLIGADA and bool(c.execute("SELECT 1 FROM receb_etq WHERE nota_id=? AND cancelado=0 LIMIT 1", (nid,)).fetchone())
+
+
 def _etq_ativa(c, nid) -> bool:
-    if ETQ_UNICA in ("0", "false", "nao", "não", "off"):
-        return False
-    if ETQ_UNICA in ("1", "true", "sim", "on", "todas"):
-        return True
-    return bool(c.execute("SELECT 1 FROM receb_etq WHERE nota_id=? LIMIT 1", (nid,)).fetchone())
+    """Modo estrito: na nota com etiqueta, a conferência é só bipando a etiqueta."""
+    return ETQ_UNICA == "estrito" and _tem_etq(c, nid)
+
+
+def _unid_bipadas(c, iid) -> int:
+    r = c.execute("SELECT COALESCE(SUM(mult),0) AS u FROM receb_etq WHERE item_id=? AND cancelado=0 AND bipado_em IS NOT NULL", (iid,)).fetchone()
+    return int(r["u"] or 0)
+
+
+def _confirmar_por_etiqueta(c, iid):
+    """Modo fim: a etiqueta bipada prova que a unidade está ali; o conferido nunca fica menor que o que foi bipado."""
+    if ETQ_UNICA == "estrito":
+        return _recontar(c, iid)
+    u = _unid_bipadas(c, iid)
+    it = c.execute("SELECT qtd_conferida FROM receb_itens WHERE id=?", (iid,)).fetchone()
+    if u > float(it["qtd_conferida"] or 0):
+        c.execute("UPDATE receb_itens SET qtd_conferida=? WHERE id=?", (float(u), iid))
+    return u
+
+
+def _faltam_etiquetas(c, nid):
+    """Itens da nota com etiqueta em que as etiquetas bipadas não batem com o conferido -> [{item_id, descricao, conferido, bipadas}]."""
+    if not _tem_etq(c, nid):
+        return []
+    out = []
+    for it in c.execute("SELECT id, n_item, descricao, qtd_conferida FROM receb_itens WHERE nota_id=? ORDER BY n_item", (nid,)).fetchall():
+        conf = int(round(float(it["qtd_conferida"] or 0)))
+        tem = c.execute("SELECT 1 FROM receb_etq WHERE item_id=? AND cancelado=0 LIMIT 1", (it["id"],)).fetchone()
+        b = _unid_bipadas(c, it["id"])
+        if conf <= 0 and b == 0:
+            continue
+        if not tem or b != conf:
+            out.append({"item_id": it["id"], "n_item": it["n_item"], "descricao": it["descricao"], "conferido": conf, "bipadas": b, "sem_etiqueta": not tem})
+    return out
 
 
 def _etq_info(c, nid, d):
     """Na nota: modo e, por item, quantas etiquetas e quantas já bipadas."""
     d["etq_modo"] = ETQ_UNICA
-    d["etq_suporte"] = ETQ_UNICA not in ("0", "false", "nao", "não", "off")
-    d["etq_unica"] = _etq_ativa(c, nid)
+    d["etq_suporte"] = not ETQ_DESLIGADA
+    d["etq_unica"] = _etq_ativa(c, nid)                 # estrito: só bipando a etiqueta
+    d["etq_confirmar"] = ETQ_UNICA == "fim" and _tem_etq(c, nid)    # fim: fecha só com todas as etiquetas bipadas
     rows = c.execute("SELECT item_id, COUNT(*) AS n, SUM(mult) AS u, SUM(CASE WHEN bipado_em IS NOT NULL THEN 1 ELSE 0 END) AS nb, "
                      "SUM(CASE WHEN bipado_em IS NOT NULL THEN mult ELSE 0 END) AS ub FROM receb_etq "
                      "WHERE nota_id=? AND cancelado=0 GROUP BY item_id", (nid,)).fetchall()
@@ -1043,7 +1083,7 @@ def etiquetas_codigos(nid):
     """Códigos únicos para imprimir. Corpo: {itens: [{item_id, grupos: [{sku, mult, qtd}]}]}  (grupo = etiqueta da unidade
     ou do kit). Devolve os mesmos códigos se já existirem (reimprimir não cria outros). Etiqueta além da quantidade da nota
     só quando todas as dele já foram bipadas (sobrou produto) ou com supervisor/admin."""
-    if ETQ_UNICA in ("0", "false", "nao", "não", "off"):
+    if ETQ_DESLIGADA:
         return jsonify({"error": "Etiqueta com código único está desligada (RECEB_ETQ_UNICA=0)."}), 409
     d = request.get_json(silent=True) or {}
     pedidos = d.get("itens") or []
@@ -1101,7 +1141,7 @@ def etiquetas_codigos(nid):
             for e in exist:
                 if e["codigo"] not in usados and not e["bipado_em"]:
                     c.execute("UPDATE receb_etq SET cancelado=1 WHERE codigo=?", (e["codigo"],))
-            if aberta:          # daqui pra frente o item conferido é só o que foi bipado (apaga "Está tudo certo" de antes)
+            if aberta and ETQ_UNICA == "estrito":    # estrito: o item conferido é só o que foi bipado (apaga "Está tudo certo")
                 _recontar(c, iid)
             out[str(iid)] = {"grupos": res}
         c.execute("UPDATE receb_notas SET atualizado_em=? WHERE id=?", (_agora(), nid))
@@ -1129,7 +1169,8 @@ def etiquetas_desbipar(nid):
             return jsonify({"error": "Nenhuma etiqueta bipada para desfazer."}), 404
         c.execute("UPDATE receb_etq SET bipado_em=NULL, bipado_por=NULL WHERE codigo=?", (e["codigo"],))
         _evento(c, e["codigo"], "recebimento", "soltou", e["sku"], None, _quem(), f"desfez a conferência (era de {e['bipado_por'] or '?'})")
-        _recontar(c, e["item_id"])
+        if ETQ_UNICA == "estrito":
+            _recontar(c, e["item_id"])
         novo = _item_resp(c, e["item_id"])
     return jsonify({"success": True, "item": novo, "codigo": e["codigo"], "falta": novo["qtd_nf"] - novo["qtd_conferida"]})
 
@@ -1154,7 +1195,7 @@ def _bipar_etq(c, nid, nota, sku, lote, cod):
         return {"success": False, "tipo": "repetida", "item": novo, "falta": novo["qtd_nf"] - novo["qtd_conferida"],
                 "error": f"Bipada por {e['bipado_por'] or '?'} às {hora}. Não contou de novo."}, 409
     c.execute("UPDATE receb_etq SET bipado_em=?, bipado_por=? WHERE codigo=? AND bipado_em IS NULL", (_agora(), _quem(), cod))
-    _recontar(c, e["item_id"])
+    _confirmar_por_etiqueta(c, e["item_id"])
     it = c.execute("SELECT lote FROM receb_itens WHERE id=?", (e["item_id"],)).fetchone()
     if lote and not (it and it["lote"]):
         c.execute("UPDATE receb_itens SET lote=? WHERE id=?", (str(lote)[:60], e["item_id"]))
@@ -1595,6 +1636,18 @@ def fechar(nid):
         d = _nota_dict(c, nid)
         if not d:
             return jsonify({"error": "Nota não encontrada."}), 404
+        if ETQ_UNICA == "fim":
+            faltam = _faltam_etiquetas(c, nid)
+            forcar = bool((request.get_json(silent=True) or {}).get("forcar")) and eh_gestor()
+            if faltam and not forcar:
+                det = "; ".join(f"item {f['n_item']} {str(f['descricao'] or '')[:30]}: "
+                                + ("sem etiqueta impressa" if f["sem_etiqueta"] else f"bipou {f['bipadas']} de {f['conferido']}") for f in faltam[:4])
+                return jsonify({"success": False, "tipo": "faltam_etiquetas", "faltam": faltam,
+                                "error": f"Bipe todas as etiquetas para confirmar as unidades que entraram. {det}"}), 409
+            if faltam:
+                for f in faltam:
+                    _evento(c, None, "recebimento", "liberou", None, d.get("numero"), _quem(),
+                            f"fechou sem bipar todas: item {f['n_item']} bipou {f['bipadas']} de {f['conferido']}")
         motivos = _divergencias(d)
         agora = _agora()
         if motivos:
