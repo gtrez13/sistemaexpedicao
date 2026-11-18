@@ -973,11 +973,11 @@ def _acha_item(itens, codigo: str):
 # Cada etiqueta impressa no recebimento tem um código só dela: QR "SKU*LOTE*U1234ABC" (sem lote: "SKU**U1234ABC").
 # Biel 18/11: "o cara imprime todas as etiquetas dos produtos, funciona como está hoje, só que no fim tem que bipar todas
 # essas etiquetas para confirmar a unidade que entrou". Cada código conta UMA vez (kit conta as unidades do kit).
-# RECEB_ETQ_UNICA: "fim" (padrão) = confere como hoje (Está tudo certo / quantidade / bip do produto) e, na nota que tem etiqueta
-#                  com código, só fecha com as etiquetas bipadas = quantidade conferida de cada item (bip da etiqueta também conta
-#                  a unidade); "estrito" = a conferência é SÓ bipando a etiqueta (botão e digitar só supervisor);
-#                  "0" = desligado (sem código nas etiquetas).
-ETQ_UNICA = (os.environ.get("RECEB_ETQ_UNICA", "fim").strip().lower() or "fim")
+# Biel 18/11 16:22: "a opção de Está tudo certo tem que sair, não pode mais ser assim: só bipando e colando".
+# RECEB_ETQ_UNICA: "estrito" (padrão) = em TODA nota aberta a conferência é só colando e bipando a etiqueta de cada unidade
+#                  (sem "Está tudo certo"/"Quantidade diferente"/bip do produto; supervisor/admin ajusta na mão);
+#                  "fim" = confere como antes e bipa as etiquetas no fim para fechar; "0" = desligado (sem código nas etiquetas).
+ETQ_UNICA = (os.environ.get("RECEB_ETQ_UNICA", "estrito").strip().lower() or "estrito")
 if ETQ_UNICA in ("nota", "1", "true", "sim", "on", "todas"):
     ETQ_UNICA = "estrito"
 ETQ_DESLIGADA = ETQ_UNICA in ("0", "false", "nao", "não", "off")
@@ -1004,8 +1004,8 @@ def _tem_etq(c, nid) -> bool:
 
 
 def _etq_ativa(c, nid) -> bool:
-    """Modo estrito: na nota com etiqueta, a conferência é só bipando a etiqueta."""
-    return ETQ_UNICA == "estrito" and _tem_etq(c, nid)
+    """Modo estrito: em toda nota a conferência é só bipando a etiqueta (sem etiqueta impressa ainda: imprima)."""
+    return ETQ_UNICA == "estrito"
 
 
 def _unid_bipadas(c, iid) -> int:
