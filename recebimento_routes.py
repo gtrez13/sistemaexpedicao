@@ -1904,11 +1904,25 @@ _TPAG_NOME = {1: "dinheiro", 2: "cheque", 3: "cartão de crédito", 4: "cartão 
               18: "transferência"}
 
 
-def _tpag_xml(xml):
-    """Meio de pagamento da NF (<detPag><tPag>). Nota com duplicatas e tPag 90/99/sem = boleto (15)."""
-    t = [int(x) for x in re.findall(r"<tPag>\s*(\d+)\s*</tPag>", xml or "") if x.isdigit()]
-    t = [x for x in t if x not in (90, 99)]
-    return t[0] if t else 15
+def _pag_xml(xml):
+    """Meio de pagamento da NF-e: (tPag, texto). <detPag><tPag> (e <xPag> no 99); 90 (sem pagamento) / sem detPag com
+    duplicata (<cobr><dup>) = boleto (15)."""
+    pags = re.findall(r"<detPag>(.*?)</detPag>", xml or "", re.S)
+    lst = []
+    for d in pags:
+        t = (re.search(r"<tPag>\s*(\d+)\s*</tPag>", d) or [None, ""])[1]
+        x = (re.search(r"<xPag>(.*?)</xPag>", d, re.S) or [None, ""])[1].strip()
+        if t.isdigit():
+            lst.append((int(t), x))
+    for t, x in lst:
+        if t not in (90, 99):
+            return t, _TPAG_NOME.get(t, f"tPag {t}")
+    for t, x in lst:
+        if t == 99 and x:
+            return 99, x
+    if re.search(r"<dup>", xml or ""):
+        return 15, "boleto (duplicatas da nota)"
+    return (lst[0][0] if lst else None), ""
 
 
 def _formas_bling():
@@ -1916,42 +1930,41 @@ def _formas_bling():
     return [x for x in ((js or {}).get("data") or []) if str(x.get("situacao", 1)) in ("1", "True", "true")] if st == 200 else []
 
 
-def _forma_pagamento(id_fornecedor, xml=None):
-    """Forma de pagamento das contas: env RECEB_FORMA_PAGAMENTO_ID; senão a mais usada nas contas a pagar desse fornecedor;
-    senão (fornecedor novo, Biel 18/11 NF 13003) a forma do Bling do mesmo meio de pagamento da NF (boleto quando tem duplicata);
-    senão a mais usada nas contas a pagar da empresa. -> (id, de onde veio) ou (None, formas que existem no Bling)."""
-    if os.environ.get("RECEB_FORMA_PAGAMENTO_ID"):
-        return int(os.environ["RECEB_FORMA_PAGAMENTO_ID"]), "configurada no WMS"
-    cont, geral = {}, {}
+def _uso_formas():
+    geral = {}
     for pag in (1, 2, 3):
         st, _, js = _bling_raw("GET", "/contas/pagar", params={"pagina": pag, "limite": 100})
         lst = (js or {}).get("data") or []
         for x in lst:
             f = (x.get("formaPagamento") or {}).get("id")
-            if not f:
-                continue
-            geral[int(f)] = geral.get(int(f), 0) + 1
-            if str((x.get("contato") or {}).get("id")) == str(id_fornecedor):
-                cont[int(f)] = cont.get(int(f), 0) + 1
+            if f:
+                geral[int(f)] = geral.get(int(f), 0) + 1
         if len(lst) < 100:
             break
-    if cont:
-        return max(cont, key=cont.get), "a mesma das últimas contas desse fornecedor"
+    return geral
+
+
+def _forma_pagamento(id_fornecedor, xml=None):
+    """Forma de pagamento das contas = a da NF-e (Biel 18/11: "tem que ser via NF-e, tem que pôr o que aparece no XML"):
+    a forma ativa do Bling com o mesmo tPag (pelo tipoPagamento ou pelo nome; no 99, pelo <xPag>); empate = a mais usada.
+    Sem nenhuma forma do Bling desse meio: RECEB_FORMA_PAGAMENTO_ID do .env; senão não lança e diz o que a nota pede.
+    -> (id, de onde veio) ou (None, explicação)."""
+    tp, txt = _pag_xml(xml)
     formas = _formas_bling()
-    tp = _tpag_xml(xml)
-    nome = _TPAG_NOME.get(tp, "")
-    cands = [x for x in formas if str(x.get("tipoPagamento") or "").lstrip("0") == str(tp)]
-    if not cands and nome:
-        cands = [x for x in formas if nome.split()[0] in str(x.get("descricao") or "").lower()]
+    cands = [x for x in formas if tp and str(x.get("tipoPagamento") or "").lstrip("0") == str(tp)] if tp != 99 else []
+    if not cands and txt:
+        chave = re.sub(r"\(.*?\)", "", txt).strip().lower().split()[0] if txt.strip() else ""
+        cands = [x for x in formas if chave and chave[:5] in str(x.get("descricao") or "").lower()]
     if cands:
-        cands.sort(key=lambda x: (-geral.get(int(x["id"]), 0), 0 if x.get("padrao") else 1))
+        if len(cands) > 1:
+            uso = _uso_formas()
+            cands.sort(key=lambda x: (-uso.get(int(x["id"]), 0), 0 if x.get("padrao") else 1))
         f = cands[0]
-        return int(f["id"]), f"{f.get('descricao') or nome} (o meio de pagamento da nota{': ' + nome if nome else ''})"
-    if geral:
-        f = max(geral, key=geral.get)
-        d = next((x.get("descricao") for x in formas if int(x.get("id") or 0) == f), None)
-        return f, f"{d or 'a forma'} mais usada nas contas a pagar"
-    return None, ", ".join(f"{x.get('descricao')} (id {x.get('id')})" for x in formas[:8]) or None
+        return int(f["id"]), f"{f.get('descricao')} (pela NF-e: {txt or 'tPag ' + str(tp)})"
+    if os.environ.get("RECEB_FORMA_PAGAMENTO_ID"):
+        return int(os.environ["RECEB_FORMA_PAGAMENTO_ID"]), f"configurada no WMS (a NF-e diz {txt or tp or 'nada'}, sem forma igual no Bling)"
+    return None, (f"a NF-e diz {txt or 'tPag ' + str(tp)} e não achei forma assim no Bling" if tp else "a NF-e não diz o meio de pagamento") + \
+        (". Formas no Bling: " + ", ".join(f"{x.get('descricao')} (id {x.get('id')})" for x in formas[:8]) if formas else "")
 
 
 VIGIA_S = int(os.environ.get("RECEB_VIGIA_S", "180"))          # de quanto em quanto tempo procura a nota no Bling
@@ -2204,8 +2217,7 @@ def plano_entrada(nid, resumo=None):
     else:
         fp, origem_fp = _forma_pagamento(forn, r["xml"])
         if not fp:
-            ponto(False, "Contas a pagar", "não achei a forma de pagamento (fornecedor sem contas antes e nenhuma forma parecida no Bling): "
-                                           "ponha RECEB_FORMA_PAGAMENTO_ID=<id> no .env" + (f". Formas no Bling: {origem_fp}" if origem_fp else ""))
+            ponto(False, "Contas a pagar", f"forma de pagamento: {origem_fp}. Cadastre essa forma no Bling (ou ponha RECEB_FORMA_PAGAMENTO_ID=<id> no .env)")
         tot = round(sum(d["valor"] for d in dups), 2)
         for k, d in enumerate(dups):
             plano["contas"].append({"numero": d["numero"], "vencimento": d["vencimento"], "valor": d["valor"],
