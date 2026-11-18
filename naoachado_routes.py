@@ -21,6 +21,13 @@ saldo de antes no Bling (lançamento de entrada). A decisão do admin não zera 
 NAO_ACHADO_ZERAR_QUANDO=relato (padrão) | decisao (jeito antigo: só quando o admin confirma).
 Só escreve no Bling com NAO_ACHADO_ZERAR_BLING=1 (senão fica "desligado"). Falha nunca derruba nada: fica gravado e o
 admin pode "reprocessar". NAO_ACHADO_DISCORD_WEBHOOK (opcional): manda o aviso também no Discord.
+
+AVISO AO COMPRADOR (Biel 18/11: "subisse uma notificação para o Kauan de produtos que foram zerados e que estão sem
+estoque, no sistema dele, o compras.lhvmed.com.br"): zerou (ou o Bling já estava sem saldo) -> POST no StockMind
+{COMPRAS_API_URL}/wms/estoque-zerado com Bearer COMPRAS_TOKEN (o mesmo valor do WMS_TOKEN do StockMind). O produto
+aparece grifado na tela de Estoque do comprador. "Achei" -> evento estoque_restaurado e o aviso some de lá.
+Sem COMPRAS_API_URL/COMPRAS_TOKEN fica "simulado" (só registrado). Falha nunca derruba nada: fica "erro" e o admin
+pode "reprocessar"; naoachado_compras.py manda os que ficaram para trás.
 """
 from __future__ import annotations
 
@@ -95,7 +102,8 @@ def garantir_tabelas(conn=None):
         """)
         c.execute("CREATE INDEX IF NOT EXISTS ix_nao_achado_status ON nao_achado (status, reportado_em)")
         extras = [("estoque_status", "TEXT"), ("estoque_anterior", "DOUBLE PRECISION"), ("estoque_msg", "TEXT"),
-                  ("estoque_zerado_em", "BIGINT"), ("velaplace_status", "TEXT"), ("velaplace_msg", "TEXT")]
+                  ("estoque_zerado_em", "BIGINT"), ("velaplace_status", "TEXT"), ("velaplace_msg", "TEXT"),
+                  ("compras_status", "TEXT"), ("compras_msg", "TEXT")]
         if os.environ.get("DATABASE_URL"):
             for col, tp in extras:
                 c.execute(f"ALTER TABLE nao_achado ADD COLUMN IF NOT EXISTS {col} {tp}")
@@ -231,6 +239,7 @@ def _zerar_agora(nid):
                          "velaplace_status=?, velaplace_msg=? WHERE id=?",
                          (est, antes, (msg or "")[:300], int(time.time()) if est in ("ok", "ja_zerado") else None,
                           vst, (vmsg or "")[:300] or None, nid))
+        _compras_zerado(nid, r, est, antes, motivo)
         _avisar_discord(r, est, antes)
     except Exception as e:
         print(f"⚠️ não achado {nid}: zerar no Bling falhou: {e}", flush=True)
@@ -274,6 +283,41 @@ def avisar_velaplace(dados: dict):
         return "erro", f"{type(e).__name__}: {e}"[:300]
 
 
+def avisar_compras(evento: str, r, antes=None, motivo: str = "", quem: str | None = None):
+    """StockMind (compras.lhvmed.com.br): avisa o comprador. -> (status, mensagem). status: ok | simulado | erro.
+    evento: estoque_zerado | estoque_restaurado. Idempotente do lado de lá por ocorrencia_id."""
+    base = os.environ.get("COMPRAS_API_URL", "").strip().rstrip("/")
+    token = os.environ.get("COMPRAS_TOKEN", "").strip()
+    if not base or not token:
+        return "simulado", "StockMind não configurado (COMPRAS_API_URL/COMPRAS_TOKEN): aviso só registrado."
+    r = dict(r)
+    corpo = {"evento": evento, "ocorrencia_id": r["id"], "sku": r["sku"], "produto": r.get("nome") or None,
+             "quantidade_anterior": antes, "quantidade_pedido": r.get("qtd"), "pedido": r.get("ml_id") or None,
+             "motivo": (motivo or "")[:400] or None, "relatado_por": quem or r.get("reportado_por"),
+             "zerado_em": r.get("reportado_em"), "origem": "wms-lhvmed"}
+    try:
+        import requests
+        w = requests.post(base + "/wms/estoque-zerado", json=corpo, timeout=8,
+                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        if w.status_code in (200, 201, 202, 204):
+            return "ok", ("Comprador avisado no StockMind." if evento == "estoque_zerado" else "StockMind avisado que o produto foi achado.")
+        return "erro", f"StockMind HTTP {w.status_code}: {w.text[:150]}"
+    except Exception as e:
+        return "erro", f"{type(e).__name__}: {e}"[:300]
+
+
+def _compras_zerado(nid, r, est, antes, motivo):
+    """Zerou (ou já estava sem saldo): avisa o comprador e grava o resultado. Nunca levanta."""
+    if est not in ("ok", "ja_zerado"):
+        return
+    try:
+        cst, cmsg = avisar_compras("estoque_zerado", r, antes, motivo)
+        with db_session() as conn:
+            conn.execute("UPDATE nao_achado SET compras_status=?, compras_msg=? WHERE id=?", (cst, (cmsg or "")[:300], nid))
+    except Exception as e:
+        print(f"⚠️ não achado {nid}: aviso ao StockMind falhou: {e}", flush=True)
+
+
 def _executar_final(conn, nid, r, parecer):
     """Zera no Bling e avisa o Velaplace; grava o resultado na ocorrência."""
     if r["estoque_status"] in ("ok", "ja_zerado", "restaurado", "zerando"):   # já tratado (no relato / achou): não zera de novo
@@ -293,7 +337,12 @@ def _executar_final(conn, nid, r, parecer):
         "UPDATE nao_achado SET estoque_status=?, estoque_anterior=?, estoque_msg=?, estoque_zerado_em=?, "
         "velaplace_status=?, velaplace_msg=? WHERE id=?",
         (est, antes, msg[:300], (r["estoque_zerado_em"] or agora) if est in ("ok", "ja_zerado") else None, vst, (vmsg or "")[:300] or None, nid))
-    return {"estoque_status": est, "estoque_msg": msg, "velaplace_status": vst, "velaplace_msg": vmsg}
+    cst = cmsg = None
+    if est in ("ok", "ja_zerado") and r["compras_status"] != "ok":
+        cst, cmsg = avisar_compras("estoque_zerado", r, antes, r["explicacao"] or parecer or "")
+        conn.execute("UPDATE nao_achado SET compras_status=?, compras_msg=? WHERE id=?", (cst, (cmsg or "")[:300], nid))
+    return {"estoque_status": est, "estoque_msg": msg, "velaplace_status": vst, "velaplace_msg": vmsg,
+            "compras_status": cst or r["compras_status"], "compras_msg": cmsg or r["compras_msg"]}
 
 
 def _fmt(r, agora=None):
@@ -434,6 +483,14 @@ def achei(nid):
         conn.execute("UPDATE nao_achado SET status='explicado', explicacao=?, explicado_por=?, explicado_em=?, "
                      "estoque_status=CASE WHEN estoque_status='ok' THEN 'restaurado' ELSE estoque_status END, estoque_msg=? WHERE id=?",
                      (("ACHADO: " + texto)[:1000], _quem(), int(time.time()), msg[:300], nid))
+    if r["compras_status"] in ("ok", "erro"):           # o comprador sabia (ou podia saber): tira o aviso de lá
+        try:
+            cst, cmsg = avisar_compras("estoque_restaurado", r, None, texto, _quem())
+            with db_session() as conn:
+                conn.execute("UPDATE nao_achado SET compras_status=?, compras_msg=? WHERE id=?",
+                             ("achado" if cst == "ok" else cst, (cmsg or "")[:300], nid))
+        except Exception as e:
+            print(f"⚠️ não achado {nid}: aviso de achado ao StockMind falhou: {e}", flush=True)
     return jsonify({"success": True, "estoque_msg": msg})
 
 
@@ -476,6 +533,11 @@ def reprocessar(nid):
         r = conn.execute("SELECT * FROM nao_achado WHERE id=?", (nid,)).fetchone()
         if not r:
             return jsonify({"error": "Ocorrência não encontrada."}), 404
+        if r["compras_status"] == "erro" and r["estoque_status"] in ("ok", "ja_zerado"):
+            cst, cmsg = avisar_compras("estoque_zerado", r, r["estoque_anterior"], r["explicacao"] or "")
+            conn.execute("UPDATE nao_achado SET compras_status=?, compras_msg=? WHERE id=?", (cst, (cmsg or "")[:300], nid))
+            if r["status"] not in ("aceito", "cobrar") or (r["velaplace_status"] in ("ok", "simulado") and r["estoque_status"] in ("ok", "ja_zerado")):
+                return jsonify({"success": cst == "ok", "compras_status": cst, "compras_msg": cmsg})
         if r["status"] not in ("aceito", "cobrar"):
             return jsonify({"error": "Só depois da decisão do admin."}), 409
         if r["estoque_status"] in ("ok", "ja_zerado") and r["velaplace_status"] in ("ok", "simulado"):
