@@ -26,6 +26,7 @@ EVENTO_CONFIRMO = "210200"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FOTOS = os.path.join(BASE_DIR, "downloads", "robo_entrada")
 _lock = threading.Lock()          # um robô por vez
+UA = os.environ.get("BLING_ROBO_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
 class RoboErro(Exception):
@@ -69,19 +70,28 @@ class _Tela:
         user, pwd = os.getenv("BLING_USER"), os.getenv("BLING_PASS")
         if not user or not pwd:
             raise RoboErro(_msg_login(page, "a sessão expirou e BLING_USER / BLING_PASS não estão no .env"))
-        js_botao = "() => [...document.querySelectorAll('button,div')].find(e => (e.innerText||'').trim() === 'Entrar')"
+        # tela de login de 18/11: input#username, input#login-password (PrimeVue), button[type=submit] "Entrar" no form#login.
+        # Digita tecla por tecla e entra com Enter, como uma pessoa (o fill direto deixava o campo da senha vazio pro Vue:
+        # "O nome de usuário ou a senha estão incorretos" com a senha certa no .env)
         try:
             page.wait_for_selector("#username", state="visible", timeout=30000)
-            page.wait_for_timeout(800)                         # o React do Bling precisa desse tempo
-            page.fill("#username", user)
-            page.fill("input[type='password']", pwd)
-            page.wait_for_function(f"() => {{ const b = ({js_botao})(); return b && !b.disabled; }}", timeout=30000)
+            page.wait_for_timeout(1200)
+            usu = page.locator("#username").first
+            sen = page.locator("#login-password, input[type='password']").first
+            usu.click(); usu.fill(""); usu.press_sequentially(user, delay=35)
+            page.wait_for_timeout(300)
+            sen.click(); sen.fill(""); sen.press_sequentially(pwd, delay=35)
+            page.wait_for_timeout(400)
+            if usu.input_value() != user or len(sen.input_value()) != len(pwd):
+                raise RuntimeError("campo não ficou preenchido")
         except Exception:
-            raise RoboErro(_msg_login(page, "a tela de login não liberou o botão Entrar (o Bling pode estar pedindo captcha)"))
-        page.evaluate(f"() => {{ const b = ({js_botao})(); if (b) b.click(); }}")
+            raise RoboErro(_msg_login(page, "não consegui preencher usuário e senha na tela de login"))
+        sen.press("Enter")
         try:
-            page.wait_for_function("() => !location.href.includes('login')", timeout=60000)
+            page.wait_for_function("() => !location.href.includes('login') || /incorret|inv[aá]lid|bloquead/i.test(document.body.innerText)", timeout=60000)
         except Exception:
+            pass
+        if "login" in (page.url or ""):
             raise RoboErro(_msg_login(page, "depois de Entrar continuou na tela de login (senha, captcha ou verificação)"))
         try:
             page.wait_for_load_state("domcontentloaded", timeout=60000)
@@ -92,7 +102,8 @@ class _Tela:
             txt = page.inner_text("body", timeout=5000)[:1500]
         except Exception:
             txt = ""
-        if re.search(r"c[oó]digo de (verifica|seguran|acesso)|verifica[cç][aã]o em (duas|2)|novo dispositivo|confirme (seu|o) acesso", txt, re.I):
+        if re.search(r"c[oó]digo de (verifica|seguran|acesso)|verifica[cç][aã]o em (duas|2)|novo dispositivo|confirme (seu|o) acesso|"
+                     r"enviamos um c[oó]digo|digite o c[oó]digo|receber (o c[oó]digo|por)|whatsapp", txt, re.I) or "mfa" in (page.url or "").lower():
             raise RoboErro(_msg_login(page, "o Bling pediu código de verificação no login"))
         # NÃO esperar "networkidle": o Bling fica consultando o servidor e a rede nunca para (Timeout 30000ms, 18/11 17:41)
         try:                                               # guarda a sessão nova: o próximo robô já entra logado
@@ -128,9 +139,11 @@ def manifestar_e_importar(numero: str, chave: str = "", valor: float | None = No
         raise RoboErro("outro robô do Bling está rodando há mais de 10 min")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
+            browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"],
+                                        ignore_default_args=["--enable-automation"])
             estado = os.path.join(BASE_DIR, "bling_state.json")
-            context = browser.new_context(storage_state=estado if os.path.exists(estado) else None,
+            context = browser.new_context(storage_state=estado if os.path.exists(estado) else None, user_agent=UA, locale="pt-BR",
+                                          timezone_id="America/Sao_Paulo",
                                           viewport={"width": 1440, "height": 900})
             page = context.new_page()
             rpa = _Tela()
@@ -287,9 +300,11 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
         raise RoboErro("outro robô do Bling está rodando há mais de 10 min")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
+            browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"],
+                                        ignore_default_args=["--enable-automation"])
             estado = os.path.join(BASE_DIR, "bling_state.json")
-            context = browser.new_context(storage_state=estado if os.path.exists(estado) else None,
+            context = browser.new_context(storage_state=estado if os.path.exists(estado) else None, user_agent=UA, locale="pt-BR",
+                                          timezone_id="America/Sao_Paulo",
                                           viewport={"width": 1600, "height": 900})
             page = context.new_page()
             rpa = _Tela()
