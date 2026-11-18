@@ -14,7 +14,9 @@ Registrado no blueprint do mapa (url_prefix /api) por registrar(bp). Rotas:
   POST /full/remessas/<id>/bipar         {codigo, quantidade}  -> etiqueta {codigo, titulo, variacao, qtd}
   POST /full/remessas/<id>/desfazer      {item_id?}            desfaz o último bip (do item)
   POST /full/remessas/<id>/status        {status: aberta|separada|enviada|cancelada}
-  POST /full/remessas/<id>/reimprimir    {item_id, qtd}        manda N etiquetas de novo para a fila
+  POST /full/remessas/<id>/reimprimir    {item_id, qtd, imprime_aqui?}  N etiquetas de novo, com a mesma validade/lote (fila ou o aparelho)
+  POST /full/remessas/<id>/validade      {item_id, validade?}  produto sem etiqueta do Full (código universal) que o ML exige validade:
+                                                              etiquetas só de validade/lote, uma por unidade separada
   GET  /full/etiquetas/fila?estacao=     computador da Elgin reserva e recebe as etiquetas que faltam imprimir
   POST /full/etiquetas/impressas         {ids, estacao}        confirma as impressas (sem confirmar, voltam para a fila em 30 s)
   GET  /full/novas                       remessas abertas (aviso com som em qualquer tela)
@@ -957,7 +959,7 @@ def registrar(bp):
             c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, impresso_em, impresso_por, detalhe, lote, validade) "
                       "VALUES (?,?,?,?,?,2,?,?,?,?,?)",
                       (rid, it["id"], 1, _quem(), agora, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None, json.dumps({"etq": 1}),
-                       lote, val if it.get("exige_validade") else None))
+                       lote, val))
             bip_id = c.execute("SELECT MAX(id) AS m FROM full_bips WHERE remessa_id=? AND item_id=? AND em=? AND reimpressao=2", (rid, it["id"], agora)).fetchone()["m"]
             novo = _rem(c, rid)
         itn = next(x for x in novo["itens"] if x["id"] == it["id"])
@@ -965,8 +967,8 @@ def registrar(bp):
                         "por_kit": [{"sku": cp["sku"], "q": int(cp["q"]), "nome": cp.get("nome")} for cp in (it["comp"] or [])],
                         "remessa": {k2: novo[k2] for k2 in ("unidades", "separadas", "etiquetadas", "a_etiquetar", "prontas_para_etiquetar", "status")},
                         "etq_esperando": novo.get("etq_esperando", 0), "estacao": novo.get("estacao"),
-                        "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": 1,
-                                     "validade": val if it.get("exige_validade") else None, "lote": lote if it.get("exige_validade") else None}})
+                        "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "qtd": 1, "sku": it["sku"],
+                                     "validade": val, "lote": lote}})
 
     @bp.post("/full/remessas/<int:rid>/desetiquetar")
     @login_required
@@ -1004,21 +1006,90 @@ def registrar(bp):
     @bp.post("/full/remessas/<int:rid>/reimprimir")
     @login_required
     def full_reimprimir(rid):
-        """Etiqueta estragou ou caiu: manda N de novo para a fila da estação (não mexe no separado)."""
+        """Etiqueta estragou ou caiu: sai de novo com a mesma validade/lote (não mexe no separado). imprime_aqui: o aparelho
+        imprime (devolve a etiqueta pronta); senão vai para a fila da estação."""
         _tabelas()
         d = request.get_json(silent=True) or {}
         try:
             iid, q = int(d.get("item_id")), max(1, min(500, int(d.get("qtd") or 1)))
         except (TypeError, ValueError):
             return jsonify({"error": "item_id e qtd"}), 400
+        aqui = bool(d.get("imprime_aqui"))
         with db_session() as c:
             it = c.execute("SELECT * FROM full_itens WHERE id=? AND remessa_id=?", (iid, rid)).fetchone()
             if not it:
                 return jsonify({"error": "Produto não está nesta remessa."}), 404
-            ult = c.execute("SELECT lote, validade FROM full_bips WHERE item_id=? AND reimpressao=2 AND desfeito=0 ORDER BY id DESC LIMIT 1", (iid,)).fetchone()
-            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, lote, validade) VALUES (?,?,?,?,?,1,?,?)",
-                      (rid, iid, q, _quem(), int(time.time()), ult["lote"] if ult else None, (ult["validade"] if ult else None) or it["validade_etq"]))
-        return jsonify({"success": True})
+            ult = c.execute("SELECT lote, validade FROM full_bips WHERE item_id=? AND reimpressao IN (1,2) AND desfeito=0 AND validade IS NOT NULL "
+                            "ORDER BY id DESC LIMIT 1", (iid,)).fetchone() \
+                or c.execute("SELECT lote, validade FROM full_bips WHERE item_id=? AND reimpressao=2 AND desfeito=0 ORDER BY id DESC LIMIT 1", (iid,)).fetchone()
+            lote, val = (ult["lote"] if ult else None), (ult["validade"] if ult else None) or it["validade_etq"]
+            if not val:
+                lote2, val2 = _lote_da_etiqueta(c, dict(it, comp=json.loads(it["comp"]) if it["comp"] else None, etiquetado=0), "")
+                lote, val = lote or lote2, val2
+            if it["exige_validade"] and not val:
+                return jsonify({"success": False, "tipo": "precisa_validade", "item_id": iid, "titulo": it["titulo"],
+                                "error": f"{str(it['titulo'])[:50]}: o ML exige validade e o sistema não sabe qual é. Bipe a unidade em Etiquetar para digitar a validade."}), 409
+            agora = int(time.time())
+            c.execute("INSERT INTO full_bips (remessa_id, item_id, qtd, por, em, reimpressao, lote, validade, impresso_em, impresso_por) VALUES (?,?,?,?,?,1,?,?,?,?)",
+                      (rid, iid, q, _quem(), agora, lote, val, agora if aqui else None, f"{_quem()} (no aparelho)" if aqui else None))
+        return jsonify({"success": True, "etiqueta": {"codigo": it["inventory_id"], "titulo": it["titulo"], "variacao": it["variacao"], "sku": it["sku"],
+                                                      "qtd": q, "lote": lote, "validade": val}})
+
+    @bp.post("/full/remessas/<int:rid>/validade")
+    @login_required
+    def full_validade(rid):
+        """Produto que vai SEM etiqueta do Full (o ML lê o código de barras) mas o ML exige validade impressa em cada unidade:
+        etiqueta só de validade/lote, uma por unidade separada, com o lote de cada unidade. Corpo: {item_id, validade?}
+        (validade digitada da embalagem vale para as unidades sem lote conhecido e fica guardada no item)."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        try:
+            iid = int(d.get("item_id"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "item_id"}), 400
+        with db_session() as c:
+            r = _rem(c, rid)
+            if not r:
+                return jsonify({"success": False, "error": "Remessa não encontrada."}), 404
+            it = next((x for x in r["itens"] if int(x["id"]) == iid), None)
+            if not it:
+                return jsonify({"success": False, "error": "Produto não está nesta remessa."}), 404
+            lim = _limite_validade(r)
+            if d.get("validade"):
+                v = _data_iso(d["validade"])
+                if not v:
+                    return jsonify({"success": False, "tipo": "precisa_validade", "error": "Validade inválida: digite como 05/2028 ou 01/05/2028."}), 400
+                if it.get("exige_validade") and v < lim:
+                    return jsonify({"success": False, "tipo": "validade_curta",
+                                    "error": f"Validade {v[8:10]}/{v[5:7]}/{v[:4]}: o Full só aceita depois de {lim[8:10]}/{lim[5:7]}/{lim[:4]}."}), 409
+                c.execute("UPDATE full_itens SET validade_etq=? WHERE id=?", (v, iid))
+                it["validade_etq"] = v
+            comp = it["comp"] or []
+            grupos, sem = {}, 0
+            for b in c.execute("SELECT lote, validade, detalhe FROM full_bips WHERE item_id=? AND reimpressao=0 AND desfeito=0 ORDER BY id", (iid,)).fetchall():
+                try:
+                    det = json.loads(b["detalhe"] or "{}")
+                except Exception:
+                    det = {}
+                n = int(det.get("un") or 0) if not comp else int((det.get("comp") or {}).get("0") or 0) // max(1, int(comp[0]["q"]))
+                if n <= 0:
+                    continue
+                val = b["validade"] or it.get("validade_etq")
+                if not val:
+                    sem += n
+                    continue
+                k = (b["lote"] if b["validade"] else None, val[:10])
+                grupos[k] = grupos.get(k, 0) + n
+            if sem:
+                return jsonify({"success": False, "tipo": "precisa_validade", "item_id": iid, "titulo": it["titulo"], "minima": lim, "sem": sem,
+                                "error": f"{sem} unidade(s) sem lote conhecido: digite a validade impressa na embalagem."}), 409
+            curtas = [v for (_, v) in grupos if it.get("exige_validade") and v < lim]
+            if curtas:
+                v = min(curtas)
+                return jsonify({"success": False, "tipo": "validade_curta",
+                                "error": f"Tem unidade com validade {v[8:10]}/{v[5:7]}/{v[:4]}: o Full só aceita depois de {lim[8:10]}/{lim[5:7]}/{lim[:4]}. Troque o lote antes de mandar."}), 409
+        etqs = [{"titulo": it["titulo"], "sku": it["sku"], "lote": lt, "validade": v, "qtd": n} for (lt, v), n in sorted(grupos.items(), key=lambda x: x[0][1])]
+        return jsonify({"success": True, "etiquetas": etqs, "unidades": sum(e["qtd"] for e in etqs), "separado": int(it["separado"] or 0)})
 
     @bp.get("/full/etiquetas/fila")
     @login_required
