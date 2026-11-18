@@ -16,6 +16,7 @@ PY=venv/bin/python; [ -x "$PY" ] || PY=python3
 
 # versões do recebimento_routes.py que já saíram do git (hash do conteúdo -> commit)
 CONHECIDAS="
+1a704f35ffb6c35e3bb95ec83d9de06d698b62f0 5bdf799
 1ce4feafcd1c02c841bad9ce3d5129f556d9d2d3 2a7e639
 47bfc413a14fedcd252c2eeef086812379dd5125 9afaf4f
 7f26b35e676410b6af5f00461dbdd3d43091e5af 7ca9eee
