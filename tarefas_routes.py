@@ -26,6 +26,16 @@ Registrado no blueprint do mapa (url_prefix /api) por registrar(bp). Rotas:
   GET  /inventario/divergencias[?status=]    admin/supervisor
   POST /inventario/divergencias/<id>/decidir {acao: substituir|manter|recontar|reler, valor?}   admin (reler: supervisor também)
 
+INVENTÁRIO GERAL (Biel 19/11): o galpão inteiro de uma vez, uma contagem por estrutura, conferido com o Bling produto por
+produto (ver o bloco "inventário geral" abaixo). Rotas:
+  GET  /inventario/geral                     o geral aberto (ou o último): contagens, produtos por situação, o que falta
+  POST /inventario/geral                     admin/supervisor: começa (uma contagem por estrutura do mapa)
+  POST /inventario/geral/proxima             pega para quem tocou a próxima contagem do geral
+  POST /inventario/geral/<id>/item           {sku_key, acao: pegar|contar|nao_encontrei, qtd?, porta_palet?, posicao?}
+  POST /inventario/geral/<id>/devolver       admin: {sku_key} o Não encontrei apareceu -> devolve o saldo no Bling
+  POST /inventario/geral/<id>/buscar         admin/supervisor: procura de novo no Bling o que ninguém contou
+  POST /inventario/geral/<id>/encerrar       admin: {cancelar?}
+
 Ajustes (.env): INV_HORA=14:00, INV_DIAS=12345 (seg..sex), INV_AVISO_MIN=15, INV_AVISO_ADMIN=0, INV_BLING_ESCREVER=1, INV_LIGADO=1."""
 from __future__ import annotations
 
@@ -166,6 +176,7 @@ def _tabelas():
             valor DOUBLE PRECISION, bling_msg TEXT, visto INTEGER NOT NULL DEFAULT 0)""")
         c.execute("CREATE INDEX IF NOT EXISTS ix_inv_div_status ON inv_divergencia (status, criado_em)")
         c.execute("CREATE TABLE IF NOT EXISTS inv_dia (dia TEXT PRIMARY KEY, tarefa_id BIGINT, em BIGINT)")
+        _tabelas_geral(c, pk)
     _ok_tab = True
 
 
@@ -191,7 +202,8 @@ def _fmt(t, vistas=None):
     if t.get("tipo") == "inventario":
         out["inventario"] = {"posicoes": len(ref.get("posicoes") or []), "estruturas": ref.get("estruturas") or [],
                              "rodada": ref.get("rodada", 1), "recontar": len(ref.get("recontar") or []), "dia": ref.get("dia"),
-                             "so_skus": bool(ref.get("so_skus"))}
+                             "so_skus": bool(ref.get("so_skus")), "geral": ref.get("geral"),
+                             "geral_recontar": bool(ref.get("geral_recontar"))}
     if vistas is not None:
         out["vista"] = t["id"] in vistas
     return out
@@ -293,6 +305,9 @@ def _gerar_hoje(forcar=False):
         return None
     if not forcar and (not _eh_dia_util() or not _passou_da_hora()):
         return None
+    with db_session() as c:
+        if _geral_aberto(c):           # inventário geral aberto: rotativo pausado
+            return None
     with _lk:
         with db_session() as c:
             r = c.execute("SELECT tarefa_id FROM inv_dia WHERE dia=?", (_hoje(),)).fetchone()
@@ -473,6 +488,460 @@ def _conferir(tid):
             pass
     finally:
         _conferindo.discard(tid)
+
+
+# ─────────────────────────── inventário geral (Biel 19/11) ───────────────────────────
+# "Vamos fazer um inventário cheio do galpão inteiro ... ir batendo como está o fluxo hoje do inventário."
+# Começar (admin/supervisor): uma contagem por estrutura do mapa, todas de uma vez; cada um pega uma e conta às cegas.
+# Bate por PRODUTO, não por contagem: quando todas as posições de um produto no mapa já foram contadas (por quem for),
+# o WMS soma e confere com o Bling (contado + separado esperando sair). Não bateu: recontagem só desse produto (1 vez);
+# de novo não bateu: divergência para o admin (a mesma de hoje). Contagem que chega depois (achado em outra posição)
+# confere de novo. Rotativo das 14h pausado enquanto o geral está aberto; posição contada vale como contada no mês.
+# Fim das estruturas: o WMS lê no Bling tudo o que tem saldo no depósito e ninguém contou -> pop-up piscando (Biel:
+# "não existe esse de não contar"): Contar (às cegas; não bateu = conta de novo 1 vez; de novo = admin) ou Não encontrei
+# (zera o saldo do depósito no Bling; o admin devolve se acharem). Sem nada pendente, o geral encerra sozinho.
+GERAL_ABERTO = ("contando", "buscando", "procurando")
+GERAL_TRAVA_S = 600                     # quem tocou em Contar no pop-up fica com o produto 10 min
+_lk_geral = threading.Lock()
+
+
+def _tabelas_geral(c, pk):
+    c.execute(f"""CREATE TABLE IF NOT EXISTS inv_geral (id {pk}, status TEXT NOT NULL DEFAULT 'contando', mes TEXT,
+        criado_por TEXT, criado_em BIGINT, fase2_em BIGINT, encerrado_por TEXT, encerrado_em BIGINT, msg TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS inv_geral_tarefa (geral_id BIGINT NOT NULL, tarefa_id BIGINT NOT NULL, tipo TEXT NOT NULL,
+        sku_key TEXT, PRIMARY KEY (geral_id, tarefa_id))""")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_inv_geral_tarefa_t ON inv_geral_tarefa (tarefa_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS inv_geral_sku (geral_id BIGINT NOT NULL, sku_key TEXT NOT NULL, sku TEXT, nome TEXT,
+        status TEXT, contado DOUBLE PRECISION, contado1 DOUBLE PRECISION, bling DOUBLE PRECISION, separados DOUBLE PRECISION,
+        recont_tid BIGINT, div_id BIGINT, msg TEXT, por TEXT, trava_por TEXT, trava_em BIGINT, em BIGINT,
+        PRIMARY KEY (geral_id, sku_key))""")
+    c.execute(f"""CREATE TABLE IF NOT EXISTS inv_geral_extra (id {pk}, geral_id BIGINT NOT NULL, sku_key TEXT NOT NULL, sku TEXT,
+        nome TEXT, qtd DOUBLE PRECISION, porta_palet INTEGER, posicao INTEGER, por TEXT, em BIGINT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_inv_geral_extra_g ON inv_geral_extra (geral_id, sku_key)")
+
+
+def _geral_aberto(c):
+    r = c.execute("SELECT * FROM inv_geral WHERE status IN ('contando','buscando','procurando') ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(r) if r else None
+
+
+def _geral_de_tarefa(c, tid):
+    r = c.execute("SELECT geral_id, tipo, sku_key FROM inv_geral_tarefa WHERE tarefa_id=?", (tid,)).fetchone()
+    return dict(r) if r else None
+
+
+def _gsku(c, gid, kk):
+    r = c.execute("SELECT * FROM inv_geral_sku WHERE geral_id=? AND sku_key=?", (gid, kk)).fetchone()
+    return dict(r) if r else None
+
+
+def _gsku_gravar(c, gid, kk, **campos):
+    campos["em"] = int(time.time())
+    if _gsku(c, gid, kk):
+        sets = ", ".join(f"{k}=?" for k in campos)
+        c.execute(f"UPDATE inv_geral_sku SET {sets} WHERE geral_id=? AND sku_key=?", (*campos.values(), gid, kk))
+    else:
+        campos.update({"geral_id": gid, "sku_key": kk})
+        c.execute(f"INSERT INTO inv_geral_sku ({', '.join(campos)}) VALUES ({', '.join('?' * len(campos))})", tuple(campos.values()))
+
+
+def _geral_tarefas(c, gid):
+    """{tarefa_id: {tipo, sku_key, status, pego_por}}"""
+    out = {}
+    for r in c.execute("SELECT g.tarefa_id, g.tipo, g.sku_key, t.status, t.pego_por FROM inv_geral_tarefa g "
+                       "JOIN tarefas t ON t.id = g.tarefa_id WHERE g.geral_id=?", (gid,)).fetchall():
+        out[int(r["tarefa_id"])] = {"tipo": r["tipo"], "sku_key": r["sku_key"], "status": r["status"], "pego_por": r["pego_por"]}
+    return out
+
+
+def _contagem_geral(c, gid):
+    """Contagens das contagens FEITAS do geral.
+    -> (por_sku {kk: {(pp, p): qtd}}, nomes {kk: (sku, nome)}, posições contadas, extra {kk: qtd do pop-up}).
+    Vale a última contagem de cada produto em cada posição (recontagem substitui). Posição vazia = 0 para os produtos que o
+    mapa diz estar lá (contagem de estrutura) ou para o produto da recontagem."""
+    tars = {t: v for t, v in _geral_tarefas(c, gid).items() if v["status"] == "feita"}
+    por_pos, _ = _skus_no_mapa(c)
+    ult, nomes, pos_cont = {}, {}, set()
+    ids = list(tars)
+    for i in range(0, len(ids), 200):
+        grupo = ids[i:i + 200]
+        for r in c.execute(f"SELECT id, tarefa_id, porta_palet, posicao, sku, sku_key, nome, qtd, vazia FROM inv_contagem "
+                           f"WHERE tarefa_id IN ({','.join('?' * len(grupo))}) AND rodada=1", tuple(grupo)).fetchall():
+            tv = tars[int(r["tarefa_id"])]
+            k = (int(r["porta_palet"]), int(r["posicao"]))
+            pos_cont.add(k)
+            if r["vazia"]:
+                alvo = [tv["sku_key"]] if tv["tipo"] == "recontar" else [_key(it["sku"]) for it in por_pos.get(k, [])]
+                for kk in alvo:
+                    if kk and int(r["id"]) > ult.get((kk, k), (0, 0))[0]:
+                        ult[(kk, k)] = (int(r["id"]), 0.0)
+                continue
+            kk = r["sku_key"] or _key(r["sku"])
+            if not kk:
+                continue
+            if int(r["id"]) > ult.get((kk, k), (0, 0))[0]:
+                ult[(kk, k)] = (int(r["id"]), float(r["qtd"] or 0))
+            if r["sku"]:
+                nomes[kk] = (r["sku"], r["nome"] or (nomes.get(kk) or (None, None))[1])
+    por_sku = {}
+    for (kk, k), (_, q) in ult.items():
+        por_sku.setdefault(kk, {})[k] = q
+    for k, its in por_pos.items():                      # nome de quem só apareceu como posição vazia
+        for it in its:
+            kk = _key(it["sku"])
+            if kk in por_sku and (kk not in nomes or not nomes[kk][1]):
+                nomes[kk] = (it["sku"], it["nome"])
+    extra = {}
+    for r in c.execute("SELECT sku_key, sku, nome, qtd FROM inv_geral_extra WHERE geral_id=? ORDER BY id", (gid,)).fetchall():
+        extra[r["sku_key"]] = float(r["qtd"] or 0)       # a última vale (contar de novo substitui)
+        nomes.setdefault(r["sku_key"], (r["sku"], r["nome"]))
+    return por_sku, nomes, pos_cont, extra
+
+
+def _ordem(ML, ks):
+    try:
+        return sorted(ks, key=lambda k: ML.rank(*k))
+    except Exception:
+        return sorted(ks)
+
+
+def _criar_recontagem(c, gid, kk, sku, nome, mapa, contados):
+    ks = {tuple(int(x) for x in k) for k in (mapa or [])} | {k for k in (contados or {}) if isinstance(k, tuple)}
+    if not ks:
+        return None
+    _, ML = _estruturas_em_ordem()
+    pos = _ordem(ML, ks)
+    ref = {"geral": gid, "mes": _mes(), "dia": _hoje(), "posicoes": [list(k) for k in pos], "estruturas": [], "rodada": 1,
+           "so_skus": [kk], "geral_recontar": kk}
+    tid = _ins(c, "INSERT INTO tarefas (tipo, titulo, descricao, para, criado_por, criado_em, prazo_em, status, ref) "
+                  "VALUES ('inventario', ?, ?, '', 'WMS', ?, ?, 'aberta', ?)",
+               (f"Inventário geral: recontar {nome or sku}"[:200],
+                f"{len(pos)} posição(ões). Não bateu com o Bling: conte de novo esse produto, com calma.",
+                int(time.time()), int(time.time()) + 30 * 86400, json.dumps(ref)))
+    c.execute("INSERT INTO inv_geral_tarefa (geral_id, tarefa_id, tipo, sku_key) VALUES (?,?,?,?)", (gid, tid, "recontar", kk))
+    return tid
+
+
+def _avaliar(gid, kks, origem, forcar=False, quem=None):
+    """Confere com o Bling os produtos kks do geral. origem: estrutura | recontagem | extra | fase2.
+    forcar: confere mesmo se alguma posição do mapa do produto não foi contada (fim das estruturas)."""
+    with _lk_geral:
+        with db_session() as c:
+            g = c.execute("SELECT status FROM inv_geral WHERE id=?", (gid,)).fetchone()
+            if not g or g["status"] not in GERAL_ABERTO:
+                return
+            cont, nomes, pos_cont, extra = _contagem_geral(c, gid)
+            _, por_sku_map = _skus_no_mapa(c)
+        for kk in kks:
+            with db_session() as c:
+                atual = _gsku(c, gid, kk) or {}
+            st0 = atual.get("status")
+            if st0 in ("nao_encontrado",) or (kk not in cont and kk not in extra):
+                continue
+            total = sum(cont.get(kk, {}).values()) + extra.get(kk, 0.0)
+            sku, nome = nomes.get(kk) or (atual.get("sku") or kk, atual.get("nome"))
+            nome = nome or atual.get("nome")
+            mapa = por_sku_map.get(kk) or []
+            if not forcar and origem == "estrutura" and not all(tuple(k) in pos_cont for k in mapa):
+                if st0 in (None, "esperando"):
+                    with db_session() as c:
+                        _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="esperando", contado=total)
+                continue
+            saldo, _, erro = _saldo_bling(sku)
+            time.sleep(0.25)
+            with db_session() as c:
+                sep = _separados(c, sku)
+                bate = erro is None and (abs(total - saldo) < 1e-6 or (sep > 0 and abs(total + sep - saldo) < 1e-6))
+                locais = [[k[0], k[1], q] for k, q in sorted(cont.get(kk, {}).items())]
+                if kk in extra:
+                    locais.append([0, 0, extra[kk]])
+                if bate:
+                    if st0 == "recontar" and atual.get("recont_tid"):
+                        c.execute("UPDATE tarefas SET status='cancelada', obs_fim=? WHERE id=? AND status IN ('aberta','andamento')",
+                                  ("Não precisa mais: o produto bateu com o Bling.", atual["recont_tid"]))
+                    if atual.get("div_id"):
+                        c.execute("UPDATE inv_divergencia SET status='resolvida', contado=?, bling=?, separados=?, decidido_por='WMS', "
+                                  "decidido_em=?, bling_msg=? WHERE id=? AND status='aberta'",
+                                  (total, saldo, sep, int(time.time()), "Inventário geral: com a contagem de outra posição passou a bater.",
+                                   atual["div_id"]))
+                    _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="ok", contado=total, bling=saldo, separados=sep, msg=None)
+                    continue
+                segunda = (origem == "recontagem" and st0 == "recontar") or (origem == "extra" and st0 == "contar_de_novo")
+                if st0 == "divergente":
+                    c.execute("UPDATE inv_divergencia SET contado=?, bling=?, separados=?, locais=? WHERE id=? AND status='aberta'",
+                              (total, saldo, sep, json.dumps(locais), atual.get("div_id")))
+                    _gsku_gravar(c, gid, kk, contado=total, bling=saldo, separados=sep)
+                elif erro or segunda:
+                    did = _ins(c, "INSERT INTO inv_divergencia (tarefa_id, mes, sku, sku_key, nome, locais, contado, contado1, bling, "
+                                  "separados, status, criado_em, contado_por, bling_msg) VALUES (?,?,?,?,?,?,?,?,?,?,'aberta',?,?,?)",
+                               (atual.get("recont_tid") or 0, _mes(), sku, kk, nome, json.dumps(locais), total, atual.get("contado1"),
+                                saldo, sep, int(time.time()), quem, erro))
+                    _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="divergente", div_id=did, contado=total, bling=saldo,
+                                 separados=sep, msg=erro, trava_por=None, trava_em=None)
+                elif st0 == "recontar":
+                    _gsku_gravar(c, gid, kk, contado=total)           # recontagem já pedida: espera ela
+                elif origem in ("extra",) or not (mapa or cont.get(kk)):
+                    _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="contar_de_novo", contado1=total, contado=total,
+                                 bling=saldo, separados=sep, trava_por=None, trava_em=None)
+                else:
+                    tid = _criar_recontagem(c, gid, kk, sku, nome, mapa, cont.get(kk))
+                    _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="recontar" if tid else "contar_de_novo", contado1=total,
+                                 contado=total, recont_tid=tid, bling=saldo, separados=sep)
+    _checar_fim(gid)
+
+
+def _checar_fim(gid):
+    iniciar = False
+    with db_session() as c:
+        g = c.execute("SELECT * FROM inv_geral WHERE id=?", (gid,)).fetchone()
+        if not g:
+            return
+        tars = _geral_tarefas(c, gid)
+        abertas = lambda tp: [t for t, v in tars.items() if v["tipo"] == tp and v["status"] not in ("feita", "cancelada", "expirada")]
+        if g["status"] == "contando" and not abertas("estrutura"):
+            c.execute("UPDATE inv_geral SET status='buscando', fase2_em=?, msg=? WHERE id=? AND status='contando'",
+                      (int(time.time()), "Todas as estruturas contadas. Procurando no Bling o que ninguém contou…", gid))
+            iniciar = True
+        elif g["status"] == "procurando" and not abertas("recontar"):
+            n = c.execute("SELECT COUNT(*) AS n FROM inv_geral_sku WHERE geral_id=? AND status IN ('nao_contado','contar_de_novo','esperando')",
+                          (gid,)).fetchone()["n"]
+            if not n:
+                c.execute("UPDATE inv_geral SET status='encerrado', encerrado_por='WMS', encerrado_em=?, msg=? WHERE id=? AND status='procurando'",
+                          (int(time.time()), "Tudo contado e conferido. O que não bateu está nas divergências.", gid))
+    if iniciar:
+        threading.Thread(target=_fase2, args=(gid,), daemon=True).start()
+
+
+def _bling_com_saldo():
+    """{sku_key: (sku, nome, saldo)} de todo produto simples ativo do Bling com saldo físico > 0 no depósito."""
+    NA, bs = _bling()
+    dep = str(NA._deposito())
+    prods = {}
+    for pag in range(1, 201):
+        r = NA._bling_req(bs._get, "/produtos", params={"pagina": pag, "limite": 100, "criterio": 2})
+        if r.status_code != 200:
+            raise RuntimeError(f"Bling produtos HTTP {r.status_code}")
+        d = (r.json() or {}).get("data") or []
+        for p in d:
+            if str(p.get("formato") or "S").upper() != "S" or str(p.get("tipo") or "P").upper() == "S":
+                continue                                   # kit/composição, pai com variações, serviço
+            cod = str(p.get("codigo") or "").strip()
+            if cod and p.get("id"):
+                prods[int(p["id"])] = (cod, str(p.get("nome") or "")[:200])
+        if len(d) < 100:
+            break
+        time.sleep(0.35)
+    out, ids = {}, list(prods)
+    for i in range(0, len(ids), 50):
+        grupo = ids[i:i + 50]
+        r = NA._bling_req(bs._get, "/estoques/saldos", params=[("idsProdutos[]", str(x)) for x in grupo])
+        if r.status_code != 200:
+            raise RuntimeError(f"Bling saldos HTTP {r.status_code}")
+        for row in (r.json() or {}).get("data") or []:
+            pid = (row.get("produto") or {}).get("id")
+            if pid is None or int(pid) not in prods:
+                continue
+            saldo = 0.0
+            for dd in row.get("depositos") or []:
+                if str(dd.get("id")) == dep:
+                    saldo = float(dd.get("saldoFisico") or 0)
+            if saldo > 0:
+                cod, nome = prods[int(pid)]
+                out[_key(cod)] = (cod, nome, saldo)
+        time.sleep(0.35)
+    return out
+
+
+def _fase2(gid):
+    try:
+        with db_session() as c:
+            esp = [r["sku_key"] for r in c.execute("SELECT sku_key FROM inv_geral_sku WHERE geral_id=? AND status='esperando'", (gid,)).fetchall()]
+        if esp:                     # alguma posição do produto ficou fora das estruturas: confere com o que foi contado
+            _avaliar(gid, esp, "fase2", forcar=True)
+        com_saldo = _bling_com_saldo()
+        with _lk_geral:
+            with db_session() as c:
+                cont, _, _, extra = _contagem_geral(c, gid)
+                ja = {r["sku_key"] for r in c.execute("SELECT sku_key FROM inv_geral_sku WHERE geral_id=?", (gid,)).fetchall()}
+                n = 0
+                for kk, (sku, nome, saldo) in com_saldo.items():
+                    if kk in cont or kk in extra or kk in ja:
+                        continue
+                    _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="nao_contado", bling=saldo)
+                    n += 1
+                c.execute("UPDATE inv_geral SET status='procurando', msg=? WHERE id=? AND status='buscando'",
+                          (f"{n} produto(s) com saldo no Bling que ninguém contou." if n else "Nada ficou sem contar.", gid))
+    except Exception as e:
+        try:
+            with db_session() as c:
+                c.execute("UPDATE inv_geral SET msg=? WHERE id=?", (f"Não consegui ler o Bling: {type(e).__name__}: {e}"[:300], gid))
+        except Exception:
+            pass
+        return                      # fica 'buscando': admin/supervisor toca em "Procurar de novo"
+    _checar_fim(gid)
+
+
+def _enviar_geral(tid):
+    """Segundo plano: contagem de estrutura (ou recontagem) do geral enviada -> feita, e confere os produtos dela."""
+    gid, kks, tipo, quem = None, set(), "estrutura", None
+    try:
+        with db_session() as c:
+            t = _tarefa(c, tid)
+            ref = json.loads(t["ref"] or "{}")
+            g = _geral_de_tarefa(c, tid)
+            gid, tipo, quem = int(g["geral_id"]), g["tipo"], t.get("pego_por")
+            linhas = [dict(r) for r in c.execute("SELECT * FROM inv_contagem WHERE tarefa_id=? AND rodada=1", (tid,)).fetchall()]
+            for l in linhas:               # achou produto numa posição que o mapa não tinha: cadastra no mapa (ele está lá)
+                if l["achado"] and l["sku_key"]:
+                    try:
+                        if not c.execute("SELECT 1 FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?",
+                                         (l["sku_key"], l["porta_palet"], l["posicao"])).fetchone():
+                            c.execute("INSERT INTO mapa_localizacao (sku_key, sku, nome, porta_palet, posicao, atualizado_em) VALUES (?,?,?,?,?,?)",
+                                      (l["sku_key"], l["sku"], l["nome"], l["porta_palet"], l["posicao"], int(time.time())))
+                    except Exception:
+                        pass
+            if tipo == "estrutura":        # vale como contado no mês (o rotativo não conta de novo)
+                for pp, p in ref.get("posicoes") or []:
+                    c.execute("DELETE FROM inv_pos WHERE mes=? AND porta_palet=? AND posicao=?", (ref.get("mes") or _mes(), pp, p))
+                    c.execute("INSERT INTO inv_pos (mes, porta_palet, posicao, tarefa_id, em, por) VALUES (?,?,?,?,?,?)",
+                              (ref.get("mes") or _mes(), pp, p, tid, int(time.time()), quem))
+            c.execute("UPDATE tarefas SET status='feita', feito_por=COALESCE(feito_por, pego_por), feito_em=? WHERE id=?", (int(time.time()), tid))
+            por_pos, _ = _skus_no_mapa(c)
+            if tipo == "recontar":
+                kks = {g["sku_key"]}
+            else:
+                kks = {l["sku_key"] for l in linhas if l["sku_key"]}
+                for k in {(int(l["porta_palet"]), int(l["posicao"])) for l in linhas}:
+                    kks |= {_key(it["sku"]) for it in por_pos.get(k, [])}
+    except Exception as e:
+        try:
+            with db_session() as c:
+                c.execute("UPDATE tarefas SET status='andamento', obs_fim=? WHERE id=?", (f"Envio falhou: {e}"[:300], tid))
+        except Exception:
+            pass
+        _conferindo.discard(tid)
+        return
+    _conferindo.discard(tid)
+    try:
+        _avaliar(gid, sorted(kks), "recontagem" if tipo == "recontar" else "estrutura", quem=quem)
+    except Exception as e:
+        try:
+            with db_session() as c:
+                c.execute("UPDATE inv_geral SET msg=? WHERE id=?", (f"Conferência falhou: {type(e).__name__}: {e}"[:300], gid))
+        except Exception:
+            pass
+
+
+def _escrever_bling_ligado():
+    return _env("INV_BLING_ESCREVER", "1") not in ("0", "false", "nao", "não", "off")
+
+
+def _zerar_inv(sku, motivo):
+    """Não encontrei no inventário geral: balanço 0 no depósito. -> (ok, saldo_antes, msg)."""
+    if not _escrever_bling_ligado():
+        return False, None, "Escrever no Bling está desligado (INV_BLING_ESCREVER=0)."
+    try:
+        NA, bs = _bling()
+        dep = NA._deposito()
+        try:
+            pid = NA._produto_id(bs, sku)
+        except LookupError as e:
+            return False, None, str(e)
+        antes = NA._saldo_no_deposito(bs, pid, dep)
+        if antes <= 0:
+            return True, antes, f"No Bling já estava {antes:g}: nada foi lançado."
+        corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "B", "quantidade": 0,
+                 "observacoes": ("WMS inventário geral: não encontrado. " + (motivo or ""))[:250]}
+        w = NA._bling_req(bs._post, "/estoques", json=corpo)
+        if w.status_code not in (200, 201):
+            msg = f"Bling recusou o balanço: HTTP {w.status_code} {w.text[:200]}"
+            if "lote" in w.text.lower():
+                msg += " (produto com controle de lote: zere no Bling, lote por lote)"
+            return False, antes, msg
+        depois = NA._saldo_no_deposito(bs, pid, dep)
+        if abs(depois) > 1e-6:
+            return False, antes, f"Balanço enviado, mas o saldo ficou {depois:g}: confira no Bling."
+        return True, antes, f"Saldo {antes:g} -> 0 no depósito {dep}."
+    except Exception as e:
+        return False, None, f"{type(e).__name__}: {e}"[:300]
+
+
+def _devolver_inv(sku, qtd, motivo):
+    if not _escrever_bling_ligado():
+        return False, "Escrever no Bling está desligado (INV_BLING_ESCREVER=0)."
+    if not qtd or qtd <= 0:
+        return True, "Nada a devolver (o saldo já era zero quando zerou)."
+    try:
+        NA, bs = _bling()
+        dep = NA._deposito()
+        pid = NA._produto_id(bs, sku)
+        antes = NA._saldo_no_deposito(bs, pid, dep)
+        corpo = {"produto": {"id": pid}, "deposito": {"id": int(dep)}, "operacao": "E", "quantidade": float(qtd),
+                 "observacoes": ("WMS inventário geral: achado, devolve o saldo zerado. " + (motivo or ""))[:250]}
+        w = NA._bling_req(bs._post, "/estoques", json=corpo)
+        if w.status_code not in (200, 201):
+            return False, f"Bling recusou a entrada: HTTP {w.status_code} {w.text[:200]}"
+        depois = NA._saldo_no_deposito(bs, pid, dep)
+        return True, f"Saldo {antes:g} -> {depois:g} no depósito {dep} (+{float(qtd):g})."
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"[:300]
+
+
+def _geral_resumo(c, g, gestor):
+    gid = int(g["id"])
+    tars = _geral_tarefas(c, gid)
+    estr, rec = [], []
+    for tid, v in tars.items():
+        t = _tarefa(c, tid)
+        if not t:
+            continue
+        ref = json.loads(t["ref"] or "{}")
+        n = c.execute("SELECT COUNT(*) AS n FROM (SELECT DISTINCT porta_palet, posicao FROM inv_contagem WHERE tarefa_id=? AND rodada=1) x",
+                      (tid,)).fetchone()["n"]
+        item = {"tarefa_id": tid, "titulo": t["titulo"], "status": t["status"], "pego_por": t["pego_por"], "feito_por": t["feito_por"],
+                "posicoes": len(ref.get("posicoes") or []), "contadas": int(n or 0), "estruturas": ref.get("estruturas") or []}
+        (rec if v["tipo"] == "recontar" else estr).append(item)
+    estr.sort(key=lambda x: x["tarefa_id"])
+    rec.sort(key=lambda x: x["tarefa_id"])
+    skus = [dict(r) for r in c.execute("SELECT * FROM inv_geral_sku WHERE geral_id=? ORDER BY nome", (gid,)).fetchall()]
+    conta = {}
+    for s in skus:
+        conta[s["status"]] = conta.get(s["status"], 0) + 1
+    agora = int(time.time())
+    campos = ("sku_key", "sku", "nome", "status", "contado", "contado1", "bling", "separados", "msg", "por", "em", "trava_por", "trava_em", "div_id")
+    itens = []
+    for s in skus:
+        if s["status"] in ("ok",) and not gestor:
+            continue
+        d = {k: s.get(k) for k in campos}
+        if not gestor:                              # às cegas: operador nunca vê o Bling
+            for k in ("contado", "contado1", "bling", "separados", "msg"):
+                d.pop(k, None)
+        if d.get("trava_em") and agora - int(d["trava_em"]) > GERAL_TRAVA_S:
+            d["trava_por"] = None
+        itens.append(d)
+    return {"geral": g, "estruturas": estr, "recontagens": rec, "conta": conta, "itens": itens,
+            "estruturas_feitas": sum(1 for x in estr if x["status"] == "feita"),
+            "posicoes": sum(x["posicoes"] for x in estr), "posicoes_contadas": sum(min(x["contadas"], x["posicoes"]) for x in estr)}
+
+
+def _geral_faltam(c, gid, eu):
+    """Pop-up piscando: o que tem saldo no Bling e ninguém contou (sem o número do Bling)."""
+    agora = int(time.time())
+    out = []
+    por_pos, por_sku = _skus_no_mapa(c)
+    ML, _ = _layout()
+    for r in c.execute("SELECT sku_key, sku, nome, status, trava_por, trava_em FROM inv_geral_sku WHERE geral_id=? "
+                       "AND status IN ('nao_contado','contar_de_novo') ORDER BY nome", (gid,)).fetchall():
+        trava = r["trava_por"] if r["trava_em"] and agora - int(r["trava_em"]) <= GERAL_TRAVA_S else None
+        if trava and trava != eu:
+            continue                                     # alguém já está procurando esse
+        locais = [_rotulo(ML, a, b) if ML else f"{a}/{b}" for a, b in (por_sku.get(r["sku_key"]) or [])][:4]
+        foto = next((it.get("foto") for k in (por_sku.get(r["sku_key"]) or []) for it in por_pos.get(k, [])
+                     if _key(it["sku"]) == r["sku_key"] and it.get("foto")), None)
+        out.append({"sku_key": r["sku_key"], "sku": r["sku"], "nome": r["nome"], "status": r["status"], "meu": trava == eu,
+                    "locais": locais, "foto": foto})
+    return out
 
 
 # ─────────────────────────── pessoas ───────────────────────────
@@ -692,6 +1161,24 @@ def registrar(bp):
                     inv = {"tarefa": _fmt(t), "acao": "comecar"}
                 elif t["status"] in ("andamento", "recontar") and t["pego_por"] == eu:
                     inv = {"tarefa": _fmt(t), "acao": "recontar" if t["status"] == "recontar" else "continuar"}
+            # inventário geral: a contagem de quem já pegou, senão a próxima livre (recontagem primeiro)
+            geral = _geral_aberto(c)
+            faltam = None
+            if geral and not inv and (papel != "admin" or _env("INV_AVISO_ADMIN", "0") == "1"):
+                r = c.execute("SELECT t.* FROM tarefas t JOIN inv_geral_tarefa x ON x.tarefa_id = t.id WHERE x.geral_id=? "
+                              "AND t.status IN ('andamento','recontar') AND t.pego_por=? ORDER BY t.id LIMIT 1", (geral["id"], eu)).fetchone()
+                if r:
+                    inv = {"tarefa": _fmt(dict(r)), "acao": "continuar"}
+                else:
+                    r = c.execute("SELECT t.* FROM tarefas t JOIN inv_geral_tarefa x ON x.tarefa_id = t.id WHERE x.geral_id=? "
+                                  "AND t.status='aberta' ORDER BY CASE WHEN x.tipo='recontar' THEN 0 ELSE 1 END, t.id LIMIT 1",
+                                  (geral["id"],)).fetchone()
+                    if r:
+                        inv = {"tarefa": _fmt(dict(r)), "acao": "comecar"}
+            if geral and geral["status"] == "procurando" and (papel != "admin" or _env("INV_AVISO_ADMIN", "0") == "1"):
+                itens = _geral_faltam(c, int(geral["id"]), eu)
+                if itens:
+                    faltam = {"geral_id": int(geral["id"]), "itens": itens[:40], "n": len(itens)}
             # recontagem pedida pelo admin (tarefa só de alguns produtos)
             if not inv and papel != "admin":
                 r = c.execute("SELECT * FROM tarefas WHERE tipo='inventario' AND status='aberta' AND ref LIKE ? ORDER BY criado_em LIMIT 1",
@@ -708,6 +1195,7 @@ def registrar(bp):
                 nv = c.execute("SELECT COUNT(*) AS n FROM inv_divergencia WHERE status='aberta' AND visto=0").fetchone()["n"]
                 div = {"abertas": int(n or 0), "novas": int(nv or 0)}
         return jsonify({"inventario": inv, "novas": novas, "divergencias": div, "intervalo_min": int(_env("INV_AVISO_MIN", "15") or 15),
+                        "geral_faltam": faltam,
                         "hora_inventario": "%02d:%02d" % _hora_inv(), "agora": int(time.time())})
 
     @bp.get("/tarefas/pessoas")
@@ -898,9 +1386,10 @@ def registrar(bp):
                     faltam.append([pp, p])
             if faltam:
                 return jsonify({"error": f"Faltam {len(faltam)} posição(ões) para contar.", "faltam": faltam}), 400
+            do_geral = _geral_de_tarefa(c, tid) is not None
             c.execute("UPDATE tarefas SET status='conferindo' WHERE id=?", (tid,))
         _conferindo.add(tid)
-        threading.Thread(target=_conferir, args=(tid,), daemon=True).start()
+        threading.Thread(target=_enviar_geral if do_geral else _conferir, args=(tid,), daemon=True).start()
         return jsonify({"ok": True, "conferindo": True})
 
     @bp.get("/inventario/divergencias")
@@ -1017,3 +1506,190 @@ def registrar(bp):
                 return jsonify({"error": msg + " Não ficou no valor pedido: confira no Bling."}), 502
             return jsonify({"ok": True, "status": "substituida", "msg": msg})
         return jsonify({"error": "Ação inválida."}), 400
+
+    # ─────────────── inventário geral ───────────────
+    @bp.get("/inventario/geral")
+    @login_required
+    def inventario_geral_ver():
+        _tabelas()
+        with db_session() as c:
+            g = _geral_aberto(c) or (lambda r: dict(r) if r else None)(
+                c.execute("SELECT * FROM inv_geral ORDER BY id DESC LIMIT 1").fetchone())
+            out = _geral_resumo(c, g, _gestor()) if g else {"geral": None}
+            if g and g["status"] == "procurando":
+                out["faltam"] = _geral_faltam(c, int(g["id"]), _quem())
+        out.update({"pode_comecar": _gestor(), "pode_encerrar": _admin(), "eu": _quem(), "gestor": _gestor()})
+        return jsonify(out)
+
+    @bp.post("/inventario/geral")
+    @login_required
+    def inventario_geral_comecar():
+        if not _gestor():
+            return jsonify({"error": "Só admin ou supervisor começa o inventário geral."}), 403
+        _tabelas()
+        with _lk_geral:
+            with db_session() as c:
+                if _geral_aberto(c):
+                    return jsonify({"error": "Já tem um inventário geral aberto."}), 409
+                est, ML = _estruturas_em_ordem()
+                if not est:
+                    return jsonify({"error": "O mapa não tem estruturas com posições: monte o mapa antes."}), 400
+                agora, eu = int(time.time()), _quem()
+                gid = _ins(c, "INSERT INTO inv_geral (status, mes, criado_por, criado_em, msg) VALUES ('contando', ?, ?, ?, ?)",
+                           (_mes(), eu, agora, "Contando as estruturas."))
+                por_pos, _ = _skus_no_mapa(c)
+                n_t = n_p = 0
+                for e, ps in est:
+                    posicoes = [[int(e["id"]), int(p)] for p in ps]
+                    n_prod = len({_key(it["sku"]) for pp, p in posicoes for it in por_pos.get((pp, p), [])})
+                    ref = {"geral": gid, "mes": _mes(), "dia": _hoje(), "posicoes": posicoes, "estruturas": [e["id"]], "rodada": 1}
+                    nome = e.get("curto") or e.get("nome") or str(e["id"])
+                    tid = _ins(c, "INSERT INTO tarefas (tipo, titulo, descricao, para, criado_por, criado_em, prazo_em, status, ref) "
+                                  "VALUES ('inventario', ?, ?, '', ?, ?, ?, 'aberta', ?)",
+                               (f"Inventário geral: contar {nome}"[:200],
+                                f"{len(posicoes)} posições, {n_prod} produtos no mapa. Conte tudo o que tem em cada posição; o sistema confere com o Bling.",
+                                eu, agora, agora + 30 * 86400, json.dumps(ref)))
+                    c.execute("INSERT INTO inv_geral_tarefa (geral_id, tarefa_id, tipo, sku_key) VALUES (?,?,?,NULL)", (gid, tid, "estrutura"))
+                    n_t += 1
+                    n_p += len(posicoes)
+                # rotativo pausado: a contagem de hoje que ninguém começou sai da fila
+                c.execute("UPDATE tarefas SET status='cancelada', obs_fim=? WHERE tipo='inventario' AND status='aberta' "
+                          "AND id IN (SELECT tarefa_id FROM inv_dia WHERE dia=?)", ("Inventário geral começou.", _hoje()))
+                g = c.execute("SELECT * FROM inv_geral WHERE id=?", (gid,)).fetchone()
+                return jsonify({"ok": True, "geral": dict(g), "contagens": n_t, "posicoes": n_p})
+
+    @bp.post("/inventario/geral/proxima")
+    @login_required
+    def inventario_geral_proxima():
+        """Pega para quem tocou a próxima contagem do geral (recontagem primeiro). -> {tarefa_id} ou {tarefa_id: null}."""
+        _tabelas()
+        eu = _quem()
+        with _lk_geral:
+            with db_session() as c:
+                g = _geral_aberto(c)
+                if not g:
+                    return jsonify({"tarefa_id": None, "msg": "Não tem inventário geral aberto."})
+                r = c.execute("SELECT t.id FROM tarefas t JOIN inv_geral_tarefa x ON x.tarefa_id = t.id WHERE x.geral_id=? "
+                              "AND t.status IN ('andamento','recontar') AND t.pego_por=? ORDER BY t.id LIMIT 1", (g["id"], eu)).fetchone()
+                if r:
+                    return jsonify({"tarefa_id": int(r["id"])})
+                r = c.execute("SELECT t.id FROM tarefas t JOIN inv_geral_tarefa x ON x.tarefa_id = t.id WHERE x.geral_id=? "
+                              "AND t.status='aberta' ORDER BY CASE WHEN x.tipo='recontar' THEN 0 ELSE 1 END, t.id LIMIT 1", (g["id"],)).fetchone()
+                if not r:
+                    return jsonify({"tarefa_id": None, "msg": "Todas as contagens já estão com alguém ou feitas."})
+                c.execute("UPDATE tarefas SET status='andamento', pego_por=?, pego_em=? WHERE id=? AND status='aberta'",
+                          (eu, int(time.time()), int(r["id"])))
+                return jsonify({"tarefa_id": int(r["id"])})
+
+    @bp.post("/inventario/geral/<int:gid>/item")
+    @login_required
+    def inventario_geral_item(gid):
+        """Pop-up do que ninguém contou: {sku_key, acao: pegar | contar | nao_encontrei, qtd?, porta_palet?, posicao?}."""
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        kk, acao, eu, agora = _key(d.get("sku_key") or d.get("sku")), str(d.get("acao") or ""), _quem(), int(time.time())
+        with _lk_geral:
+            with db_session() as c:
+                g = c.execute("SELECT * FROM inv_geral WHERE id=?", (gid,)).fetchone()
+                if not g or g["status"] != "procurando":
+                    return jsonify({"error": "Esse inventário geral não está na fase de procurar."}), 409
+                s = _gsku(c, gid, kk)
+                if not s or s["status"] not in ("nao_contado", "contar_de_novo"):
+                    return jsonify({"error": "Esse produto já foi resolvido.", "status": (s or {}).get("status")}), 409
+                trava = s["trava_por"] if s.get("trava_em") and agora - int(s["trava_em"]) <= GERAL_TRAVA_S else None
+                if trava and trava != eu and not _gestor():
+                    return jsonify({"error": f"{trava} já está procurando esse produto."}), 409
+                if acao == "pegar":
+                    _gsku_gravar(c, gid, kk, trava_por=eu, trava_em=agora)
+                    return jsonify({"ok": True})
+                if acao == "contar":
+                    try:
+                        q = float(d.get("qtd"))
+                    except (TypeError, ValueError):
+                        return jsonify({"error": "Digite quantos achou."}), 400
+                    if q < 0 or q > 100000:
+                        return jsonify({"error": "Quantidade inválida."}), 400
+                    pp = p = None
+                    try:
+                        if d.get("porta_palet") not in (None, "") and d.get("posicao") not in (None, ""):
+                            pp, p = int(d["porta_palet"]), int(d["posicao"])
+                    except (TypeError, ValueError):
+                        pp = p = None
+                    c.execute("INSERT INTO inv_geral_extra (geral_id, sku_key, sku, nome, qtd, porta_palet, posicao, por, em) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (gid, kk, s["sku"], s["nome"], q, pp, p, eu, agora))
+                    if pp is not None and q > 0:       # disse onde achou: o mapa aprende
+                        try:
+                            if not c.execute("SELECT 1 FROM mapa_localizacao WHERE sku_key=? AND porta_palet=? AND posicao=?", (kk, pp, p)).fetchone():
+                                c.execute("INSERT INTO mapa_localizacao (sku_key, sku, nome, porta_palet, posicao, atualizado_em) VALUES (?,?,?,?,?,?)",
+                                          (kk, s["sku"], s["nome"], pp, p, agora))
+                        except Exception:
+                            pass
+                    _gsku_gravar(c, gid, kk, por=eu, trava_por=eu, trava_em=agora)
+                elif acao == "nao_encontrei":
+                    pass
+                else:
+                    return jsonify({"error": "Ação inválida."}), 400
+        if acao == "contar":
+            threading.Thread(target=_avaliar, args=(gid, [kk], "extra"), kwargs={"forcar": True, "quem": eu}, daemon=True).start()
+            return jsonify({"ok": True, "conferindo": True})
+        ok, antes, msg = _zerar_inv(s["sku"], f"Por {eu}.")
+        with db_session() as c:
+            if not ok:
+                _gsku_gravar(c, gid, kk, msg=msg)
+                return jsonify({"error": f"Não consegui zerar no Bling: {msg}"}), 502
+            _gsku_gravar(c, gid, kk, status="nao_encontrado", bling=antes, msg=msg, por=eu, trava_por=None, trava_em=None)
+        _checar_fim(gid)
+        return jsonify({"ok": True, "status": "nao_encontrado"})
+
+    @bp.post("/inventario/geral/<int:gid>/devolver")
+    @login_required
+    def inventario_geral_devolver(gid):
+        """Admin: o que foi zerado como Não encontrei apareceu -> devolve o saldo no Bling e volta para contar."""
+        if not _admin():
+            return jsonify({"error": "Só o admin devolve."}), 403
+        _tabelas()
+        kk = _key((request.get_json(silent=True) or {}).get("sku_key"))
+        with db_session() as c:
+            s = _gsku(c, gid, kk)
+            g = c.execute("SELECT status FROM inv_geral WHERE id=?", (gid,)).fetchone()
+        if not s or s["status"] != "nao_encontrado":
+            return jsonify({"error": "Esse produto não está como Não encontrei."}), 409
+        ok, msg = _devolver_inv(s["sku"], float(s["bling"] or 0), f"Por {_quem()}.")
+        if not ok:
+            return jsonify({"error": msg}), 502
+        with db_session() as c:
+            _gsku_gravar(c, gid, kk, status="nao_contado" if g and g["status"] == "procurando" else "devolvido", msg=msg, por=_quem())
+        return jsonify({"ok": True, "msg": msg})
+
+    @bp.post("/inventario/geral/<int:gid>/buscar")
+    @login_required
+    def inventario_geral_buscar(gid):
+        if not _gestor():
+            return jsonify({"error": "Só admin ou supervisor."}), 403
+        with db_session() as c:
+            g = c.execute("SELECT status FROM inv_geral WHERE id=?", (gid,)).fetchone()
+            if not g or g["status"] != "buscando":
+                return jsonify({"error": "Agora não é a hora de procurar no Bling."}), 409
+            c.execute("UPDATE inv_geral SET msg=? WHERE id=?", ("Procurando no Bling o que ninguém contou…", gid))
+        threading.Thread(target=_fase2, args=(gid,), daemon=True).start()
+        return jsonify({"ok": True})
+
+    @bp.post("/inventario/geral/<int:gid>/encerrar")
+    @login_required
+    def inventario_geral_encerrar(gid):
+        """Admin: encerra agora (o que ficou aberto é cancelado; divergências continuam para decidir)."""
+        if not _admin():
+            return jsonify({"error": "Só o admin encerra o inventário geral."}), 403
+        cancelar = bool((request.get_json(silent=True) or {}).get("cancelar"))
+        with _lk_geral:
+            with db_session() as c:
+                g = c.execute("SELECT * FROM inv_geral WHERE id=?", (gid,)).fetchone()
+                if not g or g["status"] not in GERAL_ABERTO:
+                    return jsonify({"error": "Esse inventário geral já foi encerrado."}), 409
+                agora = int(time.time())
+                c.execute("UPDATE tarefas SET status='cancelada', feito_por=?, feito_em=?, obs_fim=? WHERE status IN ('aberta','andamento','recontar') "
+                          "AND id IN (SELECT tarefa_id FROM inv_geral_tarefa WHERE geral_id=?)", (_quem(), agora, "Inventário geral encerrado.", gid))
+                c.execute("UPDATE inv_geral SET status=?, encerrado_por=?, encerrado_em=?, msg=? WHERE id=?",
+                          ("cancelado" if cancelar else "encerrado", _quem(), agora,
+                           "Cancelado pelo admin." if cancelar else "Encerrado pelo admin.", gid))
+        return jsonify({"ok": True})
