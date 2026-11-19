@@ -273,6 +273,25 @@ def _brl_num(v):
         return 0.0
 
 
+
+def _campo_busca(page, numero, timeout=20000):
+    """Campo de busca da lista que está NA TELA (Notas de compra). O Bling tem outros campos escondidos com "da nota" no
+    placeholder (ex.: #edChaveAcessoRefItem, chave da nota referenciada, Biel 19/11): o .first pegava esse e travava 20 s."""
+    sel = ("input[placeholder*='da nota']:visible:not(#edChaveAcessoRefItem), "
+           "input[placeholder*='Pesquis']:visible:not(#edChaveAcessoRefItem)")
+    from playwright.sync_api import TimeoutError as PWTimeout
+    campo = page.locator(sel).first
+    try:
+        campo.wait_for(state="visible", timeout=timeout)
+    except PWTimeout:
+        try:
+            vis = page.evaluate("() => [...document.querySelectorAll('input')].filter(i => i.offsetParent && i.type !== 'hidden')"
+                                ".map(i => (i.id || i.name || '?') + '=' + (i.placeholder || '')).slice(0, 15)")
+        except Exception:
+            vis = []
+        raise RoboErro(f"não achei o campo de busca da lista de notas (campos na tela: {vis}) (foto: {_foto(page, f'{numero}_busca')})")
+    return campo
+
 def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_itens: int | None = None,
                      headless: bool = True, log=print) -> dict:
     """CONCILIA a nota de entrada (já importada) com o pedido de compra, item a item, NA TELA do Bling.
@@ -317,7 +336,7 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                 page.locator("li.tab-notasCompra a").first.click(timeout=30000)      # aba "Notas de compra"
                 page.wait_for_timeout(1200)
                 rpa.wait_no_overlay(page, 60000)
-                busca = page.locator("input[placeholder*='da nota']").first
+                busca = _campo_busca(page, numero)
                 busca.fill(numero, timeout=20000)
                 busca.press("Enter")
                 page.wait_for_timeout(2500)
@@ -408,7 +427,7 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
 
                 # confere na lista: a coluna Vinculação da nota
                 page.wait_for_timeout(2000)
-                busca = page.locator("input[placeholder*='da nota']").first
+                busca = _campo_busca(page, numero)
                 busca.fill(numero)
                 busca.press("Enter")
                 page.wait_for_timeout(2500)
