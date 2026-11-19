@@ -14,7 +14,7 @@ fi
 cd "$L" || { echo "não achei a pasta da $NOME"; exit 1; }
 echo "$NOME: $L ($SVC, porta $PORTA)"
 [ -f tarefas_routes.py ] || { echo "Não achei o tarefas_routes.py: rode antes o ligar_tarefas.sh."; exit 1; }
-BASES_OK="57d0f96c1792 e567901b9b0f"   # tarefas_routes.py do ligar_inventario_geral (0f570c5) ou do ligar_tarefas
+BASES_OK="40ab7b8176d2 57d0f96c1792 1ecf71a331de e567901b9b0f"   # tarefas_routes.py do ligar_inventario_geral (0f570c5) ou do ligar_tarefas
 G="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF"
 blob() { venv/bin/python -c "import hashlib,sys;d=open(sys.argv[1],'rb').read();print(hashlib.sha1(b'blob %d\0'%len(d)+d).hexdigest()[:12])" "$1"; }
 curl -fsSL "$G/tarefas_routes.py" -o .tarefas_novo
