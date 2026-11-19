@@ -36,6 +36,10 @@ produto (ver o bloco "inventário geral" abaixo). Rotas:
   POST /inventario/geral/<id>/buscar         admin/supervisor: procura de novo no Bling o que ninguém contou
   POST /inventario/geral/<id>/encerrar       admin: {cancelar?}
 
+PEDIDO PARADO NA SEPARAÇÃO (Biel 19/11): GET /separacao/paradas, GET /separacao/paradas/<ml_id>/itens,
+POST /separacao/paradas/<id>/responder {resposta: nao_achei|falta_produto|cancelado|termino_agora|outro, texto?, sku?}.
+Ajustes: SEP_PARADA=1, SEP_PARADA_HORAS=2, SEP_PARADA_CORTE=15:30.
+
 Ajustes (.env): INV_HORA=14:00, INV_DIAS=12345 (seg..sex), INV_AVISO_MIN=15, INV_AVISO_ADMIN=0, INV_BLING_ESCREVER=1, INV_LIGADO=1."""
 from __future__ import annotations
 
@@ -177,6 +181,7 @@ def _tabelas():
         c.execute("CREATE INDEX IF NOT EXISTS ix_inv_div_status ON inv_divergencia (status, criado_em)")
         c.execute("CREATE TABLE IF NOT EXISTS inv_dia (dia TEXT PRIMARY KEY, tarefa_id BIGINT, em BIGINT)")
         _tabelas_geral(c, pk)
+        _tabela_parada(c, pk)
     _ok_tab = True
 
 
@@ -947,6 +952,166 @@ def _geral_faltam(c, gid, eu):
     return out
 
 
+# ─────────────────────────── pedido parado na Separação: por quê? (Biel 19/11 16:03) ───────────────────────────
+# "Tem produto em separação ainda ativo e eu tenho que perguntar por quê. Quero resolver isso." O WMS cobra sozinho:
+# pedido começado (tem bip) e sem terminar há PARADA_HORAS (2 h), ou qualquer pendente/parcial depois do corte do dia
+# (PARADA_CORTE, 15:30 Brasília). Cobra quem deu o último bip; sem bip, qualquer operador (todos menos admin) até alguém
+# responder. Respostas: nao_achei (vira Não achado: zera no Bling como na separação), falta_produto (comprando),
+# cancelado (arquiva o pedido), termino_agora (30 min e cobra de novo), outro (texto). O admin vê tudo em
+# GET /separacao/paradas (Separação e Início).
+PARADA_HORAS = lambda: float(_env("SEP_PARADA_HORAS", "2") or 2)
+PARADA_CORTE = lambda: _env("SEP_PARADA_CORTE", "15:30")
+PARADA_LIGADA = lambda: _env("SEP_PARADA", "1") not in ("0", "false", "nao", "não", "off")
+_parada_ultimo = [0]
+_cols_audit = {}
+
+
+def _tabela_parada(c, pk):
+    c.execute(f"""CREATE TABLE IF NOT EXISTS sep_parada (id {pk}, ml_id TEXT NOT NULL, cliente TEXT, origem TEXT, status TEXT,
+        itens INTEGER, bipados INTEGER, ultimo_bip BIGINT, cobrado_de TEXT, motivo_cobranca TEXT, detectado_em BIGINT,
+        respondido_por TEXT, respondido_em BIGINT, resposta TEXT, texto TEXT, sku TEXT, prazo_em BIGINT, feito TEXT, dia TEXT)""")
+    c.execute("CREATE INDEX IF NOT EXISTS ix_sep_parada_ml ON sep_parada (ml_id, detectado_em)")
+
+
+def _audit_cols(c):
+    """Colunas da audit_log (o arquivo dela só existe no servidor): quem bipou e quando."""
+    if _cols_audit:
+        return _cols_audit
+    try:
+        rows = c.execute("SELECT column_name FROM information_schema.columns WHERE table_name='audit_log'").fetchall()
+        cols = {r["column_name"] for r in rows}
+    except Exception:
+        try:
+            cols = {x[1] for x in c.execute("PRAGMA table_info(audit_log)").fetchall()}
+        except Exception:
+            cols = set()
+    pega = lambda lst: next((x for x in lst if x in cols), None)
+    _cols_audit.update({"user": pega(["user_id", "usuario_id", "username", "usuario"]),
+                        "quando": pega(["created_at", "criado_em", "timestamp", "em", "data", "ts"]),
+                        "entity": pega(["entity_id", "entidade_id", "ml_id"]), "action": pega(["action", "acao"]),
+                        "ok": bool(cols)})
+    return _cols_audit
+
+
+def _ultimos_bips(c, ml_ids):
+    """{ml_id: (username, ts)} do último bip de separação de cada pedido (audit_log action 'bipar')."""
+    out = {}
+    if not ml_ids:
+        return out
+    a = _audit_cols(c)
+    if not a.get("ok") or not a.get("user") or not a.get("quando") or not a.get("entity"):
+        return out
+    q, u, e, ac = a["quando"], a["user"], a["entity"], a["action"]
+    try:
+        ids = list(ml_ids)
+        for i in range(0, len(ids), 200):
+            g = ids[i:i + 200]
+            sql = (f"SELECT {e} AS ml, {u} AS usr, {q} AS q FROM audit_log WHERE {e} IN ({','.join('?' * len(g))})"
+                   + (f" AND {ac} IN ('bipar','bipar_lote','separar')" if ac else "") + f" ORDER BY {q} DESC")
+            for r in c.execute(sql, tuple(g)).fetchall():
+                if r["ml"] in out:
+                    continue
+                ts = r["q"]
+                try:
+                    import calendar
+                    import datetime as _dt
+                    if isinstance(ts, str):
+                        ts = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+                    if isinstance(ts, _dt.datetime):
+                        # sem fuso (timestamp without time zone do Postgres / texto): o servidor grava em UTC
+                        ts = int(ts.timestamp()) if ts.tzinfo else calendar.timegm(ts.timetuple())
+                    else:
+                        ts = int(ts or 0)
+                        if ts > 10 ** 11:
+                            ts //= 1000
+                except Exception:
+                    ts = 0
+                out[r["ml"]] = (r["usr"], ts)
+        # user_id -> username
+        nums = {v[0] for v in out.values() if isinstance(v[0], int) or (isinstance(v[0], str) and v[0].isdigit())}
+        if nums:
+            nome = {}
+            for r in c.execute(f"SELECT id, username FROM users WHERE id IN ({','.join('?' * len(nums))})", tuple(int(x) for x in nums)).fetchall():
+                nome[int(r["id"])] = r["username"]
+            out = {k: (nome.get(int(v[0]), str(v[0])) if (isinstance(v[0], int) or str(v[0]).isdigit()) else v[0], v[1]) for k, v in out.items()}
+    except Exception:
+        return {}
+    return out
+
+
+def _passou_corte():
+    try:
+        h, m = PARADA_CORTE().split(":")
+        t = _br()
+        return (t.tm_hour, t.tm_min) >= (int(h), int(m))
+    except Exception:
+        return False
+
+
+def _detectar_paradas():
+    """Roda no máximo 1x por minuto: acha pedido parado e abre a cobrança (uma aberta por pedido)."""
+    if not PARADA_LIGADA():
+        return
+    agora = int(time.time())
+    if agora - _parada_ultimo[0] < 60:
+        return
+    _parada_ultimo[0] = agora
+    _tabelas()
+    with db_session() as c:
+        rows = [dict(r) for r in c.execute("""SELECT p.id, p.ml_id, p.cliente_nome, p.status, p.logistic_type,
+                   COALESCE(SUM(pp.quantidade),0) AS itens, COALESCE(SUM(pp.quantidade_bipada),0) AS bipados
+                   FROM pedidos p LEFT JOIN pedido_produtos pp ON pp.pedido_id = p.id
+                   WHERE p.status IN ('PENDENTE','PARCIAL') GROUP BY p.id, p.ml_id, p.cliente_nome, p.status, p.logistic_type""").fetchall()]
+        if not rows:
+            return
+        abertas = {r["ml_id"]: dict(r) for r in c.execute(
+            "SELECT * FROM sep_parada WHERE resposta IS NULL OR (resposta='termino_agora' AND prazo_em > ?) "
+            "OR (resposta IS NOT NULL AND respondido_em > ?)", (agora, agora - 12 * 3600)).fetchall()}
+        bips = _ultimos_bips(c, [r["ml_id"] for r in rows])
+        corte = _passou_corte()
+        lim = int(PARADA_HORAS() * 3600)
+        for r in rows:
+            if r["ml_id"] in abertas:
+                continue
+            quem, ts = bips.get(r["ml_id"], (None, 0))
+            comecado = int(r["bipados"] or 0) > 0
+            motivo = None
+            if comecado and ts and agora - ts >= lim:
+                motivo = f"começado há {max(1, (agora - ts) // 3600)} h e não terminou"
+            elif comecado and not ts and lim <= 3600 * 2:
+                pass                                      # sem hora do bip: só cobra pelo corte
+            if not motivo and corte:
+                motivo = f"passou das {PARADA_CORTE()} e ainda está na Separação"
+            if not motivo:
+                continue
+            c.execute("INSERT INTO sep_parada (ml_id, cliente, origem, status, itens, bipados, ultimo_bip, cobrado_de, motivo_cobranca, detectado_em, dia) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      (r["ml_id"], r["cliente_nome"], r["logistic_type"], r["status"], int(r["itens"] or 0), int(r["bipados"] or 0),
+                       ts or None, (quem or "") if comecado else "", motivo, agora, _hoje()))
+
+
+def _paradas_para(c, eu, gestor=False):
+    agora = int(time.time())
+    rows = [dict(r) for r in c.execute(
+        "SELECT * FROM sep_parada WHERE resposta IS NULL OR (resposta='termino_agora' AND prazo_em <= ?) ORDER BY detectado_em", (agora,)).fetchall()]
+    # ainda está parado? (pode ter terminado/arquivado depois da cobrança)
+    out = []
+    for p in rows:
+        st = c.execute("SELECT status FROM pedidos WHERE ml_id=?", (p["ml_id"],)).fetchone()
+        if not st or st["status"] not in ("PENDENTE", "PARCIAL"):
+            c.execute("UPDATE sep_parada SET resposta=COALESCE(resposta,'resolvido'), respondido_em=COALESCE(respondido_em, ?), feito=COALESCE(feito, ?) WHERE id=?",
+                      (agora, f"pedido saiu da Separação ({st['status'] if st else 'apagado'})", p["id"]))
+            continue
+        if p["resposta"] == "termino_agora":           # prazo venceu: cobra de novo
+            p["motivo_cobranca"] = (p["motivo_cobranca"] or "") + " · disse que ia terminar e não terminou"
+            c.execute("UPDATE sep_parada SET resposta=NULL, prazo_em=NULL, motivo_cobranca=? WHERE id=?", (p["motivo_cobranca"], p["id"]))
+            p["resposta"] = None
+        if gestor or not p["cobrado_de"] or p["cobrado_de"] == eu:
+            out.append({k: p.get(k) for k in ("id", "ml_id", "cliente", "origem", "status", "itens", "bipados", "ultimo_bip", "cobrado_de",
+                                             "motivo_cobranca", "detectado_em")})
+    return out
+
+
 # ─────────────────────────── pessoas ───────────────────────────
 def _pessoas(c):
     LOGIN = ["username", "usuario", "login", "user_name"]
@@ -1197,8 +1362,16 @@ def registrar(bp):
                 n = c.execute("SELECT COUNT(*) AS n FROM inv_divergencia WHERE status='aberta'").fetchone()["n"]
                 nv = c.execute("SELECT COUNT(*) AS n FROM inv_divergencia WHERE status='aberta' AND visto=0").fetchone()["n"]
                 div = {"abertas": int(n or 0), "novas": int(nv or 0)}
+        paradas = []
+        try:
+            _detectar_paradas()
+            if papel != "admin":
+                with db_session() as c:
+                    paradas = _paradas_para(c, eu)
+        except Exception:
+            paradas = []
         return jsonify({"inventario": inv, "novas": novas, "divergencias": div, "intervalo_min": int(_env("INV_AVISO_MIN", "15") or 15),
-                        "geral_faltam": faltam,
+                        "geral_faltam": faltam, "sep_paradas": paradas,
                         "hora_inventario": "%02d:%02d" % _hora_inv(), "agora": int(time.time())})
 
     @bp.get("/tarefas/pessoas")
@@ -1698,3 +1871,103 @@ def registrar(bp):
                           ("cancelado" if cancelar else "encerrado", _quem(), agora,
                            "Cancelado pelo admin." if cancelar else "Encerrado pelo admin.", gid))
         return jsonify({"ok": True})
+
+    # ─────────────── pedido parado na Separação ───────────────
+    @bp.get("/separacao/paradas")
+    @login_required
+    def sep_paradas_listar():
+        """Gestor: cobranças de hoje/ontem com as respostas; operador: só as dele abertas."""
+        _tabelas()
+        try:
+            _detectar_paradas()
+        except Exception:
+            pass
+        eu = _quem()
+        with db_session() as c:
+            abertas = _paradas_para(c, eu, gestor=_gestor())
+            hist = []
+            if _gestor():
+                hist = [dict(r) for r in c.execute("SELECT * FROM sep_parada WHERE respondido_em >= ? ORDER BY respondido_em DESC LIMIT 200",
+                                                   (int(time.time()) - 48 * 3600,)).fetchall()]
+        return jsonify({"abertas": abertas, "respondidas": hist, "gestor": _gestor(), "eu": eu, "horas": PARADA_HORAS(), "corte": PARADA_CORTE(),
+                        "ligado": PARADA_LIGADA(), "agora": int(time.time())})
+
+    @bp.get("/separacao/paradas/<path:ml_id>/itens")
+    @login_required
+    def sep_paradas_itens(ml_id):
+        """Itens do pedido (para 'Não achei o produto' escolher qual)."""
+        with db_session() as c:
+            rows = c.execute("""SELECT pr.sku, pr.nome, pp.quantidade, pp.quantidade_bipada FROM pedidos p
+                                JOIN pedido_produtos pp ON pp.pedido_id = p.id JOIN produtos pr ON pr.id = pp.produto_id
+                                WHERE p.ml_id=? ORDER BY pp.id""", (ml_id,)).fetchall()
+        return jsonify({"itens": [{"sku": r["sku"], "nome": r["nome"], "qtd": int(r["quantidade"] or 0), "bipados": int(r["quantidade_bipada"] or 0)} for r in rows]})
+
+    @bp.post("/separacao/paradas/<int:pid>/responder")
+    @login_required
+    def sep_paradas_responder(pid):
+        _tabelas()
+        d = request.get_json(silent=True) or {}
+        resp = str(d.get("resposta") or "")
+        texto = str(d.get("texto") or "").strip()[:500]
+        sku = str(d.get("sku") or "").strip()[:64]
+        eu, agora = _quem(), int(time.time())
+        if resp not in ("nao_achei", "falta_produto", "cancelado", "termino_agora", "outro"):
+            return jsonify({"error": "Escolha uma resposta."}), 400
+        if resp == "outro" and len(texto) < 10:
+            return jsonify({"error": "Escreva o que aconteceu (pelo menos 10 letras)."}), 400
+        if resp == "nao_achei" and not sku:
+            return jsonify({"error": "Diga qual produto você não achou."}), 400
+        with db_session() as c:
+            c.execute("UPDATE sep_parada SET id = id WHERE id = ?", (pid,))
+            p = c.execute("SELECT * FROM sep_parada WHERE id=?", (pid,)).fetchone()
+            if not p:
+                return jsonify({"error": "Cobrança não encontrada."}), 404
+            p = dict(p)
+            if p["resposta"] and not (p["resposta"] == "termino_agora" and (p["prazo_em"] or 0) <= agora):
+                return jsonify({"error": f"Já respondida por {p['respondido_por']}."}), 409
+            if p["cobrado_de"] and p["cobrado_de"] != eu and not _gestor():
+                return jsonify({"error": f"Essa cobrança é de {p['cobrado_de']}."}), 403
+            ped = c.execute("SELECT * FROM pedidos WHERE ml_id=?", (p["ml_id"],)).fetchone()
+            ped = dict(ped) if ped else None
+            feito = None
+            if resp == "cancelado":
+                if ped and ped["status"] in ("PENDENTE", "PARCIAL"):
+                    c.execute("UPDATE pedidos SET status='ARQUIVADO' WHERE id=? AND status=?", (ped["id"], ped["status"]))
+                    try:
+                        c.execute("INSERT INTO pedidos_arquivo (ml_id, em, status_antes, motivo, por, origem, cliente) VALUES (?,?,?,?,?,?,?)",
+                                  (p["ml_id"], agora * 1000, ped["status"], ("Separação parada: cliente/ML cancelou. " + texto)[:200], eu,
+                                   str(ped.get("logistic_type") or "ML"), str(ped.get("cliente_nome") or "")[:120]))
+                    except Exception:
+                        pass
+                    feito = "pedido arquivado (dá para voltar em Arquivados)"
+                else:
+                    feito = "pedido já não estava na Separação"
+            elif resp == "nao_achei":
+                try:
+                    import naoachado_routes as NA
+                    NA.garantir_tabelas()
+                    nome = c.execute("SELECT nome FROM produtos WHERE UPPER(sku)=UPPER(?)", (sku,)).fetchone()
+                    nome = nome["nome"] if nome else ""
+                    ex = c.execute("SELECT id FROM nao_achado WHERE sku_key=? AND status='aberto' AND COALESCE(ml_id,'')=? AND reportado_em > ?",
+                                   (sku.lower(), p["ml_id"], agora - 6 * 3600)).fetchone()
+                    if ex:
+                        nid = int(ex["id"])
+                        feito = f"Não achado já aberto (#{nid})"
+                    else:
+                        prazo = agora + int(NA.horas_prazo() * 3600)
+                        c.execute("INSERT INTO nao_achado (sku, sku_key, nome, qtd, ml_id, estoque_bling, locais, obs, reportado_por, reportado_em, prazo_em) "
+                                  "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                  (sku, sku.lower(), nome[:200], 1.0, p["ml_id"], None, "", ("Separação parada: " + texto)[:300], eu, agora, prazo))
+                        nid = int(c.execute("SELECT id FROM nao_achado WHERE sku_key=? AND reportado_em=? ORDER BY id DESC LIMIT 1", (sku.lower(), agora)).fetchone()["id"])
+                        feito = f"Não achado #{nid} aberto" + (" (zera o Bling e avisa o compras)" if NA._zerar_ligado() and NA._zerar_no_relato() else "")
+                        if NA._zerar_no_relato():
+                            threading.Thread(target=NA._zerar_agora, args=(nid,), daemon=True).start()
+                except Exception as e:
+                    feito = f"não consegui abrir o Não achado: {type(e).__name__}: {str(e)[:120]}"
+            elif resp == "termino_agora":
+                feito = "30 min para terminar; depois cobra de novo"
+            elif resp == "falta_produto":
+                feito = "fica na Separação esperando o produto"
+            c.execute("UPDATE sep_parada SET respondido_por=?, respondido_em=?, resposta=?, texto=?, sku=?, prazo_em=?, feito=? WHERE id=?",
+                      (eu, agora, resp, texto or None, sku or None, agora + 1800 if resp == "termino_agora" else None, feito, pid))
+        return jsonify({"ok": True, "feito": feito})
