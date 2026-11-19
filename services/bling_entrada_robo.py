@@ -319,7 +319,7 @@ def _campo_busca(page, numero, timeout=20000):
     raise RoboErro(f"não achei o campo de busca da lista de notas (campos na tela: {vis}) (foto: {_foto(page, f'{numero}_busca')})")
 
 def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_itens: int | None = None,
-                     headless: bool = True, log=print) -> dict:
+                     headless: bool = True, log=print, skus: list | None = None) -> dict:
     """CONCILIA a nota de entrada (já importada) com o pedido de compra, item a item, NA TELA do Bling.
     A API v3 não grava esse vínculo (PUT itens[].notaFiscal volta 200 e não salva, testado 12/11) e o Bling TRAVA a conciliação
     depois que a nota lança estoque ou contas ("Conciliação bloqueada devido a lançamentos realizados previamente"):
@@ -407,6 +407,33 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                 for k in range(total):
                     card = cards.nth(k)
                     card.scroll_into_view_if_needed(timeout=10000)
+                    # item sem vínculo com o cadastro ("Novo produto": o Bling criaria um produto novo) -> liga ao SKU do WMS
+                    # (conferido na tela 19/11 15:13: desfaz o "Novo produto", busca o SKU em "Pesquisar produtos no sistema",
+                    # escolhe na lista; o card passa a mostrar "SKU - NOME" e o botão Pedido de compra)
+                    sku_k = (skus[k] if skus and k < len(skus) else "") or ""
+                    if "Novo produto" in card.inner_text(timeout=5000):
+                        if not sku_k:
+                            raise RoboErro(f"item {k + 1}: a nota traz um produto que não existe no cadastro do Bling ('Novo produto') e o WMS "
+                                           f"não sabe o SKU dele (foto: {_foto(page, f'{numero}_conc_item{k + 1}_novo')})")
+                        card.locator(".unlink-card").first.evaluate("e => e.click()")
+                        busca_p = card.locator("input[id^='produtoConciliacaoSearch']:visible").first
+                        busca_p.wait_for(state="visible", timeout=15000)
+                        busca_p.click()
+                        busca_p.type(sku_k, delay=60)
+                        opc_p = page.locator("ul.Dropdown:visible li.Dropdown-item").first
+                        try:
+                            opc_p.wait_for(state="visible", timeout=20000)
+                        except PWTimeout:
+                            raise RoboErro(f"item {k + 1}: o Bling não achou produto com o código {sku_k} para ligar ao item "
+                                           f"(foto: {_foto(page, f'{numero}_conc_item{k + 1}_sku')})")
+                        nome_opc = opc_p.inner_text(timeout=5000).strip()
+                        opc_p.click(timeout=10000)
+                        page.wait_for_timeout(2000)
+                        txt_card = card.inner_text(timeout=5000)
+                        if f"{sku_k} -" not in txt_card:
+                            raise RoboErro(f"item {k + 1}: escolhi '{nome_opc}' mas o card não ficou com o produto {sku_k} "
+                                           f"(foto: {_foto(page, f'{numero}_conc_item{k + 1}_sku')})")
+                        passo(f"item {k + 1}: era 'Novo produto', liguei ao {sku_k} ({nome_opc})")
                     card.locator("button", has_text="Pedido de compra").first.click(timeout=15000)
                     painel.wait_for(state="visible", timeout=30000)
                     page.wait_for_timeout(800)

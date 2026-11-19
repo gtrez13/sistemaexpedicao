@@ -9,12 +9,19 @@ set -e
 REF="${1:?passe o commit: bash ligar_conciliar.sh <commit>}"
 L="$HOME/nexuswms/RussianL-country/sistemaexpedicao_fix_patched/sistemaexpedicao_fix"
 cd "$L" || { echo "não achei a pasta da LHVMed"; exit 1; }
-BASES="e22db98e2de1 8d807a27007c 849e2736e08c f46846f3e860 7a081477bd35 2f482c56b080"   # ef420c6 (busca da lista), 95c461e, b7149aa (login digitado), d3cbbe6
+BASES="eac59716a557 e22db98e2de1 8d807a27007c 849e2736e08c f46846f3e860 7a081477bd35 2f482c56b080"   # ef420c6 (busca da lista), 95c461e, b7149aa (login digitado), d3cbbe6
 G="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF"
 blob() { venv/bin/python -c "import hashlib,sys;d=open(sys.argv[1],'rb').read();print(hashlib.sha1(b'blob %d\0'%len(d)+d).hexdigest()[:12])" "$1"; }
 
 curl -fsSL "$G/services/bling_entrada_robo.py" -o .robo_novo
-venv/bin/python -m py_compile .robo_novo
+curl -fsSL "$G/recebimento_routes.py" -o .receb_novo
+venv/bin/python -m py_compile .robo_novo .receb_novo
+# recebimento_routes.py: passa o SKU de cada item para o robô (item "Novo produto"); só troca se o do servidor for o conhecido
+RECEB_BASE=1a704f35ffb6
+TROCA_RECEB=0
+if [ "$(blob recebimento_routes.py)" = "$(blob .receb_novo)" ]; then echo "recebimento_routes.py: já é o novo"
+elif [ "$(blob recebimento_routes.py)" = "$RECEB_BASE" ] || [ "${FORCAR:-0}" = "1" ]; then TROCA_RECEB=1
+else echo "recebimento_routes.py do servidor ($(blob recebimento_routes.py)) não é o esperado ($RECEB_BASE): não troco esse (o robô vai sem os SKUs)"; fi
 ATUAL=$(blob services/bling_entrada_robo.py); NOVO=$(blob .robo_novo)
 TROCA=1
 if [ "$ATUAL" = "$NOVO" ]; then
@@ -54,7 +61,7 @@ PY
 ) || OUT=""
 SID=$(printf '%s\n' "$OUT" | sed -n 's/^SID=\([0-9][0-9]*\)$/\1/p' | tail -1)
 TS=$(date +%Y%m%d%H%M%S); BKD="bak_conciliar_$TS"; mkdir "$BKD"
-cp -p services/bling_entrada_robo.py .env "$BKD/"
+cp -p services/bling_entrada_robo.py recebimento_routes.py .env "$BKD/"
 MUDOU_ENV=0
 if grep -qE '^[[:space:]]*BLING_SITUACAO_PC_ATENDIDO_ID=' .env; then
   echo "  .env já tem BLING_SITUACAO_PC_ATENDIDO_ID: deixei como está"
@@ -65,15 +72,16 @@ else
   echo "  !! não achei a situação Atendido sem dúvida: o .env ficou como estava (manda a lista acima para o Claude)"
 fi
 if [ "$TROCA" = 1 ]; then mv .robo_novo services/bling_entrada_robo.py; else rm -f .robo_novo; fi
-if [ "$TROCA" = 0 ] && [ "$MUDOU_ENV" = 0 ]; then echo "Nada para mudar."; exit 0; fi
+if [ "$TROCA_RECEB" = 1 ]; then mv .receb_novo recebimento_routes.py; else rm -f .receb_novo; fi
+if [ "$TROCA" = 0 ] && [ "$TROCA_RECEB" = 0 ] && [ "$MUDOU_ENV" = 0 ]; then echo "Nada para mudar."; exit 0; fi
 sudo systemctl restart wms-russia.service
 sleep 5
 code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/auth/me || true)
 if ! systemctl is-active --quiet wms-russia.service || ! { [ "$code" = 401 ] || [ "$code" = 200 ]; }; then
-  cp -p "$BKD/bling_entrada_robo.py" services/; cp -p "$BKD/.env" .; sudo systemctl restart wms-russia.service
+  cp -p "$BKD/bling_entrada_robo.py" services/; cp -p "$BKD/recebimento_routes.py" .; cp -p "$BKD/.env" .; sudo systemctl restart wms-russia.service
   echo "O serviço não subiu (auth/me = $code): voltei como estava. Nada mudou."; exit 1
 fi
 echo "OK: LHVMed no ar. Agora abra a NF 13003 no Recebimento e clique Continuar."
 echo
 echo "Desfazer:"
-echo "  cd $L && cp -p $BKD/bling_entrada_robo.py services/ && cp -p $BKD/.env . && sudo systemctl restart wms-russia.service"
+echo "  cd $L && cp -p $BKD/bling_entrada_robo.py services/ && cp -p $BKD/recebimento_routes.py $BKD/.env . && sudo systemctl restart wms-russia.service"

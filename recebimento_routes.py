@@ -2006,8 +2006,16 @@ def _conciliar_pc(nid, r, pc, nf, quem):
         return {"ok": False, "pulado": True, "msg": "robô desligado (RECEB_ROBO_ENTRADA=0): a nota fica sem conciliação com o pedido"}
     try:
         from services.bling_entrada_robo import conciliar_pedido
+        # SKU de cada item da nota, na ordem da NF: item que o Bling marcou como "Novo produto" (sem vínculo com o cadastro)
+        # o robô liga ao produto certo antes de conciliar o pedido (NF 13003, Dermafreeze Mini, 19/11)
+        skus = []
+        try:
+            with db_session() as c:
+                skus = [x["sku"] for x in c.execute("SELECT sku FROM receb_itens WHERE nota_id=? ORDER BY n_item, id", (nid,)).fetchall()]
+        except Exception:
+            skus = []
         out = conciliar_pedido(r["numero"], pc["numero"], valor=float(r["valor"] or 0) or None,
-                               n_itens=len(nf.get("itens") or []) or None, log=lambda t: print(t, flush=True))
+                               n_itens=len(nf.get("itens") or []) or None, skus=skus, log=lambda t: print(t, flush=True))
     except Exception as e:
         msg = str(e)
         trav = "TRAVADA" in msg
