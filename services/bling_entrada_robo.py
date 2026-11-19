@@ -274,6 +274,29 @@ def _brl_num(v):
 
 
 
+
+def _clicar(page, sel, nome, numero, timeout=8000):
+    """Clica num botão do Bling. Se o clique normal não passar (botão coberto por uma lista aberta, fora da área visível
+    do painel...: Biel 19/11 15:00, "Locator.click: Timeout 15000ms ... #btn-salvar-pedido-compra"), confere o botão e
+    clica por JS (o mesmo que o clique na tela dispara). Botão desabilitado: para com o motivo. -> como clicou."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    try:
+        page.locator(sel).first.click(timeout=timeout)
+        return "clique"
+    except PWTimeout:
+        pass
+    info = page.evaluate("""s => { const e = document.querySelector(s); if (!e) return null;
+        const r = e.getBoundingClientRect(); const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return { desabilitado: !!e.disabled || e.classList.contains('ui-state-disabled'), visivel: !!e.offsetParent,
+                 x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height),
+                 por_cima: t && t !== e && !e.contains(t) ? (t.tagName + (t.id ? '#' + t.id : '') + '.' + String(t.className || '').slice(0, 50)) : null } }""", sel)
+    if not info:
+        raise RoboErro(f"o botão {nome} sumiu da tela (foto: {_foto(page, f'{numero}_{nome}')})")
+    if info.get("desabilitado"):
+        raise RoboErro(f"o botão {nome} está desabilitado no Bling ({info}) (foto: {_foto(page, f'{numero}_{nome}')})")
+    page.evaluate("s => document.querySelector(s).click()", sel)
+    return f"clique por JS ({info})"
+
 def _campo_busca(page, numero, timeout=20000):
     """Campo de busca da lista que está NA TELA (Notas de compra). O Bling tem outros campos escondidos com "da nota" no
     placeholder (ex.: #edChaveAcessoRefItem, chave da nota referenciada, Biel 19/11): o .first pegava esse e travava 20 s."""
@@ -407,8 +430,14 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                     if not escolhido.startswith(f"{pc_numero} |") or _brl_num(saldo) <= 0:
                         raise RoboErro(f"item {k + 1}: não ficou o pedido {pc_numero} com saldo (campo '{escolhido}', saldo {saldo}) "
                                        f"(foto: {_foto(page, f'{numero}_conc_item{k + 1}')})")
-                    page.locator("#btn-salvar-pedido-compra").click(timeout=15000)
-                    painel.wait_for(state="hidden", timeout=30000)
+                    como = _clicar(page, "#btn-salvar-pedido-compra", "salvar_pedido", numero)
+                    try:
+                        painel.wait_for(state="hidden", timeout=30000)
+                    except PWTimeout:
+                        raise RoboErro(f"item {k + 1}: o Bling não fechou o painel do pedido depois de Salvar ({como}) "
+                                       f"(foto: {_foto(page, f'{numero}_conc_item{k + 1}_salvar')})")
+                    if como != "clique":
+                        passo(f"item {k + 1}: Salvar do painel {como}")
                     page.wait_for_timeout(600)
                     passo(f"item {k + 1}: pedido {pc_numero} (saldo {saldo})")
 
@@ -420,11 +449,15 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                 if botao.is_disabled():
                     raise RoboErro("TRAVADA: o Bling não liberou 'Conciliar Produtos' (nota com lançamentos)")
                 _foto(page, f"{numero}_conc_pronta")
-                botao.click(timeout=15000)
+                como = _clicar(page, "#botaoSalvarConciliacao", "conciliar_produtos", numero)
+                if como != "clique":
+                    passo(f"Conciliar Produtos: {como}")
                 salvar = page.locator("#botaoSalvar")
                 salvar.wait_for(state="visible", timeout=60000)
                 page.wait_for_timeout(1500)
-                salvar.click(timeout=15000)
+                como = _clicar(page, "#botaoSalvar", "salvar_nota", numero)
+                if como != "clique":
+                    passo(f"Salvar a nota: {como}")
                 try:
                     page.wait_for_function("() => location.hash.indexOf('#edit') === -1", timeout=90000)
                 except PWTimeout:
