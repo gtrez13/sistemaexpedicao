@@ -502,7 +502,8 @@ def _conferir(tid):
 # (zera o saldo do depósito no Bling; o admin devolve se acharem). Sem nada pendente, o geral encerra sozinho.
 GERAL_ABERTO = ("contando", "buscando", "procurando")
 GERAL_TRAVA_S = 600                     # quem tocou em Contar no pop-up fica com o produto 10 min
-_lk_geral = threading.Lock()
+_lk_geral = threading.Lock()            # conferência (segundo plano, com Bling) e começar/encerrar
+_lk_pega = threading.Lock()             # pegar contagem / produto do pop-up (rápido: não espera a conferência)
 
 
 def _tabelas_geral(c, pk):
@@ -682,7 +683,7 @@ def _avaliar(gid, kks, origem, forcar=False, quem=None):
                     _gsku_gravar(c, gid, kk, contado=total)           # recontagem já pedida: espera ela
                 elif origem in ("extra",) or not (mapa or cont.get(kk)):
                     _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="contar_de_novo", contado1=total, contado=total,
-                                 bling=saldo, separados=sep, trava_por=None, trava_em=None)
+                                 bling=saldo, separados=sep, trava_por=None, trava_em=None, msg=None)
                 else:
                     tid = _criar_recontagem(c, gid, kk, sku, nome, mapa, cont.get(kk))
                     _gsku_gravar(c, gid, kk, sku=sku, nome=nome, status="recontar" if tid else "contar_de_novo", contado1=total,
@@ -931,8 +932,10 @@ def _geral_faltam(c, gid, eu):
     out = []
     por_pos, por_sku = _skus_no_mapa(c)
     ML, _ = _layout()
-    for r in c.execute("SELECT sku_key, sku, nome, status, trava_por, trava_em FROM inv_geral_sku WHERE geral_id=? "
+    for r in c.execute("SELECT sku_key, sku, nome, status, trava_por, trava_em, msg FROM inv_geral_sku WHERE geral_id=? "
                        "AND status IN ('nao_contado','contar_de_novo') ORDER BY nome", (gid,)).fetchall():
+        if r["msg"] == "conferindo":
+            continue                                     # acabou de ser contado: o WMS está conferindo com o Bling
         trava = r["trava_por"] if r["trava_em"] and agora - int(r["trava_em"]) <= GERAL_TRAVA_S else None
         if trava and trava != eu:
             continue                                     # alguém já está procurando esse
@@ -1564,7 +1567,7 @@ def registrar(bp):
         """Pega para quem tocou a próxima contagem do geral (recontagem primeiro). -> {tarefa_id} ou {tarefa_id: null}."""
         _tabelas()
         eu = _quem()
-        with _lk_geral:
+        with _lk_pega:
             with db_session() as c:
                 g = _geral_aberto(c)
                 if not g:
@@ -1588,7 +1591,7 @@ def registrar(bp):
         _tabelas()
         d = request.get_json(silent=True) or {}
         kk, acao, eu, agora = _key(d.get("sku_key") or d.get("sku")), str(d.get("acao") or ""), _quem(), int(time.time())
-        with _lk_geral:
+        with _lk_pega:
             with db_session() as c:
                 g = c.execute("SELECT * FROM inv_geral WHERE id=?", (gid,)).fetchone()
                 if not g or g["status"] != "procurando":
@@ -1596,6 +1599,8 @@ def registrar(bp):
                 s = _gsku(c, gid, kk)
                 if not s or s["status"] not in ("nao_contado", "contar_de_novo"):
                     return jsonify({"error": "Esse produto já foi resolvido.", "status": (s or {}).get("status")}), 409
+                if s.get("msg") == "conferindo" and acao != "nao_encontrei":
+                    return jsonify({"error": "Esse produto acabou de ser contado: o WMS está conferindo com o Bling."}), 409
                 trava = s["trava_por"] if s.get("trava_em") and agora - int(s["trava_em"]) <= GERAL_TRAVA_S else None
                 if trava and trava != eu and not _gestor():
                     return jsonify({"error": f"{trava} já está procurando esse produto."}), 409
@@ -1624,7 +1629,7 @@ def registrar(bp):
                                           (kk, s["sku"], s["nome"], pp, p, agora))
                         except Exception:
                             pass
-                    _gsku_gravar(c, gid, kk, por=eu, trava_por=eu, trava_em=agora)
+                    _gsku_gravar(c, gid, kk, por=eu, trava_por=eu, trava_em=agora, msg="conferindo")
                 elif acao == "nao_encontrei":
                     pass
                 else:
