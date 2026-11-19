@@ -413,7 +413,8 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                     # "Conciliar pedido" abre o campo do número do pedido. Conferido na tela (19/11 15:05): o painel abre com
                     # "Deseja conciliar o pedido de compra?" e o campo só aparece depois do clique; se o clique cair durante a
                     # animação do painel, nada acontece -> tenta de novo (por JS na 2ª e 3ª vez).
-                    campo = painel.locator("input[name='purchaseOrderNumberSearch']").first
+                    # :visible — no 2º item o painel ainda guarda o campo do 1º escondido e o .first pegava ele (19/11 15:09)
+                    campo = painel.locator("input[name='purchaseOrderNumberSearch']:visible").first
                     for tent in range(3):
                         if tent == 0:
                             painel.locator("label.Checkbox-card", has_text="Conciliar pedido").first.click(timeout=15000)
@@ -434,7 +435,7 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                     campo.click()
                     campo.press("Control+A")
                     campo.type(pc_numero, delay=80)
-                    opc = page.locator("ul.Dropdown li.Dropdown-item", has_text=f"{pc_numero} |").first
+                    opc = page.locator("ul.Dropdown:visible li.Dropdown-item", has_text=f"{pc_numero} |").first
                     try:
                         opc.wait_for(state="visible", timeout=30000)
                     except PWTimeout:
@@ -443,7 +444,7 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                     opc.click(timeout=10000)
                     page.wait_for_timeout(1200)
                     escolhido = campo.input_value()
-                    saldo = painel.locator("input[id^='purchaseOrderItemLastBalance_']").first.input_value()
+                    saldo = painel.locator("input[id^='purchaseOrderItemLastBalance_']:visible").first.input_value()
                     if not escolhido.startswith(f"{pc_numero} |") or _brl_num(saldo) <= 0:
                         raise RoboErro(f"item {k + 1}: não ficou o pedido {pc_numero} com saldo (campo '{escolhido}', saldo {saldo}) "
                                        f"(foto: {_foto(page, f'{numero}_conc_item{k + 1}')})")
