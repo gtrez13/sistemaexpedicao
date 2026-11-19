@@ -1930,18 +1930,26 @@ def registrar(bp):
             ped = c.execute("SELECT * FROM pedidos WHERE ml_id=?", (p["ml_id"],)).fetchone()
             ped = dict(ped) if ped else None
             feito = None
-            if resp == "cancelado":
+
+            def _zerar(motivo):
+                """Biel 19/11 16:15: "depois da resposta tem que zerar" -> o pedido sai da Separação (arquivado, volta em Arquivados)."""
                 if ped and ped["status"] in ("PENDENTE", "PARCIAL"):
                     c.execute("UPDATE pedidos SET status='ARQUIVADO' WHERE id=? AND status=?", (ped["id"], ped["status"]))
                     try:
                         c.execute("INSERT INTO pedidos_arquivo (ml_id, em, status_antes, motivo, por, origem, cliente) VALUES (?,?,?,?,?,?,?)",
-                                  (p["ml_id"], agora * 1000, ped["status"], ("Separação parada: cliente/ML cancelou. " + texto)[:200], eu,
+                                  (p["ml_id"], agora * 1000, ped["status"], (motivo + (". " + texto if texto else ""))[:200], eu,
                                    str(ped.get("logistic_type") or "ML"), str(ped.get("cliente_nome") or "")[:120]))
                     except Exception:
                         pass
-                    feito = "pedido arquivado (dá para voltar em Arquivados)"
-                else:
-                    feito = "pedido já não estava na Separação"
+                    return "pedido saiu da Separação (arquivado; volta em Arquivados)"
+                return "pedido já não estava na Separação"
+
+            if resp == "cancelado":
+                feito = _zerar("Separação parada: cliente/ML cancelou")
+            elif resp == "falta_produto":
+                feito = _zerar("Separação parada: falta produto, comprando")
+            elif resp == "outro":
+                feito = _zerar("Separação parada: " + texto)
             elif resp == "nao_achei":
                 try:
                     import naoachado_routes as NA
@@ -1964,10 +1972,9 @@ def registrar(bp):
                             threading.Thread(target=NA._zerar_agora, args=(nid,), daemon=True).start()
                 except Exception as e:
                     feito = f"não consegui abrir o Não achado: {type(e).__name__}: {str(e)[:120]}"
+                feito = (feito or "") + " · " + _zerar("Separação parada: não achou " + sku)
             elif resp == "termino_agora":
                 feito = "30 min para terminar; depois cobra de novo"
-            elif resp == "falta_produto":
-                feito = "fica na Separação esperando o produto"
             c.execute("UPDATE sep_parada SET respondido_por=?, respondido_em=?, resposta=?, texto=?, sku=?, prazo_em=?, feito=? WHERE id=?",
                       (eu, agora, resp, texto or None, sku or None, agora + 1800 if resp == "termino_agora" else None, feito, pid))
         return jsonify({"ok": True, "feito": feito})

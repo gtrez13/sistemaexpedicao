@@ -5,9 +5,14 @@
 # Tabelas novas (inv_geral*) são criadas sozinhas, vazias. O rotativo das 14h só pausa enquanto um geral estiver aberto.
 # Backup + desfazer; se o serviço não subir, volta sozinho. Não mexe na MedicalD.
 set -e
-REF="${1:?passe o commit: bash ligar_inventario_geral.sh <commit>}"
-L="$HOME/nexuswms/RussianL-country/sistemaexpedicao_fix_patched/sistemaexpedicao_fix"
-cd "$L" || { echo "não achei a pasta da LHVMed"; exit 1; }
+REF="${1:?passe o commit: bash ligar_inventario_geral.sh <commit> [medicald]}"
+if [ "${2:-}" = "medicald" ]; then
+  L="$HOME/nexuswms/EuropaD-country/europad-wmm/sistemaexpedicao_fix"; SVC=wms-europa.service; PORTA=8001; NOME=MedicalD
+else
+  L="$HOME/nexuswms/RussianL-country/sistemaexpedicao_fix_patched/sistemaexpedicao_fix"; SVC=wms-russia.service; PORTA=8000; NOME=LHVMed
+fi
+cd "$L" || { echo "não achei a pasta da $NOME"; exit 1; }
+echo "$NOME: $L ($SVC, porta $PORTA)"
 [ -f tarefas_routes.py ] || { echo "Não achei o tarefas_routes.py: rode antes o ligar_tarefas.sh."; exit 1; }
 BASES_OK="57d0f96c1792 e567901b9b0f"   # tarefas_routes.py do ligar_inventario_geral (0f570c5) ou do ligar_tarefas
 G="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF"
@@ -23,15 +28,15 @@ if ! echo " $BASES_OK " | grep -q " $ATUAL " && [ "${FORCAR:-0}" != "1" ]; then
 fi
 TS=$(date +%Y%m%d%H%M%S); BKD="bak_invgeral_$TS"; mkdir "$BKD"; cp -p tarefas_routes.py "$BKD/"
 mv .tarefas_novo tarefas_routes.py
-sudo systemctl restart wms-russia.service
+sudo systemctl restart "$SVC"
 sleep 5
-code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/inventario/geral || true)
-if ! systemctl is-active --quiet wms-russia.service || ! { [ "$code" = 401 ] || [ "$code" = 302 ] || [ "$code" = 200 ]; }; then
-  cp -p "$BKD/tarefas_routes.py" .; sudo systemctl restart wms-russia.service
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORTA/api/inventario/geral || true)
+if ! systemctl is-active --quiet "$SVC" || ! { [ "$code" = 401 ] || [ "$code" = 302 ] || [ "$code" = 200 ]; }; then
+  cp -p "$BKD/tarefas_routes.py" .; sudo systemctl restart "$SVC"
   echo "O serviço não subiu direito com o arquivo novo (/api/inventario/geral = $code): voltei como estava. Nada mudou."; exit 1
 fi
-echo "OK: LHVMed no ar. /api/inventario/geral respondeu $code (401 = existe e pede login)."
+echo "OK: $NOME no ar. /api/inventario/geral respondeu $code (401 = existe e pede login)."
 echo "Para usar: Inventário > Inventário geral > Começar (admin ou supervisor)."
 echo
 echo "Desfazer:"
-echo "  cd $L && cp -p $BKD/tarefas_routes.py . && sudo systemctl restart wms-russia.service"
+echo "  cd $L && cp -p $BKD/tarefas_routes.py . && sudo systemctl restart "$SVC""
