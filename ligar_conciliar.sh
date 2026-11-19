@@ -9,7 +9,7 @@ set -e
 REF="${1:?passe o commit: bash ligar_conciliar.sh <commit>}"
 L="$HOME/nexuswms/RussianL-country/sistemaexpedicao_fix_patched/sistemaexpedicao_fix"
 cd "$L" || { echo "não achei a pasta da LHVMed"; exit 1; }
-BASES="7a081477bd35 2f482c56b080"      # robô do login digitado (b7149aa) e o anterior (d3cbbe6)
+BASES="f46846f3e860 7a081477bd35 2f482c56b080"   # 95c461e (campo visível), b7149aa (login digitado), d3cbbe6
 G="https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF"
 blob() { venv/bin/python -c "import hashlib,sys;d=open(sys.argv[1],'rb').read();print(hashlib.sha1(b'blob %d\0'%len(d)+d).hexdigest()[:12])" "$1"; }
 

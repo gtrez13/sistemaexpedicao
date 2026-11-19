@@ -277,20 +277,23 @@ def _brl_num(v):
 def _campo_busca(page, numero, timeout=20000):
     """Campo de busca da lista que está NA TELA (Notas de compra). O Bling tem outros campos escondidos com "da nota" no
     placeholder (ex.: #edChaveAcessoRefItem, chave da nota referenciada, Biel 19/11): o .first pegava esse e travava 20 s."""
-    sel = ("input[placeholder*='da nota']:visible:not(#edChaveAcessoRefItem), "
-           "input[placeholder*='Pesquis']:visible:not(#edChaveAcessoRefItem)")
-    from playwright.sync_api import TimeoutError as PWTimeout
-    campo = page.locator(sel).first
+    # na ordem: a busca da lista (#pesquisa-mini "Pesquisar por nome, CPF/CNPJ ou n° da nota"); NUNCA a busca do menu
+    # do Bling ("Pesquisar", .AdvancedInputSearch-input), que vem antes na página (Biel 19/11 14:56: digitava lá)
+    candidatos = ["#pesquisa-mini:visible",
+                  "input[placeholder*='da nota']:visible:not(#edChaveAcessoRefItem):not(.AdvancedInputSearch-input)",
+                  "input[placeholder*='Pesquisar por']:visible:not(.AdvancedInputSearch-input)"]
+    for _ in range(max(1, int(timeout / 500))):
+        for sel in candidatos:
+            loc = page.locator(sel)
+            if loc.count():
+                return loc.first
+        page.wait_for_timeout(500)
     try:
-        campo.wait_for(state="visible", timeout=timeout)
-    except PWTimeout:
-        try:
-            vis = page.evaluate("() => [...document.querySelectorAll('input')].filter(i => i.offsetParent && i.type !== 'hidden')"
-                                ".map(i => (i.id || i.name || '?') + '=' + (i.placeholder || '')).slice(0, 15)")
-        except Exception:
-            vis = []
-        raise RoboErro(f"não achei o campo de busca da lista de notas (campos na tela: {vis}) (foto: {_foto(page, f'{numero}_busca')})")
-    return campo
+        vis = page.evaluate("() => [...document.querySelectorAll('input')].filter(i => i.offsetParent && i.type !== 'hidden')"
+                            ".map(i => (i.id || i.name || '?') + '=' + (i.placeholder || '')).slice(0, 15)")
+    except Exception:
+        vis = []
+    raise RoboErro(f"não achei o campo de busca da lista de notas (campos na tela: {vis}) (foto: {_foto(page, f'{numero}_busca')})")
 
 def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_itens: int | None = None,
                      headless: bool = True, log=print) -> dict:
@@ -343,8 +346,11 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                 rpa.wait_no_overlay(page, 60000)
 
                 alvo = None
-                for k in range(page.locator(f"tr[numero='{numero}']").count()):
-                    tr = page.locator(f"tr[numero='{numero}']").nth(k)
+                linhas = page.locator("tr[numero]")                 # o Bling guarda o número com zeros: numero="013003"
+                for k in range(linhas.count()):
+                    tr = linhas.nth(k)
+                    if (tr.get_attribute("numero") or "").lstrip("0") != str(numero).lstrip("0"):
+                        continue
                     if valor is not None and abs(float(tr.get_attribute("valor") or 0) - float(valor)) > 0.05:
                         continue
                     alvo = tr
