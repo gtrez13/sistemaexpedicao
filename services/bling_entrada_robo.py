@@ -410,9 +410,26 @@ def conciliar_pedido(numero: str, pc_numero: str, valor: float | None = None, n_
                     card.locator("button", has_text="Pedido de compra").first.click(timeout=15000)
                     painel.wait_for(state="visible", timeout=30000)
                     page.wait_for_timeout(800)
-                    painel.locator("label.Checkbox-card", has_text="Conciliar pedido").first.click(timeout=15000)
+                    # "Conciliar pedido" abre o campo do número do pedido. Conferido na tela (19/11 15:05): o painel abre com
+                    # "Deseja conciliar o pedido de compra?" e o campo só aparece depois do clique; se o clique cair durante a
+                    # animação do painel, nada acontece -> tenta de novo (por JS na 2ª e 3ª vez).
                     campo = painel.locator("input[name='purchaseOrderNumberSearch']").first
-                    campo.wait_for(state="visible", timeout=30000)
+                    for tent in range(3):
+                        if tent == 0:
+                            painel.locator("label.Checkbox-card", has_text="Conciliar pedido").first.click(timeout=15000)
+                        else:
+                            page.evaluate("""() => { const p = document.getElementById('slideIn-pedido-compra');
+                                const l = [...p.querySelectorAll('label.Checkbox-card')].find(x => x.innerText.includes('Conciliar pedido'));
+                                const r = p.querySelector("input[name='conciliacao_pedido_compra']");
+                                if (r && !r.checked) { r.click(); if (!r.checked) l && l.click(); } else if (l && !r) l.click(); }""")
+                        try:
+                            campo.wait_for(state="visible", timeout=8000)
+                            break
+                        except PWTimeout:
+                            if tent == 2:
+                                txt = painel.inner_text(timeout=5000).replace("\n", " ")[:200]
+                                raise RoboErro(f"item {k + 1}: marquei 'Conciliar pedido' 3 vezes e o campo do pedido não apareceu "
+                                               f"(painel: {txt}) (foto: {_foto(page, f'{numero}_conc_item{k + 1}_painel')})")
                     page.wait_for_timeout(1200)
                     campo.click()
                     campo.press("Control+A")
