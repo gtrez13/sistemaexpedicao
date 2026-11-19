@@ -45,12 +45,16 @@ ENV_MEDICALD = [
     ("EMPRESA_NOME", "Medical Dantas Imp. e Com. de Equip. Médicos e Veterinários Ltda", ""),
     ("DEVOLUCAO_EMPRESA_PADRAO", "MEDICAL", "devoluções: empresa padrão"),
     ("DEVOLUCAO_LOJA_ML", "Medical Dantas", ""),
-    ("NAO_ACHADO_ZERAR_BLING", "0", "Não achado NÃO zera o Bling sozinho (ligar só com o OK do Biel)"),
-    ("FEFO_ATIVO", "0", "FEFO desligado até cadastrar os lotes da MedicalD"),
+    ("NAO_ACHADO_ZERAR_BLING", "1", "Não encontrei zera o saldo do depósito Local no Bling na hora (Biel 19/11: \"pode ligar isso\")"),
+    ("NAO_ACHADO_ZERAR_QUANDO", "relato", ""),
+    ("FEFO_ATIVO", "0", "FEFO desligado até cadastrar os lotes da MedicalD (Biel 19/11: \"já já arrumo\")"),
     ("RECEB_ETQ_UNICA", "estrito", "entrada: etiqueta única por unidade, conferência só bipando"),
-    ("NF_DEV_ENVIAR_AUTO", "0", "nota de devolução não vai sozinha para a SEFAZ (naturezas da MedicalD a configurar)"),
+    ("NF_DEV_ENVIAR_AUTO", "1", "nota de devolução vai sozinha para a SEFAZ, igual à LHVMed (Biel 19/11)"),
     ("SESSAO_HORAS", "12", ""),
 ]
+
+# copiados do .env da LHVMed se a MedicalD não tiver (o valor não aparece na tela)
+COPIAR_DA_LHVMED = ["NF_DEV_EMAIL_PADRAO", "NF_DEV_TELEFONE_PADRAO"]
 
 METODOS_BLING = ["_download", "_get", "_get_json", "_headers", "_load_tokens", "_post", "_request",
                  "anexar_seriais_em_observacoes", "baixar_danfe_simplificado_por_nfe", "buscar_pedido_venda_id_por_numero_loja",
@@ -130,6 +134,10 @@ class Registro:
 
     def __init__(self, alvo, orig, registro):
         self.alvo, self.orig, self.registro, self.vistos = alvo, orig, registro, set()
+        if registro and os.path.exists(registro):          # rodada anterior: não guarda de novo o já mudado como "original"
+            for ln in open(registro, encoding="utf-8"):
+                if ln.strip():
+                    self.vistos.add(ln.strip().split(" ", 1)[1])
 
     def _anota(self, linha):
         if self.registro:
@@ -374,7 +382,21 @@ def aplicar(a):
     p = os.path.join(alvo, ".env")
     s = ler(p) if os.path.exists(p) else ""
     tem = env_chaves(s)
-    faltam = [(k, v, c) for k, v, c in ENV_MEDICALD if k not in tem]
+    lista = list(ENV_MEDICALD)
+    if a.extra_env and os.path.exists(a.extra_env):            # naturezas da devolução achadas no Bling da MedicalD
+        for ln in open(a.extra_env, encoding="utf-8"):
+            m = re.match(r'([A-Z_][A-Z0-9_]*)="?([^"\n]*)"?', ln.strip())
+            if m:
+                lista.append((m.group(1), m.group(2), "natureza da nota de devolução no Bling da MedicalD"))
+    try:
+        from dotenv import dotenv_values
+        lv = dotenv_values(os.path.join(lhv, ".env"))
+        for k in COPIAR_DA_LHVMED:
+            if lv.get(k):
+                lista.append((k, lv[k], "padrão da nota de devolução, igual ao da LHVMed (troque se a MedicalD tiver o dela)"))
+    except Exception:
+        pass
+    faltam = [(k, v, c) for k, v, c in lista if k not in tem]
     if faltam:
         reg.mudar(".env")
         bloco = ("" if (not s or s.endswith("\n")) else "\n") + "\n# >>> ligar_medicald.sh: valores da MedicalD para os módulos da LHVMed\n"
@@ -385,7 +407,7 @@ def aplicar(a):
         bloco += "# <<< ligar_medicald.sh\n"
         gravar(p, s + bloco)
         feitos.append(".env: " + ", ".join(k for k, _, _ in faltam))
-    ja = [k for k, _, _ in ENV_MEDICALD if k in tem]
+    ja = [k for k, _, _ in lista if k in tem]
     if ja:
         avisos.append(".env já tinha (mantive o valor dela): " + ", ".join(ja))
 
@@ -559,6 +581,48 @@ def testar(a):
     return 1 if graves else 0
 
 
+def _sem_acento(t):
+    import unicodedata
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()).strip()
+
+
+def naturezas(a):
+    """Naturezas de devolução do Bling da MedicalD (só lê). stdout: KEY="id" das que deu para achar sem dúvida;
+    stderr: a lista para conferência. Igual à LHVMed: CPF/sem IE = não contribuinte, dentro de SP e fora de SP."""
+    alvo = os.path.abspath(a.alvo)
+    os.chdir(alvo)
+    sys.path.insert(0, alvo)
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(alvo, ".env"))
+    from services.bling_service import BlingService
+    b = BlingService()
+    nat, pag = [], 1
+    while pag <= 5:
+        d = (b._get_json("/naturezas-operacoes", params={"limite": 100, "pagina": pag}) or {}).get("data") or []
+        nat += d
+        if len(d) < 100:
+            break
+        pag += 1
+    dev = [x for x in nat if "devol" in _sem_acento(x.get("descricao"))]
+    print(f"naturezas de devolução no Bling da MedicalD ({len(dev)} de {len(nat)}):", file=sys.stderr)
+    for x in dev:
+        print(f"   {x.get('id')}  {x.get('descricao')}", file=sys.stderr)
+    nc = [x for x in dev if re.search(r"nao[ -]?contrib|consumidor final|cpf", _sem_acento(x.get("descricao")))]
+    fora = [x for x in nc if re.search(r"fora|inter|outr[ao]s? (uf|estado)|\b6\.?2\d\d", _sem_acento(x.get("descricao")))]
+    dentro = [x for x in nc if x not in fora]
+    achou = []
+    if len(dentro) == 1:
+        print(f'BLING_NATUREZA_DEV_NC_SP="{dentro[0]["id"]}"'); achou.append(f"dentro de SP = {dentro[0].get('descricao')}")
+    if len(fora) == 1:
+        print(f'BLING_NATUREZA_DEV_NC_FORA="{fora[0]["id"]}"'); achou.append(f"fora de SP = {fora[0].get('descricao')}")
+    if achou:
+        print("não contribuinte: " + "; ".join(achou), file=sys.stderr)
+    if len(dentro) != 1 or len(fora) != 1:
+        print("!! não achei sem dúvida as duas de NÃO CONTRIBUINTE (dentro e fora de SP): a nota de devolução de cliente CPF/sem IE"
+              " vai parar na prévia com 'natureza' até configurar (manda a lista acima para o Claude)", file=sys.stderr)
+    return 0
+
+
 def pip_faltam(a):
     def ler_freeze(p):
         out = {}
@@ -582,6 +646,9 @@ def main():
     x = sub.add_parser("aplicar")
     x.add_argument("--alvo", required=True); x.add_argument("--lhv", required=True); x.add_argument("--robo", required=True)
     x.add_argument("--orig"); x.add_argument("--registro"); x.add_argument("--faturar", action="store_true")
+    x.add_argument("--extra-env", dest="extra_env")
+    n = sub.add_parser("naturezas")
+    n.add_argument("--alvo", required=True)
     t = sub.add_parser("testar")
     t.add_argument("--alvo", required=True); t.add_argument("--lhv", required=True)
     p = sub.add_parser("pip")
@@ -592,6 +659,8 @@ def main():
         rc = 0
     elif a.cmd == "testar":
         rc = testar(a)
+    elif a.cmd == "naturezas":
+        rc = naturezas(a)
     else:
         rc = pip_faltam(a)
     sys.stdout.flush()

@@ -9,7 +9,8 @@
 #      Se algo grave faltar, PARA aqui e nada muda na MedicalD.
 #   3. aplica de verdade: módulos que faltam (cópia exata da LHVMed), mapa_routes.py novo, robô da entrada novo,
 #      blueprints no app.py, sessão igual à da LHVMed, correções do bling_service/ml_service/routes.py (com âncora),
-#      valores da MedicalD no .env (depósito Local, CNPJ, Não achado sem zerar o Bling, FEFO desligado)
+#      valores da MedicalD no .env (depósito Local, CNPJ, Não achado zera o Bling, nota de devolução automática,
+#      naturezas de devolução da MedicalD achadas no Bling dela, FEFO desligado)
 #   4. 4 threads no gunicorn (igual à LHVMed), cron do estoque (a cada 5 min) e da virada do dia
 #   5. reinicia a MedicalD; se não subir, volta tudo sozinho
 # Desfazer: bash ~/backups_medicald/ligar_<data>/desfazer.sh
@@ -109,6 +110,9 @@ else
   echo "não achei a situação 'Pronto para faturar' no Bling da MedicalD: o Comercial conferido não muda a situação no Bling"
 fi
 cat "$BKD/teste_aplicar.txt"
+echo "-- naturezas da nota de devolução (só lê o Bling da MedicalD):"
+(cd "$STG" && timeout 90 "$PY" -I "$AP" naturezas --alvo "$STG" > "$BKD/naturezas.env" 2> "$BKD/naturezas.txt") || echo "  (não consegui ler as naturezas)"
+grep -v "^\s*[0-9]" "$BKD/naturezas.txt" | sed 's/^/  /' | tail -4 || true
 echo "-- conferindo a cópia de teste:"
 if ! (cd "$STG" && timeout 300 "$PY" -I "$AP" testar --alvo "$STG" --lhv "$L"); then
   if [ "${FORCAR:-0}" != "1" ]; then
@@ -124,7 +128,7 @@ fi
 etapa "3/6 Aplicando na MedicalD"
 voltar() { echo; echo "deu erro no meio: voltando tudo"; bash "$BKD/desfazer.sh"; exit 1; }
 trap 'rm -rf "$STG"; voltar' ERR
-"$PY" -I "$AP" aplicar --alvo "$M" --lhv "$L" --robo "$BKD/novos/bling_entrada_robo.py" $FATURAR \
+"$PY" -I "$AP" aplicar --alvo "$M" --lhv "$L" --robo "$BKD/novos/bling_entrada_robo.py" $FATURAR --extra-env "$BKD/naturezas.env" \
      --orig "$BKD/orig" --registro "$BKD/registro.txt" > "$BKD/aplicar.txt" 2>&1 || { cat "$BKD/aplicar.txt"; voltar; }
 grep -v "diferentes nas duas" "$BKD/aplicar.txt" | grep -E "^ +(ok|!!)" | head -20 || true
 
@@ -169,18 +173,8 @@ sudo journalctl -u "$SVC" --since "-60 s" --no-pager | grep -iE "não carregou|T
 echo "LHVMed (não mexi): $(systemctl is-active wms-russia.service), /api/auth/me $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/auth/me)"
 
 # ───────────────────────── 6. o que falta configurar ─────────────────────────
-etapa "6/6 Para conferir depois (só leitura no Bling da MedicalD)"
-(cd "$M" && timeout 60 venv/bin/python - <<'PYEOF' 2>/dev/null) || echo "  (não consegui listar as naturezas)"
-from dotenv import load_dotenv; load_dotenv(".env")
-from services.bling_service import BlingService
-b = BlingService()
-nat = (b._get_json("/naturezas-operacoes", params={"limite": 100}).get("data") or [])
-print("naturezas de operação (para a nota de devolução):")
-for x in nat:
-    d = str(x.get("descricao") or "")
-    if "devol" in d.lower() or "retorno" in d.lower():
-        print(f"   {x.get('id')}  {d}")
-PYEOF
+etapa "6/6 Naturezas da nota de devolução no Bling da MedicalD"
+cat "$BKD/naturezas.txt" 2>/dev/null || echo "  (não li)"
 echo
 echo "PRONTO. Backup: $BKD"
 echo "Desfazer tudo (1 comando):  bash $BKD/desfazer.sh"
