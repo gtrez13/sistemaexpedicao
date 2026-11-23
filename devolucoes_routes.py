@@ -2267,11 +2267,17 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5, so_venda=None) -> dict:
     if so_venda:
         venda = re.sub(r"\D", "", str(so_venda))
         code, j = ml_get("/post-purchase/v1/claims/search", {"resource": "order", "resource_id": venda, "limit": 20})
-        if code != 200 or j is None:
-            sp, pk = ml_get(f"/packs/{venda}")       # número de pacote (carrinho): pega a 1ª venda dele
+        if code != 200 or j is None or not (j.get("data") or []):
+            sp, pk = ml_get(f"/packs/{venda}")       # número de pacote (carrinho): as reclamações ficam nas vendas dele
             if sp == 200 and isinstance(pk, dict) and pk.get("orders"):
-                venda = str(pk["orders"][0].get("id"))
-                code, j = ml_get("/post-purchase/v1/claims/search", {"resource": "order", "resource_id": venda, "limit": 20})
+                dados = []
+                for o in pk["orders"][:5]:
+                    code, j = ml_get("/post-purchase/v1/claims/search", {"resource": "order", "resource_id": str(o.get("id")), "limit": 20})
+                    if code == 429:
+                        break
+                    dados += (j or {}).get("data") or [] if code == 200 else []
+                if code != 429:
+                    venda, code, j = str(pk["orders"][0].get("id")), 200, {"data": dados}
         if code == 429:
             return {"ok": False, "erro": "O Mercado Livre limitou as consultas agora (429). Espere uns minutos e tente de novo."}
         if code != 200 or j is None:
