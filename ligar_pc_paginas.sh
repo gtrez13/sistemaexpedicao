@@ -10,7 +10,7 @@ curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF/rece
 venv/bin/python -m py_compile .receb_novo
 A=$(blob recebimento_routes.py)
 [ "$A" = "$(blob .receb_novo)" ] && { rm -f .receb_novo; echo "já instalado"; exit 0; }
-if [ "$A" != "890817eddabb" ] && [ "${FORCAR:-0}" != "1" ]; then echo "recebimento_routes.py do servidor ($A) não é o esperado (890817eddabb): parei"; rm -f .receb_novo; exit 1; fi
+if [ "$A" != "890817eddabb" ] && [ "$A" != "6e0f9a849843" ] && [ "${FORCAR:-0}" != "1" ]; then echo "recebimento_routes.py do servidor ($A) não é o esperado (890817eddabb): parei"; rm -f .receb_novo; exit 1; fi
 BK="recebimento_routes.py.bak_pc_$(date +%Y%m%d%H%M%S)"; cp -p recebimento_routes.py "$BK"; mv .receb_novo recebimento_routes.py
 sudo systemctl restart "$SVC"; sleep 5
 code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$PORTA/api/recebimento/resumo || true)

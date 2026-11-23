@@ -1950,13 +1950,20 @@ def _uso_formas():
     return geral
 
 
-def _forma_pagamento(id_fornecedor, xml=None):
-    """Forma de pagamento das contas = a da NF-e (Biel 18/11: "tem que ser via NF-e, tem que pôr o que aparece no XML"):
-    a forma ativa do Bling com o mesmo tPag (pelo tipoPagamento ou pelo nome; no 99, pelo <xPag>); empate = a mais usada.
-    Sem nenhuma forma do Bling desse meio: RECEB_FORMA_PAGAMENTO_ID do .env; senão não lança e diz o que a nota pede.
+def _forma_pagamento(id_fornecedor, xml=None, formas_pc=None):
+    """Forma de pagamento das contas. 1º a forma das parcelas do PEDIDO DE COMPRA (é a combinada com o fornecedor; NF 70644
+    DORJA 23/11: a NF-e dizia tPag 14 duplicata e o Bling não tem forma desse tipo, mas o pedido tinha BOLETO 28/56/84DDL).
+    2º a da NF-e (Biel 18/11): a forma ativa do Bling com o mesmo tPag (pelo tipoPagamento ou pelo nome; no 99, pelo <xPag>);
+    empate = a mais usada. 3º RECEB_FORMA_PAGAMENTO_ID do .env; senão não lança e diz o que a nota pede.
     -> (id, de onde veio) ou (None, explicação)."""
     tp, txt = _pag_xml(xml)
     formas = _formas_bling()
+    ids_pc = [int(x) for x in (formas_pc or [])]
+    if ids_pc:
+        for x in formas:
+            if int(x.get("id") or 0) in ids_pc:
+                return int(x["id"]), f"{x.get('descricao')} (pelo pedido de compra)"
+        return ids_pc[0], f"id {ids_pc[0]} (pelo pedido de compra)"
     cands = [x for x in formas if tp and str(x.get("tipoPagamento") or "").lstrip("0") == str(tp)] if tp != 99 else []
     if not cands and txt:
         chave = re.sub(r"\(.*?\)", "", txt).strip().lower().split()[0] if txt.strip() else ""
@@ -2155,7 +2162,9 @@ def plano_entrada(nid, resumo=None):
         return plano
     sit = int((pc.get("situacao") or {}).get("valor") or 0)
     plano["pc"] = {"id": pc["id"], "numero": pc.get("numero"), "situacao_id": (pc.get("situacao") or {}).get("id"), "situacao_valor": sit,
-                   "fornecedor_id": (pc.get("fornecedor") or {}).get("id"), "categoria_id": (pc.get("categoria") or {}).get("id")}
+                   "fornecedor_id": (pc.get("fornecedor") or {}).get("id"), "categoria_id": (pc.get("categoria") or {}).get("id"),
+                   # forma de pagamento combinada no pedido (parcelas): vale antes da que vem no XML (NF 70644 DORJA, 23/11)
+                   "formas_pagamento": [int(x) for x in {str((pa.get("formaPagamento") or {}).get("id") or "") for pa in (pc.get("parcelas") or [])} if x.isdigit()]}
     nome_sit = {0: "Em aberto", 1: "Atendido", 2: "Cancelado", 3: "Em andamento"}.get(sit, str(sit))
     if sit == 2:
         ponto(False, "Pedido de compra", f"o pedido {pc.get('numero')} está CANCELADO no Bling")
@@ -2229,7 +2238,7 @@ def plano_entrada(nid, resumo=None):
     if not dups:
         ponto(None, "Contas a pagar", "o XML não tem duplicatas: nenhuma conta será lançada")
     else:
-        fp, origem_fp = _forma_pagamento(forn, r["xml"])
+        fp, origem_fp = _forma_pagamento(forn, r["xml"], plano["pc"].get("formas_pagamento"))
         if not fp:
             ponto(False, "Contas a pagar", f"forma de pagamento: {origem_fp}. Cadastre essa forma no Bling (ou ponha RECEB_FORMA_PAGAMENTO_ID=<id> no .env)")
         tot = round(sum(d["valor"] for d in dups), 2)
