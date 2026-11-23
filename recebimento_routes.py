@@ -289,10 +289,16 @@ def _buscar_pcs(cnpj: str) -> list | None:
         ct = b._get_json("/contatos", {"numeroDocumento": cnpj, "limite": 5}).get("data") or []
         ids = [x["id"] for x in ct if _dig(x.get("numeroDocumento")) == cnpj]
         lista = []
-        for fid in ids[:2]:
-            for sit in (0, 3):      # em aberto, em andamento
+        # O Bling IGNORA idsSituacoes[] aqui e devolve do mais antigo para o mais novo (DORJA x pedido 3304, 23/11: o fornecedor
+        # tinha mais de 50 pedidos e o novo nunca entrava). Percorre todas as páginas e filtra aqui: 0 em aberto, 3 em andamento.
+        for fid in ids[:3]:
+            for pag in range(1, 41):
                 _ritmo()
-                lista += b._get_json("/pedidos/compras", {"idFornecedor": fid, "idsSituacoes[]": sit, "limite": 50}).get("data") or []
+                d = b._get_json("/pedidos/compras", {"idFornecedor": fid, "limite": 100, "pagina": pag}).get("data") or []
+                lista += [p for p in d if (p.get("situacao") or {}).get("valor") in (0, 3, "0", "3")]
+                if len(d) < 100:
+                    break
+        lista.sort(key=lambda p: str(p.get("data") or ""), reverse=True)
     except Exception as e:
         print(f"⚠️ recebimento: pedidos de compra do Bling falharam: {e}", flush=True)
         return None
