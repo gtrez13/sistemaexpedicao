@@ -2242,26 +2242,46 @@ def _fechadas_recentes(ml_get, agora):
     if agora - _fechadas_cache["em"] < 1800:
         return _fechadas_cache["lista"]
     corte = time.strftime("%Y-%m-%d", time.localtime(agora - DIAS_FECHADAS * 86400))
-    out, off = [], 0
+    out, off, completa = [], 0, True
     while off < 1000:
         code, j = ml_get("/post-purchase/v1/claims/search", {"status": "closed", "limit": 50, "offset": off})
         if code != 200 or j is None:
+            completa = False          # o ML cortou (429 etc.): não guarda a lista pela metade por 30 min
             break
         pg = j.get("data") or []
         out += [c for c in pg if c.get("resource") == "order" and str(c.get("date_created") or "")[:10] >= corte]
         off += 50
         if len(pg) < 50:
             break
-    _fechadas_cache.update(em=agora, lista=out)
+    if completa:
+        _fechadas_cache.update(em=agora, lista=out)
     return out
 
 
-def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
+def importar_do_ml(ml_get=_ml_get, pausa=0.5, so_venda=None) -> dict:
     """Traz para o WMS (status 'esperada') as devoluções ABERTAS do ML que VOLTAM PARA O SELLER (galpão).
-    Devolução de produto FULL vai para o armazém do ML e fica de fora. Consulta devagar e lembra o que já checou."""
+    Devolução de produto FULL vai para o armazém do ML e fica de fora. Consulta devagar e lembra o que já checou.
+    so_venda: olha SÓ as reclamações dessa venda (abertas ou fechadas), agora, sem orçamento e sem o cache de 'já vi'."""
     garantir_tabelas()
     abertas, off = [], 0
-    while off < 200:
+    if so_venda:
+        venda = re.sub(r"\D", "", str(so_venda))
+        code, j = ml_get("/post-purchase/v1/claims/search", {"resource": "order", "resource_id": venda, "limit": 20})
+        if code != 200 or j is None:
+            sp, pk = ml_get(f"/packs/{venda}")       # número de pacote (carrinho): pega a 1ª venda dele
+            if sp == 200 and isinstance(pk, dict) and pk.get("orders"):
+                venda = str(pk["orders"][0].get("id"))
+                code, j = ml_get("/post-purchase/v1/claims/search", {"resource": "order", "resource_id": venda, "limit": 20})
+        if code == 429:
+            return {"ok": False, "erro": "O Mercado Livre limitou as consultas agora (429). Espere uns minutos e tente de novo."}
+        if code != 200 or j is None:
+            return {"ok": False, "erro": f"O Mercado Livre não respondeu sobre a venda {venda} (HTTP {code})."}
+        cls = [c for c in (j.get("data") or []) if c.get("resource") == "order"]
+        if not cls:
+            return {"ok": True, "novas": 0, "sem_reclamacao": True,
+                    "msg": f"A venda {venda} não tem nenhuma reclamação/devolução no Mercado Livre nesta conta."}
+        abertas = [dict(c, _fechada=(c.get("status") != "opened")) for c in cls]
+    while off < 200 and not so_venda:
         code, j = ml_get("/post-purchase/v1/claims/search", {"status": "opened", "limit": 50, "offset": off})
         if code != 200 or j is None:
             if off == 0:
@@ -2274,7 +2294,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             break
     agora = int(time.time())
     n_abertas = len(abertas)
-    fechadas = _fechadas_recentes(ml_get, agora)
+    fechadas = [] if so_venda else _fechadas_recentes(ml_get, agora)
     ids_abertas = {str(c.get("id")) for c in abertas}
     abertas = abertas + [dict(c, _fechada=True) for c in fechadas if str(c.get("id")) not in ids_abertas]
     loja = os.environ.get("DEVOLUCAO_LOJA_ML", "LHV Med")
@@ -2287,12 +2307,12 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
             cid = str(c.get("id"))
             v = conn.execute("SELECT resultado, atualizado_em FROM devolucoes_ml_vistos WHERE claim_id=?", (cid,)).fetchone()
             tem_linha = conn.execute("SELECT 1 FROM devolucoes WHERE ml_claim_id=?", (cid,)).fetchone() is not None
-            if v and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
+            if v and not so_venda and ((v["resultado"] in ("importada", "armazem_ml") and tem_linha)
                       or (v["resultado"] in ("sem_devolucao", "fechada_ok") or str(v["resultado"]).startswith("erro_"))
                       and agora - v["atualizado_em"] < RECHECAR_SEM_DEVOLUCAO_S):
                 conhecidas += 1
                 continue
-            if checadas >= ORCAMENTO_POR_RODADA or parou_429:
+            if (checadas >= ORCAMENTO_POR_RODADA and not so_venda) or parou_429:
                 continue
             checadas += 1
             st_envio = None
@@ -2358,7 +2378,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 conn.execute("UPDATE devolucoes_ml_vistos SET resultado=?, atualizado_em=? WHERE claim_id=?", (resultado, agora, cid))
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
-        custos_feitos, custos_faltam, custos_429 = atualizar_custos(conn, ml_get, agora)
+        custos_feitos, custos_faltam, custos_429 = (0, 0, False) if so_venda else atualizar_custos(conn, ml_get, agora)
         ids = [str(c.get("id")) for c in abertas]    # abertas + fechadas recentes
         cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0, "fechada_ok": 0}
         for i in range(0, len(ids), 50):
@@ -2367,11 +2387,42 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5) -> dict:
                 k = "erro" if str(r["resultado"]).startswith("erro_") else r["resultado"]
                 cont[k] = cont.get(k, 0) + r["n"]
     pendentes = max(0, len(abertas) - sum(cont.values()))
+    if so_venda:
+        ult = None
+        with db_session() as conn:
+            ult = conn.execute("SELECT id, status FROM devolucoes WHERE ml_claim_id IN (%s) ORDER BY id DESC LIMIT 1"
+                               % ",".join("?" * len(ids)), tuple(ids)).fetchone() if ids else None
+        res = {k: cont.get(k, 0) for k in cont}
+        if parou_429:
+            msg = "O Mercado Livre limitou as consultas agora (429). Espere uns minutos e tente de novo."
+        elif ult:
+            msg = (f"Devolução #{ult['id']} " + ("importada agora" if novas else "já estava no WMS")
+                   + (" — vai para o ARMAZÉM DO ML (Full), não passa pelo galpão." if ult["status"] == "armazem_ml" else "."))
+        elif res.get("fechada_ok"):
+            msg = "Essa reclamação já fechou e a caixa já chegou/foi resolvida no ML: não tem nada pendente para o galpão."
+        elif res.get("sem_devolucao"):
+            msg = "A venda tem reclamação, mas sem envio de produto de volta (só reembolso/mediação): nada para receber."
+        else:
+            msg = "O ML não liberou os detalhes dessa reclamação: " + "; ".join(f"HTTP {e['http']} {e['msg']}" for e in erros)
+        return {"ok": True, "novas": novas, "msg": msg, "devolucao_id": ult["id"] if ult else None, "limite_ml": parou_429, "erros": erros}
     return {"ok": True, "abertas_no_ml": n_abertas, "fechadas_em_transito": len(fechadas), "novas": novas,
             "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
             "sem_devolucao": cont["sem_devolucao"], "com_erro": cont["erro"], "erros": erros,
             "pendentes": pendentes, "limite_ml": parou_429 or custos_429,
             "custos_atualizados": custos_feitos, "custos_pendentes": custos_faltam}
+
+
+@devolucoes_routes.post("/devolucoes/importar-ml-venda")
+@login_required
+def importar_ml_venda():
+    """Busca AGORA a devolução de UMA venda no ML (poucas chamadas: não espera os 5 min da importação geral)."""
+    venda = re.sub(r"\D", "", str((request.get_json(silent=True) or {}).get("venda") or ""))
+    if len(venda) < 8:
+        return jsonify({"ok": False, "erro": "Informe o número da venda do Mercado Livre."}), 400
+    try:
+        return jsonify(importar_do_ml(so_venda=venda, pausa=0.3))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "erro": f"falha ao buscar a venda: {e}"[:300]})
 
 
 @devolucoes_routes.post("/devolucoes/importar-ml")
