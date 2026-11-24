@@ -10,7 +10,7 @@ curl -fsSL "https://raw.githubusercontent.com/gtrez13/sistemaexpedicao/$REF/devo
 venv/bin/python -m py_compile .dev_novo
 A=$(blob devolucoes_routes.py)
 [ "$A" = "$(blob .dev_novo)" ] && { rm -f .dev_novo; echo "já instalado"; exit 0; }
-if [ "$A" != "6f3ff0a379b4" ] && [ "$A" != "32ef6c75849e" ] && [ "$A" != "06acb1818ae7" ] && [ "$A" != "e3b529558fa1" ] && [ "$A" != "2ae6f94b9f60" ] && [ "${FORCAR:-0}" != "1" ]; then echo "devolucoes_routes.py do servidor ($A) não é o esperado (6f3ff0a379b4): parei. Me mande esse código."; rm -f .dev_novo; exit 1; fi
+if [ "$A" != "6f3ff0a379b4" ] && [ "$A" != "32ef6c75849e" ] && [ "$A" != "06acb1818ae7" ] && [ "$A" != "e3b529558fa1" ] && [ "$A" != "2ae6f94b9f60" ] && [ "$A" != "42b0534be8f7" ] && [ "${FORCAR:-0}" != "1" ]; then echo "devolucoes_routes.py do servidor ($A) não é o esperado (6f3ff0a379b4): parei. Me mande esse código."; rm -f .dev_novo; exit 1; fi
 BK="devolucoes_routes.py.bak_venda_$(date +%Y%m%d%H%M%S)"; cp -p devolucoes_routes.py "$BK"; mv .dev_novo devolucoes_routes.py
 sudo systemctl restart "$SVC"; sleep 5
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$PORTA/api/devolucoes/importar-ml-venda || true)

@@ -2216,13 +2216,14 @@ RECHECAR_REVISAO_S = 15 * 60      # "Para sua revisão" no ML muda quando algué
 
 def _prazo_revisao(claim: dict):
     """Data limite (YYYY-MM-DD) da revisão do vendedor, se o ML informar."""
+    # "Urgente / último dia" no painel do ML = return_review_ok com mandatory=true e due_date; as outras ações vêm sem data
+    datas = []
     for p in (claim or {}).get("players") or []:
         if p.get("type") == "seller" or p.get("role") == "respondent":
             for a in p.get("available_actions") or []:
-                if str(a.get("action") or "").startswith("return_review"):
-                    d = a.get("due_date") or a.get("expiration_date") or ""
-                    return str(d)[:10] or None
-    return None
+                if str(a.get("action") or "").startswith("return_review") and a.get("due_date"):
+                    datas.append((0 if a.get("mandatory") else 1, str(a["due_date"])[:10]))
+    return sorted(datas)[0][1] if datas else None
 
 
 def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
