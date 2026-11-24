@@ -2232,7 +2232,7 @@ def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
     É isso que a tela 'Aqui no galpão para tratar' mostra — igual ao ML, só o que está pendente hoje."""
     rows = conn.execute(
         "SELECT id, ml_claim_id, ml_envio FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
-        "AND status IN ('esperada','recebida','pendente_resolver','armazem_ml') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?) "
+        "AND (ml_revisao_em IS NULL OR ml_revisao_em < ?) "
         "ORDER BY COALESCE(ml_revisao_em, 0), id LIMIT ?", (agora - RECHECAR_REVISAO_S, orcamento)).fetchall()
     feitos, limite = 0, False
     for r in rows:
@@ -2243,13 +2243,25 @@ def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
         if code != 200 or not isinstance(cl, dict):
             conn.execute("UPDATE devolucoes SET ml_revisao_em=? WHERE id=?", (agora, r["id"]))
             continue
-        # o ML abre a ação "revisar" antes de a caixa chegar: só é "Para sua revisão" com o envio de volta ENTREGUE
-        pede = any(a in _acoes_seller(cl) for a in ("return_review_ok", "return_review_fail")) and r["ml_envio"] == "delivered"
+        # o ML abre a ação "revisar" antes de a caixa chegar: só é "Para sua revisão" com o envio de volta ENTREGUE.
+        # Se o WMS ainda acha que está em trânsito, pergunta ao ML agora (1 chamada) em vez de confiar no dado velho.
+        pede = any(a in _acoes_seller(cl) for a in ("return_review_ok", "return_review_fail"))
+        envio = r["ml_envio"]
+        if pede and envio != "delivered":
+            c2, ret = ml_get(f"/post-purchase/v2/claims/{r['ml_claim_id']}/returns")
+            if c2 == 429:
+                limite = True
+                break
+            if c2 == 200 and isinstance(ret, dict):
+                _, _, envio = _destino_da_devolucao(ret)
+                if envio and envio != r["ml_envio"]:
+                    conn.execute("UPDATE devolucoes SET ml_envio=? WHERE id=?", (envio, r["id"]))
+        pede = pede and envio == "delivered"
         conn.execute("UPDATE devolucoes SET ml_revisao=?, ml_revisao_em=?, ml_revisao_prazo=? WHERE id=?",
                      ("pendente" if pede else "nao", agora, _prazo_revisao(cl) if pede else None, r["id"]))
         feitos += 1
     falta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
-                         "AND status IN ('esperada','recebida','pendente_resolver','armazem_ml') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?)",
+                         "AND (ml_revisao_em IS NULL OR ml_revisao_em < ?)",
                          (agora - RECHECAR_REVISAO_S,)).fetchone()["n"]
     return feitos, falta, limite
 
