@@ -2231,7 +2231,7 @@ def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
     É isso que a tela 'Aqui no galpão para tratar' mostra — igual ao ML, só o que está pendente hoje."""
     rows = conn.execute(
         "SELECT id, ml_claim_id FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
-        "AND status IN ('esperada','recebida','pendente_resolver') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?) "
+        "AND status IN ('esperada','recebida','pendente_resolver','armazem_ml') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?) "
         "ORDER BY COALESCE(ml_revisao_em, 0), id LIMIT ?", (agora - RECHECAR_REVISAO_S, orcamento)).fetchall()
     feitos, limite = 0, False
     for r in rows:
@@ -2247,7 +2247,7 @@ def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
                      ("pendente" if pede else "nao", agora, _prazo_revisao(cl) if pede else None, r["id"]))
         feitos += 1
     falta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
-                         "AND status IN ('esperada','recebida','pendente_resolver') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?)",
+                         "AND status IN ('esperada','recebida','pendente_resolver','armazem_ml') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?)",
                          (agora - RECHECAR_REVISAO_S,)).fetchone()["n"]
     return feitos, falta, limite
 
