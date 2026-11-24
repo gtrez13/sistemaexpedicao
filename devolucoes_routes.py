@@ -93,7 +93,8 @@ EXTRAS_V3 = [("resolucao", "TEXT"), ("resolvido_por", "TEXT"), ("resolvido_em", 
              ("nf_dev_id", "TEXT"), ("nf_dev_numero", "TEXT"), ("nf_dev_deposito", "TEXT"), ("nf_dev_por", "TEXT"),
              ("nf_dev_em", "BIGINT"), ("nf_dev_msg", "TEXT"),
              ("nf_dev_etapa", "TEXT"), ("nf_dev_etapa_em", "BIGINT"), ("nf_dev_situacao", "TEXT"), ("nf_dev_erro", "TEXT"),
-             ("nf_dev_conf", "TEXT")]
+             ("nf_dev_conf", "TEXT"),
+             ("ml_revisao", "TEXT"), ("ml_revisao_em", "BIGINT"), ("ml_revisao_prazo", "TEXT")]   # espelho do painel do ML: 'pendente' = "Para sua revisão"
 COLS_TXT = ["data_recebimento", "loja", "cliente", "numero_venda", "sku", "produto", "serie_lote", "nf_saida",
             "num_reclamacao", "motivo", "alegacao_defeito", "desc_avaria", "chegada", "qual_item", "destino",
             "observacoes", "status", "canal", "servico", "embalagem", "estado_produto"]
@@ -881,8 +882,8 @@ def ml_revisao_enviar(did):
     print(f"[ML-REVISAO] devolucao={did} claim={claim} {resultado} enviado ao ML ({st})", flush=True)
     agora = int(time.time())
     with db_session() as conn:
-        conn.execute("UPDATE devolucoes SET ml_review=?, ml_review_em=?, ml_review_por=?, ml_review_msg=?, atualizado_em=? WHERE id=?",
-                     (resultado, agora, _quem(), msg, agora, did))
+        conn.execute("UPDATE devolucoes SET ml_review=?, ml_review_em=?, ml_review_por=?, ml_review_msg=?, atualizado_em=?, ml_revisao='nao', ml_revisao_em=? WHERE id=?",
+                     (resultado, agora, _quem(), msg, agora, agora, did))
     return jsonify({"success": True, "resultado": resultado, "msg": msg})
 
 
@@ -2209,6 +2210,48 @@ def _custo_frete_volta(ml_get, claim_id):
     return (total if leu else None), leu, st_envio
 
 
+ORCAMENTO_REVISAO = 20            # reclamações cuja revisão é checada por rodada (1 chamada cada)
+RECHECAR_REVISAO_S = 15 * 60      # "Para sua revisão" no ML muda quando alguém revisa lá: olha de novo a cada 15 min
+
+
+def _prazo_revisao(claim: dict):
+    """Data limite (YYYY-MM-DD) da revisão do vendedor, se o ML informar."""
+    for p in (claim or {}).get("players") or []:
+        if p.get("type") == "seller" or p.get("role") == "respondent":
+            for a in p.get("available_actions") or []:
+                if str(a.get("action") or "").startswith("return_review"):
+                    d = a.get("due_date") or a.get("expiration_date") or ""
+                    return str(d)[:10] or None
+    return None
+
+
+def atualizar_revisoes(conn, ml_get, agora, orcamento=ORCAMENTO_REVISAO):
+    """Espelha o painel do ML: ml_revisao='pendente' enquanto o ML lista a devolução em "Para sua revisão"
+    (ação return_review_ok/fail disponível); 'nao' quando o ML não pede mais nada (já revisada lá, expirou ou fechou).
+    É isso que a tela 'Aqui no galpão para tratar' mostra — igual ao ML, só o que está pendente hoje."""
+    rows = conn.execute(
+        "SELECT id, ml_claim_id FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
+        "AND status IN ('esperada','recebida','pendente_resolver') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?) "
+        "ORDER BY COALESCE(ml_revisao_em, 0), id LIMIT ?", (agora - RECHECAR_REVISAO_S, orcamento)).fetchall()
+    feitos, limite = 0, False
+    for r in rows:
+        code, cl = ml_get(f"/post-purchase/v1/claims/{r['ml_claim_id']}")
+        if code == 429:
+            limite = True
+            break
+        if code != 200 or not isinstance(cl, dict):
+            conn.execute("UPDATE devolucoes SET ml_revisao_em=? WHERE id=?", (agora, r["id"]))
+            continue
+        pede = any(a in _acoes_seller(cl) for a in ("return_review_ok", "return_review_fail"))
+        conn.execute("UPDATE devolucoes SET ml_revisao=?, ml_revisao_em=?, ml_revisao_prazo=? WHERE id=?",
+                     ("pendente" if pede else "nao", agora, _prazo_revisao(cl) if pede else None, r["id"]))
+        feitos += 1
+    falta = conn.execute("SELECT COUNT(*) AS n FROM devolucoes WHERE ml_claim_id IS NOT NULL AND ml_review IS NULL "
+                         "AND status IN ('esperada','recebida','pendente_resolver') AND (ml_revisao_em IS NULL OR ml_revisao_em < ?)",
+                         (agora - RECHECAR_REVISAO_S,)).fetchone()["n"]
+    return feitos, falta, limite
+
+
 def atualizar_custos(conn, ml_get, agora, orcamento=ORCAMENTO_CUSTOS):
     """Preenche devolucoes.custo_ml com o frete de volta do ML (não mexe no custo digitado à mão)."""
     rows = conn.execute(
@@ -2340,7 +2383,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5, so_venda=None) -> dict:
                     if cc == 429:
                         parou_429 = True
                         continue
-                    if not (cc == 200 and any(a in _acoes_seller(cl or {}) for a in ("return_review_ok", "return_review_fail"))):
+                    pede_rev = cc == 200 and any(a in _acoes_seller(cl or {}) for a in ("return_review_ok", "return_review_fail"))
+                    if not pede_rev:
                         resultado = "fechada_ok"
             else:
                 resultado = f"erro_{code}"        # ex.: 403 sem acesso à reclamação; guarda e recheca em 30 min
@@ -2384,6 +2428,7 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5, so_venda=None) -> dict:
                 conn.execute("UPDATE devolucoes_ml_vistos SET resultado=?, atualizado_em=? WHERE claim_id=?", (resultado, agora, cid))
             else:
                 conn.execute("INSERT INTO devolucoes_ml_vistos (claim_id, resultado, atualizado_em) VALUES (?,?,?)", (cid, resultado, agora))
+        rev_feitas, rev_faltam, rev_429 = atualizar_revisoes(conn, ml_get, agora, orcamento=5 if so_venda else ORCAMENTO_REVISAO)
         custos_feitos, custos_faltam, custos_429 = (0, 0, False) if so_venda else atualizar_custos(conn, ml_get, agora)
         ids = [str(c.get("id")) for c in abertas]    # abertas + fechadas recentes
         cont = {"importada": 0, "armazem_ml": 0, "sem_devolucao": 0, "erro": 0, "fechada_ok": 0}
@@ -2414,7 +2459,8 @@ def importar_do_ml(ml_get=_ml_get, pausa=0.5, so_venda=None) -> dict:
     return {"ok": True, "abertas_no_ml": n_abertas, "fechadas_em_transito": len(fechadas), "novas": novas,
             "voltam_pro_galpao": cont["importada"], "ficam_no_ml": cont["armazem_ml"],
             "sem_devolucao": cont["sem_devolucao"], "com_erro": cont["erro"], "erros": erros,
-            "pendentes": pendentes, "limite_ml": parou_429 or custos_429,
+            "pendentes": pendentes + rev_faltam, "limite_ml": parou_429 or custos_429 or rev_429,
+            "revisoes_atualizadas": rev_feitas, "revisoes_pendentes": rev_faltam,
             "custos_atualizados": custos_feitos, "custos_pendentes": custos_faltam}
 
 
