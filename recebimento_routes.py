@@ -133,7 +133,8 @@ def _garantir_tabelas():
         for tb, col in (("receb_notas", "pedido_xml"), ("receb_notas", "vinculo_por"), ("receb_itens", "xped"),
                         ("receb_notas", "entrada_etapa"), ("receb_notas", "entrada_em"), ("receb_notas", "entrada_por"),
                         ("receb_notas", "entrada_msg"), ("receb_notas", "entrada_erro"), ("receb_notas", "entrada_resumo"),
-                        ("receb_itens", "qtd_bipada"), ("receb_itens", "ajuste_por"), ("receb_itens", "fabricacao")):
+                        ("receb_itens", "qtd_bipada"), ("receb_itens", "ajuste_por"), ("receb_itens", "fabricacao"),
+                        ("receb_itens", "serie"), ("receb_itens", "validade_indet")):   # nº de série e validade indeterminada (Biel 25/11)
             if pg:
                 # só altera se faltar a coluna (ALTER trava a tabela; e um erro engolido aqui estragava a transação inteira)
                 tem = c.execute("SELECT 1 FROM information_schema.columns WHERE table_name=? AND column_name=?", (tb, col)).fetchone()
@@ -819,8 +820,8 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
             m.append(f"Item {it['n_item']} ({nome}): FALTOU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
         elif conferencia and it["qtd_conferida"] > it["qtd_nf"]:
             m.append(f"Item {it['n_item']} ({nome}): SOBROU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
-        if conferencia and EXIGIR_LOTE and (not (it["lote"] or "").strip() or not (it["validade"] or "").strip()):
-            m.append(f"Item {it['n_item']} ({nome}): sem lote/validade")
+        if conferencia and EXIGIR_LOTE and (not _tem_lote(it) or not _tem_validade(it)):
+            m.append(f"Item {it['n_item']} ({nome}): sem lote/série ou validade (se não vence, marque 'validade indeterminada')")
     if pc:
         grupos, sobras = _grupos(d["itens"], pc)
         for g in grupos:
@@ -1117,6 +1118,31 @@ def _recontar(c, iid):
     return u
 
 
+def _tem_validade(it) -> bool:
+    """Validade informada OU marcada como indeterminada (produto que não vence: instrumental, etc.)."""
+    return bool(str(it.get("validade") or "").strip()) or str(it.get("validade_indet") or "") in ("1", "true", "True")
+
+
+def _tem_lote(it) -> bool:
+    """Lote OU nº de série (produto seriado não tem lote: a série identifica a unidade)."""
+    return bool(str(it.get("lote") or "").strip()) or bool(str(it.get("serie") or "").strip())
+
+
+def _lote_serie_sets(d, sets, args):
+    """Campos lote/série/validade/indeterminada vindos da tela -> SETs do UPDATE. Série sem lote vira o lote (o Bling e a
+    etiqueta usam o lote como identificador). Validade digitada desliga 'indeterminada' e vice-versa."""
+    if d.get("serie") is not None and "serie" in d:
+        sr = str(d["serie"] or "").strip()[:60] or None
+        sets.append("serie=?"); args.append(sr)
+        if sr and not str(d.get("lote") or "").strip():
+            sets.append("lote=?"); args.append(sr)
+    if d.get("validade_indet") in (1, True, "1", "true"):
+        sets.append("validade_indet=?"); args.append("1")
+        sets.append("validade=?"); args.append(None)
+    elif d.get("validade"):
+        sets.append("validade_indet=?"); args.append(None)
+
+
 def _item_resp(c, iid):
     novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (iid,)).fetchone())
     novo["qtd_nf"] = float(novo["qtd_nf"] or 0); novo["qtd_conferida"] = float(novo["qtd_conferida"] or 0)
@@ -1254,7 +1280,7 @@ def _bipar_etq(c, nid, nota, sku, lote, cod):
     novo = _item_resp(c, e["item_id"])
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return {"success": True, "item": novo, "falta": falta, "excedeu": falta < 0, "mult": int(e["mult"] or 1), "codigo": cod,
-            "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])}, 200
+            "precisa_lote": EXIGIR_LOTE and not (_tem_lote(novo) and _tem_validade(novo))}, 200
 
 
 @recebimento_routes.post("/recebimento/notas/<int:nid>/bipar")
@@ -1295,6 +1321,7 @@ def bipar(nid):
             sets.append("lote=?"); args.append(str(d["lote"]).strip()[:60])
         if d.get("validade"):
             sets.append("validade=?"); args.append(str(d["validade"]).strip()[:10])
+        _lote_serie_sets(d, sets, args)
         c.execute(f"UPDATE receb_itens SET {', '.join(sets)} WHERE id=?", tuple(args) + (it["id"],))
         c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=? AND status IN ('aguardando','recusada','conferindo')", (_agora(), nid))
         novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (it["id"],)).fetchone())
@@ -1302,7 +1329,7 @@ def bipar(nid):
     _num_bip(novo)
     falta = novo["qtd_nf"] - novo["qtd_conferida"]
     return jsonify({"success": True, "item": novo, "falta": falta, "excedeu": falta < 0,
-                    "precisa_lote": EXIGIR_LOTE and not (novo["lote"] and novo["validade"])})
+                    "precisa_lote": EXIGIR_LOTE and not (_tem_lote(novo) and _tem_validade(novo))})
 
 
 # ───────────────────────── rastreio da unidade (Biel 18/11) ─────────────────────────
@@ -1620,6 +1647,7 @@ def confirmar_item(nid, iid):
         for campo in ("lote", "validade"):
             if d.get(campo):
                 sets.append(f"{campo}=?"); args.append(str(d[campo]).strip()[:60])
+        _lote_serie_sets(d, sets, args)
         c.execute(f"UPDATE receb_itens SET {', '.join(sets)} WHERE id=?", tuple(args) + (iid,))
         c.execute("UPDATE receb_notas SET status='conferindo', atualizado_em=? WHERE id=? AND status IN ('aguardando','conferindo')", (_agora(), nid))
         novo = dict(c.execute("SELECT * FROM receb_itens WHERE id=?", (iid,)).fetchone())
@@ -1648,6 +1676,7 @@ def editar_item(nid, iid):
         for campo in ("lote", "validade", "obs", "fabricacao"):
             if campo in d:
                 sets.append(f"{campo}=?"); args.append((str(d[campo]).strip() or None) if d[campo] is not None else None)
+        _lote_serie_sets(d, sets, args)
         if "qtd_conferida" in d:
             try:
                 nova = max(0.0, float(d["qtd_conferida"] or 0))
@@ -2207,7 +2236,8 @@ def plano_entrada(nid, resumo=None):
             fab, fab_origem = _fabricacao_auto(lote_it, rastros.get(int(it["n_item"] or 0)))
         plano["itens"].append({"item_id": it["id"], "n_item": it["n_item"], "sku": it["sku"], "descricao": it["descricao"], "pid": pid,
                                "qtd": q, "custo": float(it.get("valor_unit") or 0), "lote": lote_it,
-                               "validade": (it.get("validade") or "").strip(), "controla_lote": False,
+                               "validade": (it.get("validade") or "").strip(), "validade_indet": _tem_validade(it) and not (it.get("validade") or "").strip(),
+                               "serie": (it.get("serie") or "").strip(), "controla_lote": False,
                                "fabricacao": fab or "", "fabricacao_origem": fab_origem, "lote_existe": False})
         if not pid:
             ponto(False, f"Item {it['n_item']}", f"{(it['descricao'] or '')[:40]}: não achei o produto no pedido (SKU {it['sku'] or '-'})")
@@ -2219,7 +2249,7 @@ def plano_entrada(nid, resumo=None):
         for p in plano["itens"]:
             if p["pid"]:
                 p["controla_lote"] = ctl.get(int(p["pid"]), False)
-                if p["controla_lote"] and not (p["lote"] and p["validade"]):
+                if p["controla_lote"] and not (p["lote"] and (p["validade"] or p["validade_indet"])):
                     ponto(False, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: o Bling controla lote desse produto e falta lote/validade")
                 elif p["controla_lote"] and not p["fabricacao"]:
                     # o Bling só pede fabricação para CRIAR o lote: se o lote já existe nesse produto, não precisa
@@ -2460,7 +2490,9 @@ def _job_entrada(nid, quem):
                     raise RuntimeError(f"CONF|Falta a data de fabricação do lote {x['lote']} (item {x['n_item']}): o Bling exige para criar o lote. "
                                        "Informe em 'Ver o que vai ser lançado' e clique Continuar a entrada.")
                 corpo = [{"produto": {"id": int(x["pid"])}, "deposito": {"id": DEP_LOCAL_ID}, "codigoLote": x["lote"],
-                          "dataFabricacao": x["fabricacao"], "dataValidade": x["validade"]}]
+                          "dataFabricacao": x["fabricacao"]}]
+                if x.get("validade"):
+                    corpo[0]["dataValidade"] = x["validade"]       # validade indeterminada: lote sem data de validade
                 st, txt, js = _bling_raw("PUT", "/produtos/lotes", corpo)
                 try:
                     idl = js["data"]["saved"][0]["id"]
