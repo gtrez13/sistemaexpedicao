@@ -564,6 +564,30 @@ def _mesmo_prod(a, b):
                 (a.get("cprod") and b.get("cprod") and _up(a["cprod"]) == _up(b["cprod"])))
 
 
+def _desc_key(t):
+    """Descrição normalizada para comparar NF x pedido (sem acento, só letras e números)."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "", t)
+
+
+def _pc_por_descricao(it, pc_itens, grupos_nf=None):
+    """Item do pedido com a MESMA descrição do item da nota — só quando é única dos dois lados (sem chute).
+    27/11: Nalgon manda cProd diferente do 'código do fornecedor' do pedido, mas a descrição é idêntica."""
+    k = _desc_key(it.get("descricao"))
+    if len(k) < 6:
+        return None
+    def bate(a, b):   # igual, ou uma começa com a outra (pedido com observação depois do nome)
+        return a == b or (len(a) >= 12 and len(b) >= 12 and (a.startswith(b) or b.startswith(a)))
+    cands = [x for x in pc_itens if bate(_desc_key(x.get("descricao")), k)]
+    if len(cands) != 1:
+        return None
+    kp = _desc_key(cands[0].get("descricao"))
+    if grupos_nf is not None and sum(1 for g in grupos_nf if bate(kp, _desc_key(g["nf"][0].get("descricao")))) != 1:
+        return None
+    return cands[0]
+
+
 def _grupos(itens_nf, pc):
     """Junta por PRODUTO: o mesmo produto pode vir em várias linhas da nota (um lote por linha) e/ou do pedido.
     -> (grupos [{nf: [...], pc: [...]}], itens do pedido que não casaram com nenhum produto da nota)"""
@@ -578,6 +602,9 @@ def _grupos(itens_nf, pc):
     for x in (pc or {}).get("itens") or []:
         g = (next((g for g in grupos if any(x.get("sku") and o.get("sku") and _up(x["sku"]) == _up(o["sku"]) for o in g["nf"])), None)
              or next((g for g in grupos if any(x.get("cprod") and o.get("cprod") and _up(x["cprod"]) == _up(o["cprod"]) for o in g["nf"])), None))
+        if not g:   # 3) mesma DESCRIÇÃO, única dos dois lados (27/11)
+            g = next((g for g in grupos if not g["pc"] and not any(o.get("sku") for o in g["nf"])
+                      and _pc_por_descricao(g["nf"][0], (pc or {}).get("itens") or [], grupos) is x), None)
         if g:
             g["pc"].append(x)
         else:
@@ -702,14 +729,26 @@ def _preencher_skus_pelo_pedido(c, d: dict):
     if not pc:
         return False
     mudou = False
+    grupos, _ = _grupos(d["itens"], pc)
     for it in d["itens"]:
-        if it["sku"] or not it["cprod"]:
+        if it["sku"]:
             continue
-        pi = next((x for x in pc["itens"] if x["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper() and x["sku"]), None)
+        pi = None
+        if it["cprod"]:
+            pi = next((x for x in pc["itens"] if x["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper() and x["sku"]), None)
+        origem = "pedido"
+        if not pi:   # 27/11: mesma descrição (única) no pedido
+            pi = _pc_por_descricao(it, pc["itens"], grupos)
+            origem = "descricao"
+            if pi and not pi.get("sku"):
+                pi = None
         if pi:
             c.execute("UPDATE receb_itens SET sku=? WHERE id=?", (pi["sku"], it["id"]))
-            c.execute("""INSERT INTO receb_vinculos (fornecedor_cnpj, cprod, sku, criado_por, criado_em) VALUES (?,?,?,?,?)
-                         ON CONFLICT (fornecedor_cnpj, cprod) DO NOTHING""", (d["fornecedor_cnpj"], it["cprod"], pi["sku"], "pedido", _agora()))
+            it["sku"] = pi["sku"]
+            if it["cprod"]:
+                c.execute("""INSERT INTO receb_vinculos (fornecedor_cnpj, cprod, sku, criado_por, criado_em) VALUES (?,?,?,?,?)
+                             ON CONFLICT (fornecedor_cnpj, cprod) DO NOTHING""", (d["fornecedor_cnpj"], it["cprod"], pi["sku"], origem, _agora()))
+            print(f"[RECEB] item {it['n_item']} ({str(it.get('descricao'))[:30]}) herdou SKU {pi['sku']} do pedido por {origem}", flush=True)
             mudou = True
     return mudou
 
@@ -815,7 +854,8 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
     for it in d["itens"]:
         nome = it["descricao"][:40]
         if not it["sku"]:
-            m.append(f"Item {it['n_item']} ({nome}): sem SKU vinculado")
+            m.append(f"Item {it['n_item']} ({nome}): sem SKU vinculado (código do fornecedor na NF: {it.get('cprod') or '-'}"
+                     f"{', EAN ' + it['ean'] if it.get('ean') else ''}) — toque no item e escolha o SKU")
         if conferencia and it["qtd_conferida"] < it["qtd_nf"]:
             m.append(f"Item {it['n_item']} ({nome}): FALTOU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
         elif conferencia and it["qtd_conferida"] > it["qtd_nf"]:
