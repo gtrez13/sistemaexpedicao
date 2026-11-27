@@ -167,11 +167,18 @@ def manifestar_e_importar(numero: str, chave: str = "", valor: float | None = No
                     page.wait_for_timeout(1500)
                 except Exception:
                     pass
-                busca = page.locator("input[placeholder*='nº da nota'], input[placeholder*='Pesquisar']").first
+                # 27/11: o Bling passou a pedir "Selecione uma loja no filtro para iniciarmos" antes de listar
+                _escolher_loja(page, passo)
+                # 27/11: NUNCA a busca global do menu (digitava 18400 lá e procurava módulos): só o campo da lista
+                busca = _campo_busca(page, numero)
                 busca.fill(numero, timeout=20000)
                 busca.press("Enter")
                 page.wait_for_timeout(2500)
                 rpa.wait_no_overlay(page, 60000)
+                if "Selecione uma loja" in (page.inner_text("body") or ""):
+                    _escolher_loja(page, passo, forcar=True)
+                    busca = _campo_busca(page, numero); busca.fill(numero, timeout=20000); busca.press("Enter")
+                    page.wait_for_timeout(2500); rpa.wait_no_overlay(page, 60000)
 
                 linhas = page.locator("tr", has=page.locator("select.notas-recebidas-select"))
                 alvo = None
@@ -296,6 +303,63 @@ def _clicar(page, sel, nome, numero, timeout=8000):
         raise RoboErro(f"o botão {nome} está desabilitado no Bling ({info}) (foto: {_foto(page, f'{numero}_{nome}')})")
     page.evaluate("s => document.querySelector(s).click()", sel)
     return f"clique por JS ({info})"
+
+def _escolher_loja(page, passo=print, forcar=False):
+    """Notas recebidas (Bling 27/11): a lista só aparece depois de escolher uma loja/unidade no filtro ("Selecione uma loja
+    no filtro para iniciarmos"). Tenta o seletor "Todas as lojas" do topo e, se não, o filtro Unidade de negócio.
+    Escolhe a loja que tem o nome da empresa (LHV / MEDICAL) ou, senão, a primeira que não é 'Todas/Nenhuma'."""
+    try:
+        corpo = page.inner_text("body") or ""
+    except Exception:
+        corpo = ""
+    if not forcar and "Selecione uma loja" not in corpo:
+        return
+    alvo_nome = (os.environ.get("BLING_LOJA_NOME") or "").strip().upper()
+    marcas = [alvo_nome] if alvo_nome else ["LHV", "MEDICAL"]
+    def escolher_opcao():
+        ops = page.locator("[role='option']:visible, li:visible, label:visible, .dropdown-item:visible")
+        n = min(ops.count(), 40)
+        textos = []
+        for i in range(n):
+            try:
+                t = (ops.nth(i).inner_text(timeout=1000) or "").strip()
+            except Exception:
+                continue
+            textos.append((i, t))
+        for m in marcas:
+            for i, t in textos:
+                if m and m in t.upper() and "TODAS" not in t.upper():
+                    ops.nth(i).click(timeout=5000); return t
+        for i, t in textos:
+            tu = t.upper()
+            if t and len(t) < 60 and "TODAS" not in tu and "NENHUM" not in tu and "FILTRAR" not in tu and "LIMPAR" not in tu:
+                ops.nth(i).click(timeout=5000); return t
+        return None
+    escolhido = None
+    for gatilho in ("text=Todas as lojas", "text=Nenhuma unidade", "text=Unidade de negócio"):
+        try:
+            g = page.locator(gatilho).first
+            if not g.count():
+                continue
+            g.click(timeout=5000)
+            page.wait_for_timeout(800)
+            escolhido = escolher_opcao()
+            if escolhido:
+                break
+            page.keyboard.press("Escape")
+        except Exception:
+            continue
+    if escolhido:
+        page.wait_for_timeout(1000)
+        try:
+            page.get_by_text("Filtrar", exact=True).first.click(timeout=3000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        passo(f"loja escolhida no filtro de Notas recebidas: {escolhido}")
+    else:
+        passo(f"não consegui escolher a loja no filtro de Notas recebidas (foto: {_foto(page, 'loja_filtro')})")
+
 
 def _campo_busca(page, numero, timeout=20000):
     """Campo de busca da lista que está NA TELA (Notas de compra). O Bling tem outros campos escondidos com "da nota" no
