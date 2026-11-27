@@ -559,9 +559,15 @@ def _up(v):
     return str(v or "").strip().upper()
 
 
+def _cod(v):
+    """Código do fornecedor para comparar: maiúsculo e SEM zeros à esquerda (NF '002518' = pedido '2518')."""
+    u = _up(v)
+    return u.lstrip("0") or u
+
+
 def _mesmo_prod(a, b):
     return bool((a.get("sku") and b.get("sku") and _up(a["sku"]) == _up(b["sku"])) or
-                (a.get("cprod") and b.get("cprod") and _up(a["cprod"]) == _up(b["cprod"])))
+                (a.get("cprod") and b.get("cprod") and _cod(a["cprod"]) == _cod(b["cprod"])))
 
 
 def _desc_key(t):
@@ -601,7 +607,7 @@ def _grupos(itens_nf, pc):
     sobras = []
     for x in (pc or {}).get("itens") or []:
         g = (next((g for g in grupos if any(x.get("sku") and o.get("sku") and _up(x["sku"]) == _up(o["sku"]) for o in g["nf"])), None)
-             or next((g for g in grupos if any(x.get("cprod") and o.get("cprod") and _up(x["cprod"]) == _up(o["cprod"]) for o in g["nf"])), None))
+             or next((g for g in grupos if any(x.get("cprod") and o.get("cprod") and _cod(x["cprod"]) == _cod(o["cprod"]) for o in g["nf"])), None))
         if not g:   # 3) mesma DESCRIÇÃO, única dos dois lados (27/11)
             g = next((g for g in grupos if not g["pc"] and not any(o.get("sku") for o in g["nf"])
                       and _pc_por_descricao(g["nf"][0], (pc or {}).get("itens") or [], grupos) is x), None)
@@ -735,7 +741,7 @@ def _preencher_skus_pelo_pedido(c, d: dict):
             continue
         pi = None
         if it["cprod"]:
-            pi = next((x for x in pc["itens"] if x["cprod"] and str(x["cprod"]).upper() == str(it["cprod"]).upper() and x["sku"]), None)
+            pi = next((x for x in pc["itens"] if x["cprod"] and _cod(x["cprod"]) == _cod(it["cprod"]) and x["sku"]), None)
         origem = "pedido"
         if not pi:   # 27/11: mesma descrição (única) no pedido
             pi = _pc_por_descricao(it, pc["itens"], grupos)
