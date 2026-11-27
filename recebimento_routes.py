@@ -2285,10 +2285,17 @@ def plano_entrada(nid, resumo=None):
             if rastros is None:
                 rastros = _rastros_xml(r["xml"] or "")
             fab, fab_origem = _fabricacao_auto(lote_it, rastros.get(int(it["n_item"] or 0)))
+        # 27/11: sem lote (produto 'sem lote / não vence' ou lote não informado) -> lote automático NF<numero>, usado só se o Bling controlar lote
+        lote_auto = False
+        if not lote_it and not (it.get("serie") or "").strip():
+            lote_it, lote_auto = f"NF{str(r['numero'] or '').strip() or r['id']}", True
+        # 27/11: sem data de fabricação -> emissão da NF (o Bling só precisa de uma data para criar o lote)
+        if not fab and (r["emissao"] or "").strip():
+            fab, fab_origem = (r["emissao"] or "").strip()[:10], "emissao"
         plano["itens"].append({"item_id": it["id"], "n_item": it["n_item"], "sku": it["sku"], "descricao": it["descricao"], "pid": pid,
                                "qtd": q, "custo": float(it.get("valor_unit") or 0), "lote": lote_it,
                                "validade": (it.get("validade") or "").strip(), "validade_indet": _tem_validade(it) and not (it.get("validade") or "").strip(),
-                               "serie": (it.get("serie") or "").strip(), "controla_lote": False,
+                               "serie": (it.get("serie") or "").strip(), "controla_lote": False, "lote_auto": lote_auto,
                                "fabricacao": fab or "", "fabricacao_origem": fab_origem, "lote_existe": False})
         if not pid:
             ponto(False, f"Item {it['n_item']}", f"{(it['descricao'] or '')[:40]}: não achei o produto no pedido (SKU {it['sku'] or '-'})")
@@ -2300,7 +2307,11 @@ def plano_entrada(nid, resumo=None):
         for p in plano["itens"]:
             if p["pid"]:
                 p["controla_lote"] = ctl.get(int(p["pid"]), False)
-                if p["controla_lote"] and not (p["lote"] and (p["validade"] or p["validade_indet"])):
+                if not p["controla_lote"] and p.get("lote_auto"):
+                    p["lote"] = ""      # Bling não controla lote: não inventa lote
+                if p["controla_lote"] and p.get("lote_auto"):
+                    ponto(True, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: sem lote informado — vai com o lote automático {p['lote']} (fabricação = emissão da NF)")
+                if p["controla_lote"] and not p["lote"]:
                     ponto(False, f"Item {p['n_item']}", f"{(p['descricao'] or '')[:40]}: o Bling controla lote desse produto e falta lote/validade")
                 elif p["controla_lote"] and not p["fabricacao"]:
                     # o Bling só pede fabricação para CRIAR o lote: se o lote já existe nesse produto, não precisa
