@@ -866,8 +866,9 @@ def _divergencias(d: dict, conferencia: bool = True) -> list:
             m.append(f"Item {it['n_item']} ({nome}): FALTOU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
         elif conferencia and it["qtd_conferida"] > it["qtd_nf"]:
             m.append(f"Item {it['n_item']} ({nome}): SOBROU — NF {it['qtd_nf']:g}, conferido {it['qtd_conferida']:g}")
-        if conferencia and EXIGIR_LOTE and (not _tem_lote(it) or not _tem_validade(it)):
-            m.append(f"Item {it['n_item']} ({nome}): sem lote/série ou validade (se não vence, marque 'validade indeterminada')")
+        # 27/11: 'validade indeterminada' = produto sem lote e que não vence -> não exige lote nem série
+        if conferencia and EXIGIR_LOTE and not _indeterminada(it) and (not _tem_lote(it) or not _tem_validade(it)):
+            m.append(f"Item {it['n_item']} ({nome}): sem lote/série ou validade (produto sem lote e que não vence: marque 'Sem lote / não vence')")
     if pc:
         grupos, sobras = _grupos(d["itens"], pc)
         for g in grupos:
@@ -1162,6 +1163,10 @@ def _recontar(c, iid):
     u = float(u or 0)
     c.execute("UPDATE receb_itens SET qtd_conferida=?, qtd_bipada=? WHERE id=?", (u, str(u), iid))
     return u
+
+
+def _indeterminada(it) -> bool:
+    return str(it.get("validade_indet") or "") in ("1", "true", "True")
 
 
 def _tem_validade(it) -> bool:
