@@ -937,6 +937,11 @@ def registrar(bp):
             if not it["inventory_id"]:
                 return jsonify({"success": False, "error": "Esse anúncio não tem código do Full: a etiqueta não sai. Chame o supervisor."}), 409
             lote, val = _lote_da_etiqueta(c, it, lote_lido)
+            if d.get("sem_validade") in (1, True, "1", "true") and it.get("exige_validade"):
+                # 27/11 (Biel): produto que não tem validade — quem está etiquetando decide; fica registrado e vale para o item inteiro
+                c.execute("UPDATE full_itens SET exige_validade=0, validade_etq=NULL WHERE id=?", (it["id"],))
+                it["exige_validade"] = 0
+                print(f"[FULL] remessa {rid} item {it['id']} ({str(it['titulo'])[:40]}): marcado SEM VALIDADE por {_quem()}", flush=True)
             if it.get("exige_validade"):              # o ML marcou validade: a etiqueta sai com ela, sempre
                 if d.get("validade"):
                     v = _data_iso(d["validade"])
@@ -1055,6 +1060,10 @@ def registrar(bp):
             if not it:
                 return jsonify({"success": False, "error": "Produto não está nesta remessa."}), 404
             lim = _limite_validade(r)
+            if d.get("sem_validade") in (1, True, "1", "true"):
+                c.execute("UPDATE full_itens SET exige_validade=0, validade_etq=NULL WHERE id=?", (iid,))
+                print(f"[FULL] remessa {rid} item {iid} ({str(it['titulo'])[:40]}): marcado SEM VALIDADE por {_quem()}", flush=True)
+                return jsonify({"success": True, "etiquetas": [], "sem_validade": True})
             if d.get("validade"):
                 v = _data_iso(d["validade"])
                 if not v:
